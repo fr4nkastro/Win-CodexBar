@@ -469,6 +469,8 @@ fn ascii_header_value(raw: &str) -> String {
 
 fn format_usage_amount(value: f64) -> String {
     if (value.fract()).abs() < f64::EPSILON {
+        // Value verified integral to f64 precision; the i64 cast loses nothing.
+        #[allow(clippy::cast_possible_truncation, reason = "guarded by the fract() == 0 check above")]
         format!("{}", value as i64)
     } else {
         format!("{value:.2}")

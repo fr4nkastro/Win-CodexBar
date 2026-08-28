@@ -162,7 +162,9 @@ impl GrokProvider {
 
         let cookie_header = crate::providers::browser_cookie_header(&["grok.com"])?;
         let result = self.fetch_with_cookie(&cookie_header).await?;
-        let _ = CookieHeaderCache::store(ProviderId::Grok, &cookie_header, "browser");
+        // Best-effort cache write: failing to persist the cookie only costs a
+        // re-read from the browser on the next fetch.
+        let _cached = CookieHeaderCache::store(ProviderId::Grok, &cookie_header, "browser");
         Ok(result)
     }
 
