@@ -8,6 +8,9 @@ on:
 jobs:
   trigger-circleci:
     name: Trigger CircleCI release pipeline
+    # CircleCI project + API token live only on the canonical upstream repo.
+    # Forks tag releases via the signpath-test workflow instead.
+    if: github.repository == 'nesszer/Win-CodexBar'
     runs-on: ubuntu-latest
     permissions:
       contents: read
