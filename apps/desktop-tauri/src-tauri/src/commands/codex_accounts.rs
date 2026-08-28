@@ -359,4 +359,59 @@ mod tests {
         assert!(json.get("codexHomePath").is_some());
         assert!(json.get("providerAccountId").is_some());
     }
+
+    /// Regression for issue #1: an account discovered on disk but never written
+    /// to `accounts.json` must keep the same id between two `load_codex_accounts`
+    /// calls, so the id the UI listed still resolves on the follow-up
+    /// switch/remove/fetch IPC (the lookup behind "Codex account not found.").
+    #[test]
+    fn discovered_account_id_resolves_on_a_later_call() {
+        use codexbar::codex_accounts::file_locations;
+
+        let unique = Uuid::new_v4().to_string();
+        let mut root = std::env::temp_dir();
+        root.push(format!("codexbar-cmd-test-{unique}"));
+        let app_support = root.join("app-support");
+        let ambient_home = root.join("dot-codex");
+        std::fs::create_dir_all(&app_support).unwrap();
+        std::fs::create_dir_all(&ambient_home).unwrap();
+
+        file_locations::with_app_support_directory(app_support.clone());
+        file_locations::with_ambient_codex_home(ambient_home.clone());
+
+        // Ambient account present on disk, absent from accounts.json.
+        let auth = serde_json::json!({
+            "tokens": {
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "account_id": "acct-never-persisted",
+            },
+            "last_refresh": "2026-04-23T00:00:00Z",
+        });
+        std::fs::write(
+            ambient_home.join("auth.json"),
+            serde_json::to_vec_pretty(&auth).unwrap(),
+        )
+        .unwrap();
+
+        let first = load_codex_accounts().expect("first list");
+        let listed_id = first
+            .iter()
+            .find(|a| a.codex_home_path == ambient_home)
+            .expect("ambient account listed")
+            .id
+            .to_string();
+
+        let second = load_codex_accounts().expect("second list");
+        let resolved = second.iter().any(|a| a.id.to_string() == listed_id);
+
+        file_locations::clear_app_support_directory_override();
+        file_locations::clear_ambient_codex_home_override();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            resolved,
+            "discovered account id did not resolve on a later call"
+        );
+    }
 }

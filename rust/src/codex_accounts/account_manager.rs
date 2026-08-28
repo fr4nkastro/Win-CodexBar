@@ -506,8 +506,9 @@ fn candidate_account(
     home_path: &Path,
     source: CodexAccountSource,
 ) -> CodexAccount {
+    let id = stable_discovered_id(home_path, &identity);
     CodexAccount::new(
-        Uuid::new_v4(),
+        id,
         None,
         identity.email.clone(),
         identity.auth_subject.clone(),
@@ -520,6 +521,73 @@ fn candidate_account(
     )
 }
 
+/// Namespace for deterministically derived discovered-account ids.
+///
+/// Never change this string: changing it re-keys every derived id and would make
+/// already-listed discovered accounts unresolvable on a later IPC call.
+const DISCOVERED_ACCOUNT_ID_NAMESPACE: &str = "codexbar:codex-account:v1";
+
+/// Deterministic id for an account discovered on disk.
+///
+/// Managed homes created by the app (and externally created ones) are named
+/// `<uuid>`; that name IS the id. Otherwise the id is derived from the strongest
+/// available stable identity key. Pure computation: no filesystem writes, no
+/// network, no Windows-only syscalls, so it is fully exercised by `cargo test`
+/// on Linux/WSL2.
+fn stable_discovered_id(home_path: &Path, identity: &AuthBackedIdentity) -> Uuid {
+    if let Some(id) = home_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| Uuid::parse_str(name.trim()).ok())
+    {
+        return id;
+    }
+    derive_account_uuid(&stable_identity_key(home_path, identity))
+}
+
+/// First-available stable key: `provider_account_id` -> `auth_subject` -> home
+/// path (equivalent to `CodexAccount::standardized_home_path()`).
+fn stable_identity_key(home_path: &Path, identity: &AuthBackedIdentity) -> String {
+    if let Some(value) = normalized(identity.provider_account_id.as_deref()) {
+        return format!("provider:{value}");
+    }
+    if let Some(value) = normalized(identity.auth_subject.as_deref()) {
+        return format!("subject:{value}");
+    }
+    format!("home:{}", managed_home_key(home_path))
+}
+
+/// Trim, drop-if-empty, lowercase — mirrors `models.rs::normalize_identifier` so
+/// a derived id agrees with `CodexAccount::matches`.
+fn normalized(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// Fold a stable key into a well-formed, deterministic `Uuid` via SHA-256.
+///
+/// The version nibble is set to `5` to denote the name-based family (not the
+/// literal hash algorithm); the RFC 4122 variant bits are set so the value is a
+/// round-trippable `Uuid`. Uses the existing `sha2` dependency — no new crate,
+/// and the `uuid` `v5` feature is deliberately not enabled.
+fn derive_account_uuid(key: &str) -> Uuid {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(DISCOVERED_ACCOUNT_ID_NAMESPACE.as_bytes());
+    hasher.update([0x1f_u8]); // unit separator: removes namespace/key concat ambiguity
+    hasher.update(key.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
 fn build_discovered_account(
     matched: Option<&CodexAccount>,
     identity: AuthBackedIdentity,
@@ -527,10 +595,11 @@ fn build_discovered_account(
     source: CodexAccountSource,
     discovered_at: DateTime<Utc>,
 ) -> CodexAccount {
+    let id = matched
+        .map(|account| account.id)
+        .unwrap_or_else(|| stable_discovered_id(&home_path, &identity));
     CodexAccount::new(
-        matched
-            .map(|account| account.id)
-            .unwrap_or_else(Uuid::new_v4),
+        id,
         matched.and_then(|account| account.nickname.clone()),
         identity
             .email
@@ -670,6 +739,35 @@ mod tests {
         )
     }
 
+    /// Write an `auth.json` whose embedded JWT carries exactly `jwt_payload`,
+    /// with an optional `tokens.account_id`. Lets a test control which identity
+    /// fields are readable (provider id / subject / email).
+    fn write_auth_payload(
+        home_path: &Path,
+        jwt_payload: serde_json::Value,
+        token_account_id: Option<&str>,
+    ) {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&jwt_payload).unwrap());
+        let mut tokens = serde_json::json!({
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "id_token": format!("header.{encoded}.signature"),
+        });
+        if let Some(account_id) = token_account_id {
+            tokens["account_id"] = serde_json::Value::String(account_id.to_string());
+        }
+        let auth_payload = serde_json::json!({
+            "tokens": tokens,
+            "last_refresh": "2026-04-23T00:00:00Z",
+        });
+        std::fs::write(
+            home_path.join("auth.json"),
+            serde_json::to_vec_pretty(&auth_payload).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn remove_managed_account_removes_duplicate_homes_for_same_provider() {
         let dir = tempfile::tempdir().unwrap();
@@ -799,6 +897,263 @@ mod tests {
                 format!("user-e9H3MsspGTF7UZJ8uaXuML55__{new_account_id}")
             );
         }
+
+        super::super::file_locations::clear_app_support_directory_override();
+        super::super::file_locations::clear_ambient_codex_home_override();
+        super::super::file_locations::clear_codex_desktop_session_root_override();
+    }
+
+    #[test]
+    fn managed_home_named_uuid_uses_directory_name_as_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::file_locations::with_app_support_directory(root.to_path_buf());
+
+        let uuid_name = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+        let home = root.join("managed-homes").join(uuid_name);
+        std::fs::create_dir_all(&home).unwrap();
+        write_auth(&home, "user@example.com", "provider-xyz");
+
+        let manager = CodexAccountManager::new();
+        let discovered = manager.discover_managed_accounts(&[]).unwrap();
+        let account = discovered
+            .iter()
+            .find(|a| a.codex_home_path.as_path() == home.as_path())
+            .expect("managed home discovered");
+        assert_eq!(account.id, Uuid::parse_str(uuid_name).unwrap());
+
+        super::super::file_locations::clear_app_support_directory_override();
+    }
+
+    #[test]
+    fn discovery_ids_are_stable_across_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::file_locations::with_app_support_directory(root.to_path_buf());
+
+        let uuid_home = root
+            .join("managed-homes")
+            .join("f47ac10b-58cc-4372-a567-0e02b2c3d479");
+        let plain_home = root.join("managed-homes").join("not-a-uuid-directory");
+        let ambient_home = root.join(".codex");
+        for home in [&uuid_home, &plain_home, &ambient_home] {
+            std::fs::create_dir_all(home).unwrap();
+        }
+        write_auth(&uuid_home, "uuid@example.com", "provider-uuid-home");
+        write_auth(&plain_home, "plain@example.com", "provider-plain-home");
+        write_auth(
+            &ambient_home,
+            "ambient@example.com",
+            "provider-ambient-home",
+        );
+        super::super::file_locations::with_ambient_codex_home(ambient_home.clone());
+
+        let manager = CodexAccountManager::new();
+
+        let pass_one = manager.discover_managed_accounts(&[]).unwrap();
+        let pass_two = manager.discover_managed_accounts(&[]).unwrap();
+        for home in [&uuid_home, &plain_home] {
+            let first = pass_one
+                .iter()
+                .find(|a| a.codex_home_path.as_path() == home.as_path())
+                .unwrap();
+            let second = pass_two
+                .iter()
+                .find(|a| a.codex_home_path.as_path() == home.as_path())
+                .unwrap();
+            assert_eq!(first.id, second.id, "unstable id for {home:?}");
+        }
+
+        let ambient_one = manager.discover_ambient_account(&[]).unwrap();
+        let ambient_two = manager.discover_ambient_account(&[]).unwrap();
+        assert_eq!(ambient_one.id, ambient_two.id);
+
+        super::super::file_locations::clear_app_support_directory_override();
+        super::super::file_locations::clear_ambient_codex_home_override();
+    }
+
+    #[test]
+    fn ambient_account_id_is_derived_and_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::file_locations::with_app_support_directory(root.to_path_buf());
+
+        let ambient_home = root.join(".codex");
+        std::fs::create_dir_all(&ambient_home).unwrap();
+        write_auth(&ambient_home, "ambient@example.com", "acct-ambient-001");
+        super::super::file_locations::with_ambient_codex_home(ambient_home.clone());
+
+        let manager = CodexAccountManager::new();
+        let first = manager.discover_ambient_account(&[]).unwrap();
+        let second = manager.discover_ambient_account(&[]).unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.id, derive_account_uuid("provider:acct-ambient-001"));
+
+        super::super::file_locations::clear_app_support_directory_override();
+        super::super::file_locations::clear_ambient_codex_home_override();
+    }
+
+    #[test]
+    fn managed_home_with_non_uuid_name_derives_stable_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::file_locations::with_app_support_directory(root.to_path_buf());
+
+        let managed_root = root.join("managed-homes");
+        let provider_home = managed_root.join("provider-keyed");
+        let subject_home = managed_root.join("subject-keyed");
+        let path_home = managed_root.join("path-keyed");
+        for home in [&provider_home, &subject_home, &path_home] {
+            std::fs::create_dir_all(home).unwrap();
+        }
+
+        // provider_account_id readable -> keyed by provider, ignoring subject.
+        write_auth_payload(
+            &provider_home,
+            serde_json::json!({ "email": "p@example.com", "sub": "auth0|ignored-subject" }),
+            Some("prov-1"),
+        );
+        // provider absent, auth_subject readable -> keyed by subject.
+        write_auth_payload(
+            &subject_home,
+            serde_json::json!({ "email": "s@example.com", "sub": "auth0|subject-2" }),
+            None,
+        );
+        // neither provider nor subject readable -> keyed by standardized home path.
+        write_auth_payload(
+            &path_home,
+            serde_json::json!({ "email": "h@example.com" }),
+            None,
+        );
+
+        let manager = CodexAccountManager::new();
+        let pass_one = manager.discover_managed_accounts(&[]).unwrap();
+        let pass_two = manager.discover_managed_accounts(&[]).unwrap();
+
+        fn id_for(accounts: &[CodexAccount], home: &Path) -> Uuid {
+            let found = accounts
+                .iter()
+                .find(|a| a.codex_home_path.as_path() == home);
+            found.expect("home present in discovery").id
+        }
+
+        assert_eq!(
+            id_for(&pass_one, provider_home.as_path()),
+            derive_account_uuid("provider:prov-1")
+        );
+        assert_eq!(
+            id_for(&pass_one, subject_home.as_path()),
+            derive_account_uuid("subject:auth0|subject-2")
+        );
+        assert_eq!(
+            id_for(&pass_one, path_home.as_path()),
+            derive_account_uuid(&format!("home:{}", managed_home_key(&path_home)))
+        );
+
+        for home in [&provider_home, &subject_home, &path_home] {
+            assert_eq!(
+                id_for(&pass_one, home.as_path()),
+                id_for(&pass_two, home.as_path())
+            );
+        }
+
+        super::super::file_locations::clear_app_support_directory_override();
+    }
+
+    #[test]
+    fn persisted_account_id_wins_over_derived_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::file_locations::with_app_support_directory(root.to_path_buf());
+
+        let home = root.join("managed-homes").join("persisted-home");
+        std::fs::create_dir_all(&home).unwrap();
+        write_auth(&home, "stored@example.com", "provider-stored");
+
+        let stored_id = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let mut stored = make_account(home.clone(), "stored@example.com", "provider-stored");
+        stored.id = stored_id;
+
+        let store = super::super::stores::AccountStore::new();
+        store.save(std::slice::from_ref(&stored), None).unwrap();
+
+        let manager = CodexAccountManager::new();
+        let existing = store.load_accounts().unwrap();
+        let discovered = manager.discover_managed_accounts(&existing).unwrap();
+        let found = discovered
+            .iter()
+            .find(|a| a.codex_home_path.as_path() == home.as_path())
+            .expect("home discovered");
+        assert_eq!(found.id, stored_id, "discovery must reuse the persisted id");
+
+        // Mimic the reconcile in load_codex_accounts: start from persisted, merge fresh.
+        let mut reconciled = stored.clone();
+        if let Some(fresh) = discovered.iter().find(|fresh| fresh.matches(&reconciled)) {
+            reconciled.merge_from(fresh);
+        }
+        assert_eq!(reconciled.id, stored_id);
+
+        store.save(std::slice::from_ref(&reconciled), None).unwrap();
+        let reloaded = store.load_accounts().unwrap();
+        assert_eq!(
+            reloaded[0].id, stored_id,
+            "accounts.json id must not be rewritten"
+        );
+
+        super::super::file_locations::clear_app_support_directory_override();
+    }
+
+    #[test]
+    fn switch_to_discovered_account_resolved_by_id_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::file_locations::with_app_support_directory(root.to_path_buf());
+
+        let ambient_home = root.join(".codex");
+        let target_home = root.join("managed-homes").join("discovered-switch-target");
+        let desktop_session_root = root.join("package-session");
+        std::fs::create_dir_all(&ambient_home).unwrap();
+        std::fs::create_dir_all(&target_home).unwrap();
+        std::fs::create_dir_all(&desktop_session_root).unwrap();
+
+        write_auth(
+            &ambient_home,
+            "old@example.com",
+            "1ea93d04-5c50-42e3-857b-3db850785967",
+        );
+        write_auth(
+            &target_home,
+            "new@example.com",
+            "83c5ae92-f5ee-41f8-9528-199110d1d0f9",
+        );
+
+        super::super::file_locations::with_ambient_codex_home(ambient_home.clone());
+        super::super::file_locations::with_codex_desktop_session_root(desktop_session_root);
+
+        let manager = CodexAccountManager::new();
+        let mut accounts = manager.discover_managed_accounts(&[]).unwrap();
+        if let Some(ambient) = manager.discover_ambient_account(&[]) {
+            accounts.push(ambient);
+        }
+
+        let listed_id = accounts
+            .iter()
+            .find(|a| a.codex_home_path.as_path() == target_home.as_path())
+            .expect("target discovered")
+            .id
+            .to_string();
+
+        // Resolve exactly how commands/codex_accounts.rs does: by id string.
+        let target = accounts
+            .iter()
+            .find(|a| a.id.to_string() == listed_id)
+            .cloned()
+            .expect("discovered account resolves by its listed id");
+
+        manager
+            .switch_active_account(&target, &accounts)
+            .expect("switch by discovered id should succeed");
 
         super::super::file_locations::clear_app_support_directory_override();
         super::super::file_locations::clear_ambient_codex_home_override();
