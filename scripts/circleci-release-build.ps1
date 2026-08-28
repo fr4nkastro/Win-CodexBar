@@ -76,7 +76,7 @@ function Clear-DirectoryContents {
 
 if (-not (Test-CanonicalReleaseTag $Tag)) { throw "Invalid canonical release tag '$Tag'." }
 if ($Sha -notmatch '^[0-9a-fA-F]{40}$') { throw "Invalid immutable SHA '$Sha'." }
-if ((Normalize-GitHubRepository $Repository) -ne 'nesszer/win-codexbar') { throw 'Repository must be canonical nesszer/Win-CodexBar.' }
+if ((Normalize-GitHubRepository $Repository) -notmatch '(^|/)win-codexbar$') { throw "Repository must be a Win-CodexBar repository; got '$Repository'." }
 if (-not (Test-Path -LiteralPath $RepoRoot -PathType Container)) { throw "Missing repository root: $RepoRoot" }
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
@@ -108,7 +108,8 @@ try {
         '-AssetsDir', $assetsDir,
         '-OutputDir', $OutputDir,
         '-Tag', $Tag,
-        '-Sha', $Sha
+        '-Sha', $Sha,
+        '-Repository', $Repository
     ) (Join-Path $OutputDir 'emit-release-manifest.log')
     Write-Host "Credential-free release build passed for $Tag ($Sha)."
 } finally {

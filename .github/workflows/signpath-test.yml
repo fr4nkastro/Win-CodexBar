@@ -40,9 +40,10 @@ jobs:
         env:
           CIRCLE_TAG: ${{ inputs.tag }}
           CIRCLE_SHA1: ${{ steps.tag-sha.outputs.sha }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
         run: |
           $ErrorActionPreference = 'Stop'
-          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/release-preflight.ps1 -Tag $env:CIRCLE_TAG -Sha $env:CIRCLE_SHA1 -RepoRoot .
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/release-preflight.ps1 -Tag $env:CIRCLE_TAG -Sha $env:CIRCLE_SHA1 -RepoRoot . -Repository $env:RELEASE_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw "release-preflight failed: $LASTEXITCODE" }
 
       - name: Build release artifacts
@@ -50,9 +51,10 @@ jobs:
         env:
           CIRCLE_TAG: ${{ inputs.tag }}
           CIRCLE_SHA1: ${{ steps.tag-sha.outputs.sha }}
+          RELEASE_REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: |
           $ErrorActionPreference = 'Stop'
-          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/circleci-release-build.ps1 -Tag $env:CIRCLE_TAG -Sha $env:CIRCLE_SHA1 -RepoRoot .
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/circleci-release-build.ps1 -Tag $env:CIRCLE_TAG -Sha $env:CIRCLE_SHA1 -RepoRoot . -Repository $env:RELEASE_REPO_URL
           if ($LASTEXITCODE -ne 0) { throw "circleci-release-build failed: $LASTEXITCODE" }
 
       - name: Prepare version (strip v prefix)
@@ -139,5 +141,5 @@ jobs:
           $assets = Get-ChildItem "$outputDir\CodexBar-$version-*" |
             Where-Object { $_.Name -notmatch '\.log$' } |
             Select-Object -ExpandProperty FullName
-          gh release create $tag --repo nesszer/Win-CodexBar --draft --title "Win-CodexBar $version" --notes "Release $version" @assets
+          gh release create $tag --repo ${{ github.repository }} --draft --title "Win-CodexBar $version" --notes "Release $version" @assets
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed: $LASTEXITCODE" }
