@@ -504,7 +504,7 @@ fn nonnegative_u64(value: Option<&Value>) -> Option<u64> {
         return Some(number);
     }
     let number = value.as_f64()?;
-    (number.is_finite() && number >= 0.0 && number <= u64::MAX as f64).then_some(number as u64)
+    (number.is_finite() && number >= 0.0 && number < u64::MAX as f64).then_some(number as u64)
 }
 
 fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -709,8 +709,12 @@ mod tests {
         assert_eq!(nonnegative_u64(Some(&serde_json::json!(12.0))), Some(12));
         // Fractional floats are accepted via `as u64` truncation.
         assert_eq!(nonnegative_u64(Some(&serde_json::json!(1.5))), Some(1));
-        // `u64::MAX as f64` rounds up to 2^64; f64 spacing there is 4096, so
-        // +2048.0 rounds back into range. First out-of-range step is +4096.0.
+        // `u64::MAX as f64` rounds up to 2^64 and must be rejected before the
+        // conversion can saturate to `u64::MAX`.
+        assert_eq!(
+            nonnegative_u64(Some(&serde_json::json!(u64::MAX as f64))),
+            None
+        );
         assert_eq!(
             nonnegative_u64(Some(&serde_json::json!(u64::MAX as f64 + 4096.0))),
             None
