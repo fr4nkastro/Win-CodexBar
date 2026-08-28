@@ -454,9 +454,25 @@ impl TtyCommandRunner {
 
             // Check if process has exited
             if let Ok(Some(_)) = child.try_wait() {
-                // Process exited, drain remaining output
-                while let Ok(chunk) = rx.try_recv() {
-                    buffer.push_str(&chunk);
+                // Process exited; the reader thread may still be forwarding
+                // the final bytes, so drain with bounded blocking receives
+                // instead of one nonblocking sweep that can race the reader
+                // and lose them. Disconnected ends the drain immediately;
+                // the overall deadline bounds it so a reader held open by
+                // inherited handles cannot hang.
+                let drain_deadline = Instant::now() + Duration::from_millis(250);
+                loop {
+                    let remaining = drain_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match rx.recv_timeout(remaining.min(Duration::from_millis(25))) {
+                        Ok(chunk) => buffer.push_str(&chunk),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        // Quiet slice: keep waiting until the deadline so
+                        // slowly forwarded tail output is not lost.
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
                 }
                 break;
             }
