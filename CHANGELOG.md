@@ -1,5 +1,20 @@
 # Changelog
 
+## [Windows] 0.55.1 - 2026-08-28
+
+### Fixed
+- Codex accounts: switching, removing, or fetching a Codex account discovered on
+  disk but not yet stored no longer fails with "Codex account not found."
+  Discovered accounts now get a stable id derived from their managed-home
+  directory name or their account identity, so the id the UI lists still
+  resolves on the follow-up action (#1).
+- Codex accounts: usage snapshots stay attached to discovered accounts across
+  refresh cycles. Per-account `snapshots.json` usage keys reset once after
+  upgrading to this version and self-heal on the next refresh; entries recorded
+  under the previous rotating ids are ignored.
+
+---
+
 ## [Windows] 0.55.0 - 2026-08-25
 
 Windows port of upstream CodexBar **0.54.0 → 0.55.0**, plus the Windows Grok OAuth routing fix from issue #362.
