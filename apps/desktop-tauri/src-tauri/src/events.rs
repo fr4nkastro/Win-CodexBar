@@ -21,6 +21,7 @@ pub const UPDATE_STATE_CHANGED: &str = "update-state-changed";
 pub const LOCALE_CHANGED: &str = "locale-changed";
 pub const SETTINGS_CHANGED: &str = "settings-changed";
 pub const CODEX_ACCOUNTS_UPDATED: &str = "codex-accounts-updated";
+pub const CLAUDE_ACCOUNTS_UPDATED: &str = "claude-accounts-updated";
 pub const LOGIN_PHASE: &str = "login-phase";
 
 // ── Payloads ─────────────────────────────────────────────────────────
@@ -102,6 +103,13 @@ pub fn emit_refresh_complete(app: &AppHandle, provider_count: usize, error_count
 /// `get_codex_accounts_state`.
 pub fn emit_codex_accounts_updated(app: &AppHandle) {
     let _emit_codex_accounts = app.emit(CODEX_ACCOUNTS_UPDATED, ());
+}
+
+/// Broadcast that the Claude account snapshot store was refreshed, or that a
+/// managed account was added/switched/removed. Payload-less; listeners
+/// re-fetch via `get_claude_accounts_state`.
+pub fn emit_claude_accounts_updated(app: &AppHandle) {
+    let _emit_claude_accounts = app.emit(CLAUDE_ACCOUNTS_UPDATED, ());
 }
 
 pub fn emit_update_state_changed(app: &AppHandle, payload: &UpdateStatePayload) {

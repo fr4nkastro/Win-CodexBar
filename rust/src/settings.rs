@@ -321,6 +321,15 @@ pub struct Settings {
     #[serde(default)]
     pub claude_allow_reading_claude_code_credentials: bool,
 
+    /// Explicit consent to add, switch, or remove managed Claude Code
+    /// accounts (multi-account support). Default OFF — every write path in
+    /// `claude_accounts` (add/switch/remove) is rejected before touching
+    /// disk unless this is `true`. Distinct from
+    /// `claude_allow_reading_claude_code_credentials`, which only gates
+    /// read/refresh of the ambient credentials.
+    #[serde(default)]
+    pub claude_allow_managing_claude_code_accounts: bool,
+
     /// Optional work-week length [2,6] for session-equivalent weekly forecast.
     /// `None` uses wall-clock time until weekly reset.
     #[serde(default)]
@@ -550,6 +559,7 @@ impl Default for Settings {
             promote_tray_icon: true,
             claude_daily_routines_usage_visible: true,
             claude_allow_reading_claude_code_credentials: false,
+            claude_allow_managing_claude_code_accounts: false,
             weekly_progress_work_days: None,
             alibaba_token_plan_region: default_alibaba_token_plan_region(),
             codex_external_oauth_sources_allowed: false,

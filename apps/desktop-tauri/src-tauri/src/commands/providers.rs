@@ -395,6 +395,17 @@ fn spawn_provider_refreshes(
         }));
     }
 
+    // Same multi-account lane pattern for Claude (design decision D5): the
+    // ambient-matching account reuses the existing ClaudeOAuthFetcher::fetch()
+    // path, other managed directories use the per-dir path.
+    if inputs.enabled_ids.contains(&ProviderId::Claude) {
+        let app_handle = app.clone();
+        let fetch_permits = Arc::clone(&fetch_permits);
+        handles.push(tokio::spawn(async move {
+            super::claude_accounts::refresh_claude_account_lanes(app_handle, fetch_permits).await;
+        }));
+    }
+
     handles
 }
 
