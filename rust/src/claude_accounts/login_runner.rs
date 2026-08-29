@@ -115,13 +115,11 @@ pub struct ClaudeLoginRunner;
 
 impl ClaudeLoginRunner {
     /// Resolve the `claude` executable via `PATH`.
-    ///
-    /// RED stub (task 1.13): unconditionally returns a placeholder path,
-    /// ignoring both the real `which::which` lookup and the test override —
-    /// deliberately wrong so `run_returns_missing_binary_when_claude_not_found`
-    /// fails until the GREEN commit implements this for real.
     pub fn locate_claude_binary() -> Option<PathBuf> {
-        Some(PathBuf::from("claude"))
+        if let Some(overridden) = BINARY_OVERRIDE.with(|cell| cell.borrow().clone()) {
+            return overridden;
+        }
+        which::which("claude").ok()
     }
 
     pub fn run(
@@ -176,15 +174,14 @@ impl ClaudeLoginRunner {
     }
 }
 
-/// Build the login subprocess command.
-///
-/// RED stub (task 1.14): deliberately omits the `CLAUDE_CONFIG_DIR` env
-/// override so `build_login_command_scopes_only_config_dir_env` fails until
-/// the GREEN commit fixes this.
-fn build_login_command(binary: &Path, _dir: &Path) -> Command {
+/// Build the login subprocess command: fixed args, `Stdio::piped`, and
+/// exactly one overridden env var (`CLAUDE_CONFIG_DIR`) on top of the
+/// inherited environment.
+fn build_login_command(binary: &Path, dir: &Path) -> Command {
     let mut command = Command::new(binary);
     command
         .args(LOGIN_ARGS)
+        .env("CLAUDE_CONFIG_DIR", dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
