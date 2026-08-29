@@ -16,6 +16,8 @@ pub mod file_locations;
 pub mod identity;
 pub mod login_runner;
 pub mod models;
+pub mod stores;
+pub mod usage;
 
 pub use account_manager::{ClaudeAccountManager, ClaudeAccountManagerError, ClaudeSwitchResult};
 pub use identity::{
@@ -27,3 +29,4 @@ pub use models::{
     ClaudeAccount, ClaudeAccountSource, ClaudeAccountUsageSnapshot, RemovedAccountIdentity,
     UsageWindowSnapshot, utc_now,
 };
+pub use stores::{ClaudeAccountStore, ClaudeSnapshotStore};
