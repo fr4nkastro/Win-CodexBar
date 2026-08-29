@@ -5,6 +5,7 @@
 
 pub mod agent_sessions;
 pub mod browser;
+pub mod claude_accounts;
 pub mod cli;
 pub mod codex_accounts;
 pub mod codex_workspaces;
