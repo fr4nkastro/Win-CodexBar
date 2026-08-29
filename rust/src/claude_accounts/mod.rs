@@ -14,6 +14,7 @@ pub mod account_manager;
 pub mod credentials_merge;
 pub mod file_locations;
 pub mod identity;
+pub mod lanes;
 pub mod login_runner;
 pub mod models;
 pub mod stores;
@@ -30,6 +31,7 @@ pub use identity::{
     load_identity_from_path, parse_auth_status_json, parse_claude_json_identity,
     stable_discovered_id,
 };
+pub use lanes::{LaneGroup, group_lanes_by_identity};
 pub use login_runner::{ClaudeLoginOutcome, ClaudeLoginResult, ManagedLoginProcess};
 pub use models::{
     ClaudeAccount, ClaudeAccountSource, ClaudeAccountUsageSnapshot, RemovedAccountIdentity,

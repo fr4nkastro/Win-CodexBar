@@ -234,10 +234,15 @@ export default function MenuCard({
     showPace,
   );
   const { hasDetails } = presence;
+  // A bounded, self-healing OAuth 429 backoff arrives with `transient: true`
+  // and its `error` text still set. Render it as the refreshing affordance,
+  // not the red error banner — the OAuth layer's own retry window clears it.
+  const refreshing = isRefreshing || provider.transient === true;
+  const showError = Boolean(provider.error) && provider.transient !== true;
   const cardClassName = [
     "menu-card",
-    provider.error ? "menu-card--error" : null,
-    isRefreshing ? "menu-card--refreshing" : null,
+    showError ? "menu-card--error" : null,
+    refreshing ? "menu-card--refreshing" : null,
     hasDetails ? "menu-card--with-details" : "menu-card--header-only",
   ]
     .filter(Boolean)
@@ -246,17 +251,17 @@ export default function MenuCard({
   return (
     <article
       className={cardClassName}
-      aria-busy={isRefreshing}
+      aria-busy={refreshing}
       style={accentColor ? ({ "--provider-accent": accentColor } as CSSProperties) : undefined}
     >
       <header className="menu-card__header">
         <div className="menu-card__title-row">
           <div className="menu-card__name-group">
             <span className="menu-card__name">{provider.displayName}</span>
-            {!provider.error && email && <span className="menu-card__email">{email}</span>}
+            {!showError && email && <span className="menu-card__email">{email}</span>}
           </div>
         </div>
-        {provider.error ? (
+        {showError && provider.error ? (
           <div className="menu-card__error-block">
             <div className="menu-card__error-text">{provider.error}</div>
             <CopyIconButton text={provider.error} />
@@ -264,9 +269,11 @@ export default function MenuCard({
         ) : (
           <div className="menu-card__subtitle-row">
             <span className="menu-card__subtitle">
-              {Number.isNaN(Date.parse(provider.updatedAt))
-                ? provider.updatedAt
-                : formatRelativeUpdated(Date.parse(provider.updatedAt), t)}
+              {refreshing && !hasDetails
+                ? t("SummaryRefreshing")
+                : Number.isNaN(Date.parse(provider.updatedAt))
+                  ? provider.updatedAt
+                  : formatRelativeUpdated(Date.parse(provider.updatedAt), t)}
             </span>
             {planName && (
               <span className="menu-card__plan-badge">{planName}</span>

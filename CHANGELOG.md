@@ -1,5 +1,27 @@
 # Changelog
 
+## [Windows] 0.56.3 - 2026-08-29
+
+### Fixed
+- Claude accounts: a newly added account now appears without an app restart.
+  `claude_account_add` emits `claude-accounts-updated` at the mutation site
+  (mirroring remove/switch), and the Settings add flow re-probes providers, so
+  the tray Claude submenu and the provider card reflect the new account
+  immediately (#16).
+- Claude usage: a transient OAuth rate-limit (HTTP 429) inside its own bounded
+  retry window no longer renders as the red "usage failed from all configured
+  sources" error when it is the only usable source and there is no last-good
+  snapshot. The card shows the transient "refreshing" affordance instead and
+  clears itself when the backoff window elapses; non-429 failures, exhausted
+  backoff, and hard auth loss still surface the error banner (#16).
+- Claude usage: the post-add usage-probe burst is coalesced to one
+  `GET /api/oauth/usage` per distinct account identity (normalized `org_id`,
+  else `email_hint`, else config directory). Ambient and managed accounts that
+  resolve to the same identity share one result; the ambient lane always runs
+  so its refresh token still rotates (#16).
+
+---
+
 ## [Windows] 0.56.2 - 2026-08-29
 
 ### Fixed

@@ -603,6 +603,13 @@ export interface ProviderUsageSnapshot {
   sourceLabel: string;
   updatedAt: string;
   error: string | null;
+  /**
+   * Bounded, self-healing failure (Claude OAuth 429 backoff) with no last-good
+   * snapshot to fall back to. `error` is still populated for logs/copy; the
+   * card renders the refreshing affordance instead of the red error banner
+   * while this is true.
+   */
+  transient?: boolean;
   pace: PaceSnapshot | null;
   accountOrganization: string | null;
   trayStatusLabel: string | null;

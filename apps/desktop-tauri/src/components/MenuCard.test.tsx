@@ -619,4 +619,39 @@ describe("MenuCard", () => {
 
     expect(await screen.findByText("3分前")).toBeInTheDocument();
   });
+
+  it("renders a transient OAuth backoff as refreshing, not a red error", async () => {
+    const snapshot = provider(
+      "Claude usage failed from all configured sources. OAuth: rate limited.",
+    );
+    snapshot.transient = true;
+
+    const { container } = renderCard(snapshot);
+
+    expect(await screen.findByText("SummaryRefreshing")).toBeInTheDocument();
+    expect(container.querySelector(".menu-card__error-text")).not.toBeInTheDocument();
+    expect(container.querySelector(".menu-card--refreshing")).toBeInTheDocument();
+    expect(container.querySelector(".menu-card--error")).not.toBeInTheDocument();
+    expect(container.querySelector('article[aria-busy="true"]')).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Claude usage failed from all configured sources. OAuth: rate limited.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("still shows the red error banner when a failure is not transient", async () => {
+    const snapshot = provider("OAuth error: Claude OAuth credentials not found.");
+    // `transient` absent — regression guard for the non-bounded failure path.
+
+    const { container } = renderCard(snapshot);
+
+    expect(
+      await screen.findByText("OAuth error: Claude OAuth credentials not found."),
+    ).toBeInTheDocument();
+    expect(container.querySelector(".menu-card__error-text")).toBeInTheDocument();
+    expect(container.querySelector(".menu-card--error")).toBeInTheDocument();
+    expect(container.querySelector(".menu-card--refreshing")).not.toBeInTheDocument();
+    expect(screen.queryByText("SummaryRefreshing")).not.toBeInTheDocument();
+  });
 });

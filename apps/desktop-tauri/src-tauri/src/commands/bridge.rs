@@ -194,6 +194,13 @@ pub struct ProviderUsageSnapshot {
     pub updated_at: String,
     #[serde(default)]
     pub error: Option<String>,
+    /// Bounded, self-healing failure (Claude OAuth 429 backoff) with no
+    /// last-good snapshot to fall back to. `error` is retained for logs/copy;
+    /// surfaces render the refreshing affordance instead of the error banner
+    /// while this is set (design D5). Additive + `#[serde(default)]` so
+    /// persisted caches and seed JSON deserialize unchanged.
+    #[serde(default)]
+    pub transient: bool,
     #[serde(default)]
     pub pace: Option<PaceSnapshot>,
     #[serde(default)]
@@ -380,6 +387,7 @@ impl ProviderUsageSnapshot {
             source_label: result.source_label.clone(),
             updated_at: usage.updated_at.to_rfc3339(),
             error: None,
+            transient: false,
             pace,
             account_organization: usage.account_organization.clone(),
             tray_status_label: None,
@@ -420,6 +428,7 @@ impl ProviderUsageSnapshot {
             source_label: String::new(),
             updated_at: chrono::Utc::now().to_rfc3339(),
             error: Some(error),
+            transient: false,
             pace: None,
             account_organization: None,
             tray_status_label: None,

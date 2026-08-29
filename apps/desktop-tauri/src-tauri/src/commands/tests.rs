@@ -1418,3 +1418,83 @@ fn bootstrap_payload_exposes_every_provider_variant() {
     assert!(encoded.contains("\"providers\""));
     assert!(encoded.contains("\"settings\""));
 }
+
+// ── Bounded OAuth 429 backoff → transient presentation (R4-classify / R5) ──
+//
+// CI-only (Blacksmith Windows): the Tauri crate cannot link under WSL2, so
+// these run in `cargo test --workspace` on the Windows runner, never locally.
+//
+// Coverage split: the positive path (a 429 error while the OAuth backoff gate
+// is live and within the 300s ceiling → `transient == true`) is exercised in
+// the `codexbar` crate — `providers::claude::oauth::tests::
+// rate_limit_backoff_peek_reports_without_mutating` — plus the MenuCard render
+// test, because this crate has no public API to arm the process-global gate.
+// What is checkable here is the guard: without a live gate, and for every
+// non-429 / hard-auth failure, `transient` stays false and the error surfaces.
+
+#[test]
+fn is_bounded_oauth_backoff_is_false_for_non_rate_limit_errors() {
+    assert!(!super::providers::is_bounded_oauth_backoff(Some(
+        "OAuth error: API error 500: internal"
+    )));
+    assert!(!super::providers::is_bounded_oauth_backoff(Some(
+        "OAuth error: Claude OAuth credentials not found. Run `claude` to authenticate."
+    )));
+    assert!(!super::providers::is_bounded_oauth_backoff(None));
+}
+
+#[test]
+fn is_bounded_oauth_backoff_needs_a_live_gate_even_for_rate_limit_text() {
+    // Rate-limit wording alone is not enough — with no active backoff gate the
+    // predicate is false, so an exhausted / stale 429 fails open to the banner.
+    assert!(!super::providers::is_bounded_oauth_backoff(Some(
+        "Claude usage failed from all configured sources. OAuth: Claude OAuth usage endpoint is rate limited."
+    )));
+}
+
+#[test]
+fn claude_bounded_backoff_without_gate_keeps_error_and_is_not_transient() {
+    let metadata = instantiate_provider(ProviderId::Claude).metadata().clone();
+    let err = ProviderUsageSnapshot::from_error(
+        ProviderId::Claude,
+        &metadata,
+        "Claude usage failed from all configured sources. OAuth: Claude OAuth usage endpoint is rate limited. Retrying in about 20s; credentials were preserved.".to_string(),
+    );
+    let mut state = AppState::new();
+    // No error-free snapshot cached → falls through to the transient branch.
+    let out =
+        super::providers::preserve_last_good_transient_failure(&mut state, ProviderId::Claude, err);
+    assert!(out.error.is_some(), "error text is retained for logs/copy");
+    assert!(!out.transient, "no live gate ⇒ no transient suppression");
+}
+
+#[test]
+fn claude_hard_auth_loss_is_never_transient() {
+    let metadata = instantiate_provider(ProviderId::Claude).metadata().clone();
+    let err = ProviderUsageSnapshot::from_error(
+        ProviderId::Claude,
+        &metadata,
+        "OAuth error: Claude OAuth credentials not found. Run `claude` to authenticate."
+            .to_string(),
+    );
+    let mut state = AppState::new();
+    let out =
+        super::providers::preserve_last_good_transient_failure(&mut state, ProviderId::Claude, err);
+    assert!(out.error.is_some());
+    assert!(!out.transient);
+}
+
+#[test]
+fn claude_non_rate_limit_failure_is_never_transient() {
+    let metadata = instantiate_provider(ProviderId::Claude).metadata().clone();
+    let err = ProviderUsageSnapshot::from_error(
+        ProviderId::Claude,
+        &metadata,
+        "OAuth error: API error 500: upstream failure".to_string(),
+    );
+    let mut state = AppState::new();
+    let out =
+        super::providers::preserve_last_good_transient_failure(&mut state, ProviderId::Claude, err);
+    assert!(out.error.is_some());
+    assert!(!out.transient);
+}

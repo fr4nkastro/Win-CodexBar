@@ -1,6 +1,11 @@
 use super::{ClaudeOAuthCredentials, ClaudeOAuthFetcher, OAuthUsageResponse, UsageWindow};
 use reqwest::header::HeaderValue;
+use std::sync::Mutex;
 use std::time::Duration;
+
+/// Serializes the tests that mutate the process-global rate-limit gate so the
+/// parallel test runner cannot interleave their `record`/`clear` calls.
+static RATE_LIMIT_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn keeps_sub_one_utilization_in_percent_units() {
@@ -287,6 +292,9 @@ fn invalid_retry_after_uses_default_backoff() {
 
 #[test]
 fn rate_limit_gate_blocks_and_clears() {
+    let _guard = RATE_LIMIT_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     ClaudeOAuthFetcher::clear_rate_limit();
 
     ClaudeOAuthFetcher::record_rate_limit(Duration::from_secs(30));
@@ -294,6 +302,34 @@ fn rate_limit_gate_blocks_and_clears() {
 
     ClaudeOAuthFetcher::clear_rate_limit();
     assert!(ClaudeOAuthFetcher::rate_limit_backoff_remaining().is_none());
+}
+
+#[test]
+fn rate_limit_backoff_peek_reports_without_mutating() {
+    let _guard = RATE_LIMIT_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ClaudeOAuthFetcher::clear_rate_limit();
+
+    // Unset gate → None.
+    assert!(ClaudeOAuthFetcher::rate_limit_backoff_peek().is_none());
+
+    // Active bounded window → Some(remaining); repeated peeks never clear a
+    // live gate.
+    ClaudeOAuthFetcher::record_rate_limit(Duration::from_secs(300));
+    assert!(ClaudeOAuthFetcher::rate_limit_backoff_peek().is_some());
+    assert!(ClaudeOAuthFetcher::rate_limit_backoff_peek().is_some());
+    assert!(
+        ClaudeOAuthFetcher::rate_limit_backoff_remaining().is_some(),
+        "peek must leave a live gate intact"
+    );
+
+    // Elapsed window → None (self-heals); peek still does not touch the gate.
+    ClaudeOAuthFetcher::record_rate_limit(Duration::from_millis(1));
+    std::thread::sleep(Duration::from_millis(15));
+    assert!(ClaudeOAuthFetcher::rate_limit_backoff_peek().is_none());
+
+    ClaudeOAuthFetcher::clear_rate_limit();
 }
 
 #[test]

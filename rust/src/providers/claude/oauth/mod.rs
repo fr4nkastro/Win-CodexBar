@@ -467,6 +467,27 @@ impl ClaudeOAuthFetcher {
         }
     }
 
+    /// Non-mutating view of the rate-limit backoff gate.
+    ///
+    /// Returns the remaining backoff duration while a bounded window is active,
+    /// or `None` when the gate is unset or has already elapsed. Unlike
+    /// [`Self::rate_limit_backoff_remaining`] this never clears an expired
+    /// gate — callers that only need to *observe* the throttle state (e.g. the
+    /// desktop layer deciding whether a 429 should present as a transient
+    /// "refreshing" state) use this so they do not race the fetch path that
+    /// owns the gate lifecycle. The gate still self-expires on the next real
+    /// fetch, so suppression bounded by this value ends on its own.
+    pub fn rate_limit_backoff_peek() -> Option<Duration> {
+        let guard = Self::rate_limit_gate().lock().ok()?;
+        let until = (*guard)?;
+        let now = Instant::now();
+        if until <= now {
+            None
+        } else {
+            Some(until.saturating_duration_since(now))
+        }
+    }
+
     fn record_rate_limit(duration: Duration) {
         if let Ok(mut guard) = Self::rate_limit_gate().lock() {
             *guard = Some(Instant::now() + duration);
