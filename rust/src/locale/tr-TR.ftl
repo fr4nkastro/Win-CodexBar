@@ -299,6 +299,7 @@ CodexAccountsRemoveButton = Kaldır
 CodexAccountsEmpty = Codex hesabı bulunamadı.
 CodexAccountsSourceAmbient = Ortam
 CodexAccountsSourceManaged = Yönetilen
+CodexAccountsActive = Etkin
 CodexAccountsUsageUnavailable = Kullanım verisi yok
 CodexSwitchSuccess = Etkin hesap değiştirildi.
 CodexSwitchRestartPrompt = Geri yüklenen oturumu açmak için Codex Desktop yeniden başlatılsın mı?

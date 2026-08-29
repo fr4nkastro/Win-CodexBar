@@ -14,6 +14,7 @@ import {
   codexAccountRestartDesktop,
   codexAccountSwitch,
   getCodexAccountsState,
+  refreshProviders,
 } from "../../../../../lib/tauri";
 
 interface Props {
@@ -36,6 +37,7 @@ export function CodexAccountsSection({ t }: Props) {
   const [snapshots, setSnapshots] = useState<
     Record<string, CodexAccountUsageSnapshot>
   >({});
+  const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -50,6 +52,7 @@ export function CodexAccountsSection({ t }: Props) {
       const next: CodexAccountsStateBridge = await getCodexAccountsState();
       setAccounts(next.accounts);
       setSnapshots(next.snapshots);
+      setActiveAccountId(next.activeAccountId ?? null);
       setLoaded(true);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -97,6 +100,9 @@ export function CodexAccountsSection({ t }: Props) {
       const result = await codexAccountSwitch(id);
       setSwitchResult(result);
       await load();
+      // Mirror the tray menu: make the tray icon and Codex provider card
+      // reflect the now-active identity without waiting for a refresh tick.
+      void refreshProviders().catch(() => {});
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -202,6 +208,7 @@ export function CodexAccountsSection({ t }: Props) {
           <ul className="credential-list codex-accounts-list">
             {accounts.map((account) => {
               const snapshot = snapshots[account.id];
+              const isActive = account.id === activeAccountId;
               return (
                 <li
                   key={account.id}
@@ -221,6 +228,11 @@ export function CodexAccountsSection({ t }: Props) {
                             ? t("CodexAccountsSourceAmbient")
                             : t("CodexAccountsSourceManaged")}
                         </span>
+                        {isActive && (
+                          <span className="credential-card__badge credential-card__badge--set">
+                            {t("CodexAccountsActive")}
+                          </span>
+                        )}
                         {snapshot ? (
                           <CodexUsagePill snapshot={snapshot} t={t} />
                         ) : (
@@ -242,7 +254,7 @@ export function CodexAccountsSection({ t }: Props) {
                       <button
                         type="button"
                         className="credential-btn credential-btn--primary"
-                        disabled={busy}
+                        disabled={busy || isActive}
                         onClick={() => void handleSwitch(account.id)}
                       >
                         {t("CodexAccountsSwitchButton")}

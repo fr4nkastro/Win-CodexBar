@@ -19,7 +19,9 @@ pub mod login_runner;
 pub mod models;
 pub mod stores;
 
-pub use account_manager::{CodexAccountManager, CodexAccountManagerError, CodexSwitchResult};
+pub use account_manager::{
+    CodexAccountManager, CodexAccountManagerError, CodexSwitchResult, active_account_id,
+};
 pub use api::{AuthBackedIdentity, AuthCredentials, CodexAccountApi, CodexApiError, load_identity};
 pub use codex_desktop::{
     CodexDesktopControlError, build_restart_command, build_restart_script,

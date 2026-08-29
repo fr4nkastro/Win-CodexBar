@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use codexbar::codex_accounts::{
     AccountStore, CodexAccount, CodexAccountApi, CodexAccountManager, CodexAccountManagerError,
-    CodexApiError, CodexSwitchResult, SnapshotStore, restart_codex_desktop,
+    CodexApiError, CodexSwitchResult, SnapshotStore, active_account_id, restart_codex_desktop,
 };
 
 use crate::state::AppState;
@@ -311,6 +311,10 @@ fn into_api_message(error: CodexApiError) -> String {
 pub struct CodexAccountsStateBridge {
     pub accounts: Vec<CodexAccount>,
     pub snapshots: HashMap<Uuid, codexbar::codex_accounts::AccountUsageSnapshot>,
+    /// Id of the account whose identity matches the live `~/.codex/auth.json`,
+    /// or `None` when it is absent/unreadable or matches no listed account.
+    /// Additive and optional — legacy consumers ignore it.
+    pub active_account_id: Option<Uuid>,
 }
 
 #[tauri::command]
@@ -318,9 +322,13 @@ pub fn get_codex_accounts_state(
     state: tauri::State<'_, Mutex<AppState>>,
 ) -> Result<CodexAccountsStateBridge, String> {
     let _guard = state.lock().map_err(|e| e.to_string())?;
+    let accounts = load_codex_accounts()?;
+    let identity = CodexAccountManager::new().load_active_identity();
+    let active = active_account_id(&accounts, identity.as_ref());
     Ok(CodexAccountsStateBridge {
-        accounts: load_codex_accounts()?,
+        accounts,
         snapshots: codex_account_snapshots()?,
+        active_account_id: active,
     })
 }
 
@@ -358,6 +366,28 @@ mod tests {
         let json = serde_json::to_value(sample_account()).unwrap();
         assert!(json.get("codexHomePath").is_some());
         assert!(json.get("providerAccountId").is_some());
+    }
+
+    #[test]
+    fn accounts_state_bridge_serializes_active_account_id_camel_case() {
+        let account = sample_account();
+        let bridge = CodexAccountsStateBridge {
+            accounts: vec![account.clone()],
+            snapshots: HashMap::new(),
+            active_account_id: Some(account.id),
+        };
+        let json = serde_json::to_value(&bridge).unwrap();
+        assert_eq!(
+            json.get("activeAccountId").and_then(|v| v.as_str()),
+            Some(account.id.to_string().as_str())
+        );
+
+        let none = CodexAccountsStateBridge {
+            accounts: vec![],
+            snapshots: HashMap::new(),
+            active_account_id: None,
+        };
+        assert!(serde_json::to_value(&none).unwrap()["activeAccountId"].is_null());
     }
 
     /// Regression for issue #1: an account discovered on disk but never written
