@@ -19,10 +19,14 @@ pub mod models;
 pub mod stores;
 pub mod usage;
 
-pub use account_manager::{ClaudeAccountManager, ClaudeAccountManagerError, ClaudeSwitchResult};
+pub use account_manager::{
+    ClaudeAccountManager, ClaudeAccountManagerError, ClaudeSwitchResult, reconcile_stored_accounts,
+};
 pub use identity::{
     AmbientClaudeIdentity, AmbientOauthAccount, ClaudeIdentity, ClaudeIdentityError,
-    active_account_id, derive_account_uuid, parse_auth_status_json, stable_discovered_id,
+    active_account_id, claude_json_path, derive_account_uuid, load_identity_from_files,
+    load_identity_from_path, parse_auth_status_json, parse_claude_json_identity,
+    stable_discovered_id,
 };
 pub use login_runner::{ClaudeLoginOutcome, ClaudeLoginResult, ManagedLoginProcess};
 pub use models::{

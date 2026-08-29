@@ -1,7 +1,14 @@
-//! Pure JSON merge of the `claudeAiOauth` key, plus atomic read/write helpers
-//! for a `.credentials.json` root, used when switching the active Claude
-//! account (design decision D2: switch is a JSON key merge, never a whole-file
-//! copy, because `.credentials.json` also holds `mcpOAuth`).
+//! Key-scoped JSON merge for Claude Code state files, plus atomic read/write
+//! helpers. Used when switching the active Claude account: the switch is a
+//! JSON key merge, never a whole-file copy, because `.credentials.json` also
+//! holds `mcpOAuth` and ambient `~/.claude.json` holds ~74 KB of unrelated
+//! project/onboarding state (design decision D2).
+//!
+//! Two layers:
+//! - dir-based [`read_root`] / [`write_root`] for `<dir>/.credentials.json`;
+//! - path-based [`read_json_root`] / [`write_json_root_atomic`] /
+//!   [`merge_top_level_key`] for any JSON object file (e.g. ambient
+//!   `~/.claude.json`). The dir-based helpers delegate to the path-based ones.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -29,10 +36,10 @@ pub fn credentials_file_path(dir: &Path) -> PathBuf {
     dir.join(CREDENTIALS_FILE_NAME)
 }
 
-/// Read and parse a `.credentials.json` root from `dir`.
-pub fn read_root(dir: &Path) -> Result<serde_json::Value, CredentialsMergeError> {
-    let path = credentials_file_path(dir);
-    let content = fs::read_to_string(&path)?;
+/// Read and parse a JSON object root from `path`. A non-object root is an
+/// error; a malformed file surfaces as [`CredentialsMergeError::Json`].
+pub fn read_json_root(path: &Path) -> Result<serde_json::Value, CredentialsMergeError> {
+    let content = fs::read_to_string(path)?;
     let value: serde_json::Value = serde_json::from_str(&content)?;
     if !value.is_object() {
         return Err(CredentialsMergeError::Message(
@@ -42,19 +49,56 @@ pub fn read_root(dir: &Path) -> Result<serde_json::Value, CredentialsMergeError>
     Ok(value)
 }
 
-/// Atomically write a `.credentials.json` root to `dir` (temp file + rename).
-pub fn write_root(dir: &Path, value: &serde_json::Value) -> Result<(), CredentialsMergeError> {
-    let path = credentials_file_path(dir);
+/// Atomically write a JSON root to `path` (temp file + rename). The temp file
+/// name mirrors `credentials_store`'s `pid.counter` convention so concurrent
+/// writers never share a path.
+pub fn write_json_root_atomic(
+    path: &Path,
+    value: &serde_json::Value,
+) -> Result<(), CredentialsMergeError> {
     let serialized = serde_json::to_string_pretty(value)?;
-    fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(
-        ".credentials.json.codexbar-tmp.{}.{}",
+    let parent = path.parent().ok_or_else(|| {
+        CredentialsMergeError::Message("target path has no parent directory".to_string())
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            CredentialsMergeError::Message("target path has no file name".to_string())
+        })?;
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        "{file_name}.codexbar-tmp.{}.{}",
         std::process::id(),
         WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     fs::write(&tmp, serialized.as_bytes())?;
-    fs::rename(&tmp, &path)?;
+    fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Replace only `key` in `target` (which MUST be a JSON object) with `value`,
+/// leaving every sibling key byte-identical. Pure: never touches disk.
+pub fn merge_top_level_key(
+    target: &mut serde_json::Value,
+    key: &str,
+    value: serde_json::Value,
+) -> Result<(), CredentialsMergeError> {
+    let obj = target.as_object_mut().ok_or_else(|| {
+        CredentialsMergeError::Message("target JSON root is not an object".to_string())
+    })?;
+    obj.insert(key.to_string(), value);
+    Ok(())
+}
+
+/// Read and parse a `.credentials.json` root from `dir`.
+pub fn read_root(dir: &Path) -> Result<serde_json::Value, CredentialsMergeError> {
+    read_json_root(&credentials_file_path(dir))
+}
+
+/// Atomically write a `.credentials.json` root to `dir` (temp file + rename).
+pub fn write_root(dir: &Path, value: &serde_json::Value) -> Result<(), CredentialsMergeError> {
+    write_json_root_atomic(&credentials_file_path(dir), value)
 }
 
 /// Replace only the `claudeAiOauth` key in `ambient_root` with the value from

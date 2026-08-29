@@ -7,7 +7,7 @@ use uuid::Uuid;
 use codexbar::claude_accounts::{
     ClaudeAccount, ClaudeAccountManager, ClaudeAccountManagerError, ClaudeAccountSource,
     ClaudeAccountStore, ClaudeAccountUsageSnapshot, ClaudeSnapshotStore, ClaudeSwitchResult,
-    active_account_id, credentials_merge, usage,
+    active_account_id, credentials_merge, file_locations, reconcile_stored_accounts, usage,
 };
 use codexbar::core::{ProviderFetchResult, RateWindow};
 use codexbar::providers::claude::ClaudeOAuthFetcher;
@@ -51,17 +51,14 @@ pub(crate) fn load_claude_accounts() -> Result<Vec<ClaudeAccount>, String> {
         }
     }
 
-    // Reconcile persisted metadata (nickname, stored timestamps) for managed homes.
-    let mut reconciled: Vec<ClaudeAccount> = existing
-        .iter()
-        .map(|account| {
-            let mut account = account.clone();
-            if let Some(fresh) = managed.iter().find(|fresh| fresh.matches(&account)) {
-                account.merge_from(fresh);
-            }
-            account
-        })
-        .collect();
+    // Reconcile persisted metadata (nickname, stored timestamps) for managed
+    // homes, hydrate stale identities from each dir's own `.claude.json`, and
+    // drop managed rows whose dir no longer resolves on disk (#12).
+    let mut reconciled: Vec<ClaudeAccount> = reconcile_stored_accounts(
+        &existing,
+        &managed,
+        &file_locations::managed_configs_directory(),
+    );
 
     // Add any newly discovered accounts that are not yet persisted.
     for candidate in &merged {
