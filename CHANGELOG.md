@@ -1,5 +1,23 @@
 # Changelog
 
+## [Windows] 0.56.1 - 2026-08-29
+
+### Fixed
+- Claude accounts: managed accounts now resolve their identity (email, org,
+  org name) from each config directory's own `.claude.json` `oauthAccount`
+  instead of a stale stored record, so accounts render their email instead of a
+  shrunk directory UUID. Switching an account also key-merges the target's
+  `oauthAccount` into the ambient `~/.claude.json`, so the "Active" badge
+  reflects the switch immediately instead of lagging until the `claude` CLI
+  rewrites the file. Switching no longer spawns a duplicate account row on every
+  click (email-tolerant identity matching plus a dedupe-before-create guard in
+  materialization), and a failed identity write now rolls the credentials switch
+  back rather than leaving a half-switched state. A reconciliation pass on load
+  rebuilds placeholder stored records from disk and hides `.credentials.json`-only
+  directories with no resolvable identity (left on disk, never deleted) (#12).
+
+---
+
 ## [Windows] 0.56.0 - 2026-08-29
 
 ### Added
