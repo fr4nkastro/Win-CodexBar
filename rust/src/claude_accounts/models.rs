@@ -157,7 +157,12 @@ impl ClaudeAccount {
         {
             return true;
         }
-        if self.normalized_org_id().is_some() || other.normalized_org_id().is_some() {
+        // Reaching here with BOTH org ids known means they differ (the equal
+        // case already returned above) — genuinely distinct accounts. When only
+        // ONE side knows its org id, fall through to `email_hint`: a managed row
+        // hydrated from files must still unify with a store record that predates
+        // the per-directory identity fix (#12) and has `org_id: null`.
+        if self.normalized_org_id().is_some() && other.normalized_org_id().is_some() {
             return false;
         }
         if let (Some(a), Some(b)) = (self.normalized_email_hint(), other.normalized_email_hint())
@@ -246,12 +251,12 @@ impl RemovedAccountIdentity {
         {
             return true;
         }
-        if self
-            .org_id
-            .as_ref()
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false)
-            || account.org_id.as_ref().is_some()
+        // Bail only when BOTH sides have a normalized org id and they differ;
+        // otherwise fall through to `email_hint`. The right-hand side is now
+        // normalized consistently with the left — previously a raw `is_some()`
+        // let a whitespace-only `org_id` block the email fallback.
+        if normalize_identifier(self.org_id.as_deref()).is_some()
+            && account.normalized_org_id().is_some()
         {
             return false;
         }
@@ -451,5 +456,77 @@ mod tests {
             Some("org-other"),
         );
         assert!(!removed.matches(&other));
+    }
+
+    // ── email-tolerant matching (#12) ──────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    fn acct(id: &str, dir: &str, org_id: Option<&str>, email: Option<&str>) -> ClaudeAccount {
+        ClaudeAccount::new(
+            Uuid::parse_str(id).unwrap(),
+            None,
+            email.map(str::to_string),
+            org_id.map(str::to_string),
+            None,
+            None,
+            PathBuf::from(dir),
+            ClaudeAccountSource::ManagedByApp,
+            utc_now(),
+            utc_now(),
+            None,
+        )
+    }
+
+    #[test]
+    fn matches_is_email_tolerant_when_exactly_one_side_lacks_org_id() {
+        let with_org = acct(
+            "11111111-1111-1111-1111-111111111111",
+            "/x/a",
+            Some("org-1"),
+            Some("a@x.com"),
+        );
+        let without_org = acct(
+            "22222222-2222-2222-2222-222222222222",
+            "/y/b",
+            None,
+            Some("A@X.COM"),
+        );
+        assert!(with_org.matches(&without_org));
+        assert!(without_org.matches(&with_org));
+
+        // Both `matches` impls agree.
+        let removed = RemovedAccountIdentity::from_account(&without_org);
+        assert!(removed.matches(&with_org));
+
+        // A whitespace-only org id is treated as absent -> still tolerant.
+        let ws_org = acct(
+            "33333333-3333-3333-3333-333333333333",
+            "/z/c",
+            Some("   "),
+            Some("a@x.com"),
+        );
+        assert!(ws_org.matches(&with_org));
+        let removed_ws = RemovedAccountIdentity::from_account(&ws_org);
+        assert!(removed_ws.matches(&with_org));
+    }
+
+    #[test]
+    fn matches_still_separates_two_distinct_known_org_ids() {
+        let a = acct(
+            "11111111-1111-1111-1111-111111111111",
+            "/x/a",
+            Some("org-1"),
+            Some("shared@x.com"),
+        );
+        let b = acct(
+            "22222222-2222-2222-2222-222222222222",
+            "/y/b",
+            Some("org-2"),
+            Some("shared@x.com"),
+        );
+        assert!(!a.matches(&b));
+        assert!(!b.matches(&a));
+        let removed = RemovedAccountIdentity::from_account(&a);
+        assert!(!removed.matches(&b));
     }
 }

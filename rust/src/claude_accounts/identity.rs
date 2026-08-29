@@ -8,7 +8,7 @@
 //! `claude-accounts-updated` events.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -131,6 +131,92 @@ pub fn parse_auth_status_json(content: &str) -> Result<ClaudeIdentity, ClaudeIde
         org_name,
         subscription_type,
     })
+}
+
+/// Path to Claude Code's per-config-dir state file, `<config_dir>/.claude.json`.
+///
+/// This file is home-rooted only when `CLAUDE_CONFIG_DIR` is unset; when it is
+/// set — which is the case for every app-managed directory — Claude Code writes
+/// `<CLAUDE_CONFIG_DIR>/.claude.json`. Identity resolution for a managed
+/// account is therefore path-based (this function), not derived from ambient
+/// state.
+pub fn claude_json_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(".claude.json")
+}
+
+/// The subset of a Claude Code `.claude.json` root that carries account
+/// identity. Every other top-level key (projects, mcpServers, telemetry
+/// counters, onboarding state) is ignored here.
+#[derive(Debug, Deserialize, Default)]
+struct ClaudeJsonRoot {
+    #[serde(rename = "oauthAccount")]
+    oauth_account: Option<OauthAccountPayload>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OauthAccountPayload {
+    #[serde(rename = "emailAddress")]
+    email_address: Option<String>,
+    #[serde(rename = "organizationUuid")]
+    organization_uuid: Option<String>,
+    #[serde(rename = "organizationName")]
+    organization_name: Option<String>,
+}
+
+/// Parse a Claude Code `.claude.json` body into a [`ClaudeIdentity`]. Pure
+/// computation: malformed JSON returns a typed error, never panics.
+///
+/// `oauthAccount: null` or an absent `oauthAccount` yields
+/// `ClaudeIdentity::default()`. `subscription_type` is always `None` — it
+/// lives in `.credentials.json`, not in `oauthAccount`. All string fields pass
+/// through [`normalized`] (trim + empty → `None`).
+pub fn parse_claude_json_identity(content: &str) -> Result<ClaudeIdentity, ClaudeIdentityError> {
+    let root: ClaudeJsonRoot =
+        serde_json::from_str(content).map_err(|e| ClaudeIdentityError::Parse(e.to_string()))?;
+    let Some(oauth) = root.oauth_account else {
+        return Ok(ClaudeIdentity::default());
+    };
+    Ok(ClaudeIdentity {
+        email: normalized(oauth.email_address.as_deref()),
+        org_id: normalized(oauth.organization_uuid.as_deref()),
+        org_name: normalized(oauth.organization_name.as_deref()),
+        subscription_type: None,
+    })
+}
+
+/// Infallible identity load from a `.claude.json` file path. A missing file, an
+/// unreadable file, or malformed JSON all yield `ClaudeIdentity::default()`
+/// (logged at debug level). Every managed read path treats "no identity" as a
+/// fall-through, never an error, so this boundary never propagates a failure.
+pub fn load_identity_from_path(claude_json: &Path) -> ClaudeIdentity {
+    let content = match std::fs::read_to_string(claude_json) {
+        Ok(content) => content,
+        Err(error) => {
+            tracing::debug!(
+                path = %claude_json.display(),
+                %error,
+                "no readable .claude.json; using an empty Claude identity"
+            );
+            return ClaudeIdentity::default();
+        }
+    };
+    match parse_claude_json_identity(&content) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::debug!(
+                path = %claude_json.display(),
+                %error,
+                "malformed .claude.json; using an empty Claude identity"
+            );
+            ClaudeIdentity::default()
+        }
+    }
+}
+
+/// Infallible identity load for a config directory: reads
+/// `<config_dir>/.claude.json` via [`load_identity_from_path`].
+pub fn load_identity_from_files(config_dir: &Path) -> ClaudeIdentity {
+    load_identity_from_path(&claude_json_path(config_dir))
 }
 
 /// Namespace for deterministically derived discovered-account ids.
@@ -520,5 +606,69 @@ mod tests {
             access_token: Some("shared-token".to_string()),
         };
         assert_eq!(active_account_id(&accounts, &ambient, &tokens), Some(a.id));
+    }
+
+    // ── parse_claude_json_identity / load_identity_from_files (#12) ───────
+
+    #[test]
+    fn parse_claude_json_identity_reads_oauth_account_fields() {
+        let identity = parse_claude_json_identity(
+            r#"{"oauthAccount":{"emailAddress":"a@x.com","organizationUuid":"org-1","organizationName":"Acme"},"projects":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(identity.email.as_deref(), Some("a@x.com"));
+        assert_eq!(identity.org_id.as_deref(), Some("org-1"));
+        assert_eq!(identity.org_name.as_deref(), Some("Acme"));
+        assert_eq!(identity.subscription_type, None);
+    }
+
+    #[test]
+    fn parse_claude_json_identity_null_or_absent_oauth_account_is_default() {
+        assert_eq!(
+            parse_claude_json_identity(r#"{"oauthAccount":null}"#).unwrap(),
+            ClaudeIdentity::default()
+        );
+        assert_eq!(
+            parse_claude_json_identity(r#"{"numStartups":3}"#).unwrap(),
+            ClaudeIdentity::default()
+        );
+    }
+
+    #[test]
+    fn parse_claude_json_identity_malformed_returns_parse_error() {
+        let err = parse_claude_json_identity("not json").expect_err("malformed must error");
+        assert!(matches!(err, ClaudeIdentityError::Parse(_)));
+    }
+
+    #[test]
+    fn parse_claude_json_identity_whitespace_fields_become_none() {
+        let identity = parse_claude_json_identity(
+            r#"{"oauthAccount":{"emailAddress":"  ","organizationUuid":"","organizationName":"   "}}"#,
+        )
+        .unwrap();
+        assert_eq!(identity, ClaudeIdentity::default());
+    }
+
+    #[test]
+    fn load_identity_from_files_reads_real_shaped_claude_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            claude_json_path(dir.path()),
+            r#"{"oauthAccount":{"emailAddress":"real@x.com","organizationUuid":"org-real","organizationName":"RealCo"},"numStartups":9}"#,
+        )
+        .unwrap();
+        let identity = load_identity_from_files(dir.path());
+        assert_eq!(identity.email.as_deref(), Some("real@x.com"));
+        assert_eq!(identity.org_id.as_deref(), Some("org-real"));
+        assert_eq!(identity.org_name.as_deref(), Some("RealCo"));
+    }
+
+    #[test]
+    fn load_identity_from_files_missing_file_is_default_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_identity_from_files(dir.path()),
+            ClaudeIdentity::default()
+        );
     }
 }
