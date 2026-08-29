@@ -20,7 +20,9 @@ pub mod stores;
 pub mod usage;
 
 pub use account_manager::{
-    ClaudeAccountManager, ClaudeAccountManagerError, ClaudeSwitchResult, reconcile_stored_accounts,
+    ClaudeAccountManager, ClaudeAccountManagerError, ClaudeSwitchResult, DirCandidate, WriteTarget,
+    WriteTargetError, is_stub_managed_dir, reconcile_stored_accounts,
+    resolve_credential_write_target, stub_dir_is_prunable,
 };
 pub use identity::{
     AmbientClaudeIdentity, AmbientOauthAccount, ClaudeIdentity, ClaudeIdentityError,

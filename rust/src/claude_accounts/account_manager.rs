@@ -28,7 +28,7 @@ use super::identity::{
     stable_discovered_id,
 };
 use super::login_runner::{ClaudeLoginOutcome, ClaudeLoginRunner, ManagedLoginProcess};
-use super::models::{ClaudeAccount, ClaudeAccountSource, utc_now};
+use super::models::{ClaudeAccount, ClaudeAccountSource, normalize_identifier, utc_now};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -94,23 +94,30 @@ impl ClaudeAccountManager {
             return Ok(());
         }
 
+        // Delete EVERY managed directory whose identity matches this account,
+        // not only its recorded `claude_config_dir` (#14 bug 1: a leftover
+        // duplicate directory resurrected a removed account). Structurally
+        // mirrors `codex_accounts::account_manager::remove_managed_files_if_owned`.
         let root = fs::canonicalize(managed_configs_directory())
             .unwrap_or_else(|_| managed_configs_directory());
-        let target = std::path::absolute(&account.claude_config_dir)
-            .unwrap_or_else(|_| account.claude_config_dir.clone());
-        let resolved = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
-        let relative = resolved.strip_prefix(&root).map_err(|_| {
-            ClaudeAccountManagerError::Message(
-                "This path is not an app-managed config directory.".to_string(),
-            )
-        })?;
-        if relative.as_os_str().is_empty() {
-            return Err(ClaudeAccountManagerError::Message(
-                "Refusing to remove the managed-configs root.".to_string(),
-            ));
-        }
-        if target.exists() {
-            fs::remove_dir_all(&target)?;
+        for target in self.managed_config_paths_matching(account)? {
+            // The canonicalize + strip_prefix + non-empty-relative guard is
+            // applied PER target inside the loop; both error strings are kept
+            // byte-identical so the existing guard tests stay green unchanged.
+            let resolved = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+            let relative = resolved.strip_prefix(&root).map_err(|_| {
+                ClaudeAccountManagerError::Message(
+                    "This path is not an app-managed config directory.".to_string(),
+                )
+            })?;
+            if relative.as_os_str().is_empty() {
+                return Err(ClaudeAccountManagerError::Message(
+                    "Refusing to remove the managed-configs root.".to_string(),
+                ));
+            }
+            if target.exists() {
+                fs::remove_dir_all(&target)?;
+            }
         }
         Ok(())
     }
@@ -204,12 +211,30 @@ impl ClaudeAccountManager {
             ));
         }
 
+        // `target.claude_config_dir` comes from the listing; when several
+        // directories carry this identity it may be the stale/contaminated one
+        // (#14 bug 2). Re-point at whichever directory actually holds the
+        // target's expected token, tie-broken on freshest `expiresAt`. This is
+        // read-only and cannot leave a partial state; on any non-`Existing`
+        // result it defensively keeps the caller's directory.
+        let expected_token =
+            read_claude_ai_oauth_str_field(&target.claude_config_dir, "accessToken");
+        let target_identity = load_identity_from_files(&target.claude_config_dir);
+        let source_dir = match resolve_credential_write_target(
+            expected_token.as_deref(),
+            &target_identity,
+            &managed_dir_candidates()?,
+        ) {
+            Ok(WriteTarget::Existing(dir)) => dir,
+            _ => target.claude_config_dir.clone(),
+        };
+
         let ambient_dir = ambient_claude_config_dir();
         let ambient_account = self.discover_ambient_account(existing);
 
         // Read the target's `oauthAccount` BEFORE any write: a read here cannot
         // leave a partial state, so failing early is free.
-        let target_oauth = target_oauth_account_value(target);
+        let target_oauth = target_oauth_account_value(&source_dir, target);
 
         let mut materialized_account: Option<ClaudeAccount> = None;
         if let Some(ambient) = &ambient_account {
@@ -228,7 +253,7 @@ impl ClaudeAccountManager {
         } else {
             serde_json::json!({})
         };
-        let source_root = credentials_merge::read_root(&target.claude_config_dir)?;
+        let source_root = credentials_merge::read_root(&source_dir)?;
         credentials_merge::merge_claude_ai_oauth(&mut ambient_root, &source_root)?;
         credentials_merge::write_root(&ambient_dir, &ambient_root)?;
 
@@ -309,13 +334,43 @@ impl ClaudeAccountManager {
             ));
         }
 
-        if let Some(hit) = existing.iter().find(|candidate| {
-            candidate.source == ClaudeAccountSource::ManagedByApp
-                && candidate.matches(account)
-                && credentials_merge::credentials_file_path(&candidate.claude_config_dir).exists()
-        }) {
-            self.refresh_managed_dir_from(account, hit)?;
-            return Ok(hit.clone());
+        // Route the dedupe through the ownership gate (#14 bug 2): the loose
+        // `matches()` predicate could pick a directory belonging to a
+        // DIFFERENT account and write this account's token into it. The gate
+        // proves ownership by `claudeAiOauth.accessToken` equality first, then
+        // strict identity (exact `org_id` / same dir — never email), and
+        // refuses rather than guess.
+        let source_identity = source_identity_of(account);
+        let source_token =
+            read_claude_ai_oauth_str_field(&account.claude_config_dir, "accessToken");
+        let candidates = managed_dir_candidates()?;
+        match resolve_credential_write_target(
+            source_token.as_deref(),
+            &source_identity,
+            &candidates,
+        ) {
+            Ok(WriteTarget::Existing(dir)) => {
+                // Self-heals a mislabelled `.claude.json` (G2).
+                self.refresh_managed_dir(account, &dir)?;
+                return Ok(existing
+                    .iter()
+                    .find(|candidate| candidate.standardized_config_dir() == standardized(&dir))
+                    .cloned()
+                    .unwrap_or_else(|| managed_row_for_dir(account, &dir)));
+            }
+            Ok(WriteTarget::CreateNew) => {}
+            Err(WriteTargetError::NoOwnedCandidate) => {
+                tracing::warn!(
+                    dir = %account.claude_config_dir.display(),
+                    "no managed dir is owned by this account; materializing into a fresh directory"
+                );
+            }
+            Err(WriteTargetError::ForeignTokenOnly { dir }) => {
+                tracing::warn!(
+                    foreign = %dir.display(),
+                    "refusing to overwrite a foreign-token directory; materializing into a fresh one"
+                );
+            }
         }
 
         let destination_dir = managed_configs_directory().join(Uuid::new_v4().to_string());
@@ -347,21 +402,23 @@ impl ClaudeAccountManager {
     }
 
     /// On a dedupe hit, key-merge the source account's fresh `claudeAiOauth`
-    /// and `oauthAccount` into the existing managed directory so switching back
+    /// and `oauthAccount` into the chosen managed directory so switching back
     /// to it later does not restore stale tokens (design F6). Key-scoped, so
-    /// the hit directory's `mcpOAuth` and other siblings survive.
-    fn refresh_managed_dir_from(
+    /// the directory's `mcpOAuth` and other siblings survive. The
+    /// `oauthAccount` rewrite also self-heals a mislabelled `.claude.json`
+    /// whose recorded identity disagreed with the token now written (G2).
+    fn refresh_managed_dir(
         &self,
         source: &ClaudeAccount,
-        hit: &ClaudeAccount,
+        dir: &Path,
     ) -> Result<(), ClaudeAccountManagerError> {
         let source_root = credentials_merge::read_root(&source.claude_config_dir)?;
-        let mut hit_root = credentials_merge::read_root(&hit.claude_config_dir)?;
-        credentials_merge::merge_claude_ai_oauth(&mut hit_root, &source_root)?;
-        credentials_merge::write_root(&hit.claude_config_dir, &hit_root)?;
+        let mut dir_root = credentials_merge::read_root(dir)?;
+        credentials_merge::merge_claude_ai_oauth(&mut dir_root, &source_root)?;
+        credentials_merge::write_root(dir, &dir_root)?;
 
         if let Some(oauth) = source_oauth_account_value(source) {
-            let path = claude_json_path(&hit.claude_config_dir);
+            let path = claude_json_path(dir);
             let mut root = if path.exists() {
                 credentials_merge::read_json_root(&path)?
             } else {
@@ -553,6 +610,355 @@ impl ClaudeAccountManager {
             discovered_at,
         ))
     }
+
+    /// Every managed directory whose identity matches `account`, with the
+    /// account's own recorded directory always first (element 0). Port of
+    /// `codex_accounts::account_manager::managed_home_paths_matching`. Uses the
+    /// LOOSE `matches()` predicate deliberately (design G8): removal is
+    /// user-initiated and destructive-by-request, so breadth is correct here.
+    fn managed_config_paths_matching(
+        &self,
+        account: &ClaudeAccount,
+    ) -> Result<Vec<PathBuf>, ClaudeAccountManagerError> {
+        ensure_directories()?;
+        let first = std::path::absolute(&account.claude_config_dir)
+            .unwrap_or_else(|_| account.claude_config_dir.clone());
+        let mut seen: std::collections::HashSet<String> =
+            [standardized(&first)].into_iter().collect();
+        let mut targets = vec![first];
+
+        for entry in fs::read_dir(managed_configs_directory())? {
+            let Ok(entry) = entry else { continue };
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let key = standardized(&dir);
+            if seen.contains(&key) {
+                continue;
+            }
+            let Some(candidate) =
+                self.discovered_managed_account(&dir, std::slice::from_ref(account))
+            else {
+                continue;
+            };
+            if !candidate.matches(account) {
+                continue;
+            }
+            targets.push(std::path::absolute(&dir).unwrap_or(dir));
+            seen.insert(key);
+        }
+        Ok(targets)
+    }
+
+    /// Delete every managed directory that is a stub (`is_stub_managed_dir`)
+    /// AND older than the in-flight-login grace window. Invoked ONLY from the
+    /// removal command path — never from `load_claude_accounts` (design G7: a
+    /// managed dir is created before `claude auth login` writes into it, so
+    /// pruning on load would race-delete an in-flight sign-in). Applies the
+    /// same per-directory canonicalize + strip_prefix guard as removal.
+    pub fn prune_stub_managed_dirs(&self) -> Result<usize, ClaudeAccountManagerError> {
+        ensure_directories()?;
+        let root = fs::canonicalize(managed_configs_directory())
+            .unwrap_or_else(|_| managed_configs_directory());
+        let mut removed = 0usize;
+        for entry in fs::read_dir(managed_configs_directory())? {
+            let Ok(entry) = entry else { continue };
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let has_credentials = credentials_merge::credentials_file_path(&dir).exists();
+            let identity = load_identity_from_files(&dir);
+            let oauth_present = identity.email.is_some() || identity.org_id.is_some();
+            let age = fs::metadata(&dir)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok());
+            if !stub_dir_is_prunable(has_credentials, oauth_present, age) {
+                continue;
+            }
+            let resolved = fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            let Ok(relative) = resolved.strip_prefix(&root) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            fs::remove_dir_all(&dir)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+}
+
+/// The in-flight-login grace window: a managed directory younger than this is
+/// never pruned even if it currently looks like a stub, because
+/// `add_managed_account` creates the directory before `claude auth login`
+/// writes any credentials into it (design G7).
+const STUB_PRUNE_GRACE: Duration = Duration::from_secs(600);
+
+/// A managed directory considered as a credential-write destination, read once.
+#[derive(Debug, Clone)]
+pub struct DirCandidate {
+    pub dir: PathBuf,
+    /// `load_identity_from_files(&dir)`.
+    pub identity: ClaudeIdentity,
+    /// `claudeAiOauth.accessToken`, trimmed, non-empty.
+    pub access_token: Option<String>,
+    /// `claudeAiOauth.expiresAt` (epoch ms).
+    pub expires_at: Option<i64>,
+}
+
+/// Where a credential write is allowed to land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteTarget {
+    /// Write into this existing managed directory.
+    Existing(PathBuf),
+    /// No candidate is owned by the source; the caller must create a fresh
+    /// directory (only returned when there are no candidates at all).
+    CreateNew,
+}
+
+/// Why a credential write could not be routed to an existing directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteTargetError {
+    /// No candidate is owned by the source: neither token equality nor strict
+    /// identity holds. The caller MUST create a fresh directory — never write
+    /// into an unrelated one.
+    NoOwnedCandidate,
+    /// Reserved defensive variant: the only identity match is a directory that
+    /// is holding a third party's token and whose label strictly disagrees
+    /// with the source. Callers treat it exactly like `NoOwnedCandidate`
+    /// (warn, then materialize into a fresh directory).
+    ForeignTokenOnly { dir: PathBuf },
+}
+
+/// Exact normalized `org_id` equality. No email fallback, no directory
+/// component (identities carry no path). Mirror of
+/// `ClaudeAccount::matches_strict` at the identity level.
+fn identity_matches_strict(a: &ClaudeIdentity, b: &ClaudeIdentity) -> bool {
+    matches!(
+        (
+            normalize_identifier(a.org_id.as_deref()),
+            normalize_identifier(b.org_id.as_deref()),
+        ),
+        (Some(x), Some(y)) if x == y
+    )
+}
+
+/// Order two `expiresAt` values freshest-first, `None` last.
+fn cmp_expires_desc(a: Option<i64>, b: Option<i64>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(x), Some(y)) => y.cmp(&x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+/// PURE. Choose the directory allowed to receive the source's credentials.
+///
+/// Precedence:
+///   1. token equality — candidates whose `access_token == source_token`,
+///      ordered by (strict-identity-agrees desc, `expires_at` desc);
+///   2. strict identity — `identity_matches_strict`, ordered by `expires_at`
+///      desc, `None` last (a directory with no credentials is a valid
+///      destination);
+///   3. otherwise `Err(NoOwnedCandidate)`.
+///
+/// `CreateNew` is returned only when `candidates` is empty.
+pub fn resolve_credential_write_target(
+    source_token: Option<&str>,
+    source_identity: &ClaudeIdentity,
+    candidates: &[DirCandidate],
+) -> Result<WriteTarget, WriteTargetError> {
+    if candidates.is_empty() {
+        return Ok(WriteTarget::CreateNew);
+    }
+
+    let source_token = source_token
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+
+    if let Some(token) = source_token {
+        let mut tier1: Vec<&DirCandidate> = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .access_token
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    == Some(token)
+            })
+            .collect();
+        if !tier1.is_empty() {
+            tier1.sort_by(|a, b| {
+                let a_agrees = identity_matches_strict(&a.identity, source_identity);
+                let b_agrees = identity_matches_strict(&b.identity, source_identity);
+                b_agrees
+                    .cmp(&a_agrees)
+                    .then_with(|| cmp_expires_desc(a.expires_at, b.expires_at))
+            });
+            return Ok(WriteTarget::Existing(tier1[0].dir.clone()));
+        }
+    }
+
+    let mut tier2: Vec<&DirCandidate> = candidates
+        .iter()
+        .filter(|candidate| identity_matches_strict(&candidate.identity, source_identity))
+        .collect();
+    if !tier2.is_empty() {
+        tier2.sort_by(|a, b| cmp_expires_desc(a.expires_at, b.expires_at));
+        return Ok(WriteTarget::Existing(tier2[0].dir.clone()));
+    }
+
+    Err(WriteTargetError::NoOwnedCandidate)
+}
+
+/// PURE. A directory carrying no recoverable account at all: no
+/// `.credentials.json` and no `oauthAccount` in its `.claude.json`.
+pub fn is_stub_managed_dir(has_credentials: bool, oauth_account_present: bool) -> bool {
+    !has_credentials && !oauth_account_present
+}
+
+/// PURE. Whether a managed directory should be pruned: it must be a stub AND
+/// demonstrably older than the in-flight-login grace window. An unknown age
+/// (mtime unreadable) is treated as "too young" — never prune what cannot be
+/// dated.
+pub fn stub_dir_is_prunable(
+    has_credentials: bool,
+    oauth_account_present: bool,
+    age: Option<Duration>,
+) -> bool {
+    is_stub_managed_dir(has_credentials, oauth_account_present)
+        && age.map(|value| value >= STUB_PRUNE_GRACE).unwrap_or(false)
+}
+
+/// `claudeAiOauth.expiresAt`. Claude writes it as a JSON number (epoch ms); a
+/// string is tolerated. Sibling of `read_claude_ai_oauth_str_field`.
+fn read_claude_ai_oauth_i64_field(dir: &Path, field: &str) -> Option<i64> {
+    let root = credentials_merge::read_root(dir).ok()?;
+    let value = root.get("claudeAiOauth")?.get(field)?;
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    if let Some(number) = value.as_f64() {
+        return Some(number as i64);
+    }
+    value
+        .as_str()
+        .and_then(|text| text.trim().parse::<i64>().ok())
+}
+
+/// IO. Enumerate every directory under `managed_configs_directory()` as a
+/// write-target candidate, sorted by lowercased file name (deterministic,
+/// exactly like `discover_managed_accounts`). Unlike discovery this does NOT
+/// require `.credentials.json`: a directory that has only `.claude.json` — or
+/// neither — is still a legitimate (empty) destination.
+fn managed_dir_candidates() -> Result<Vec<DirCandidate>, ClaudeAccountManagerError> {
+    ensure_directories()?;
+    let mut entries: Vec<PathBuf> = fs::read_dir(managed_configs_directory())?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    entries.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    });
+    let mut candidates = Vec::with_capacity(entries.len());
+    for dir in entries {
+        let identity = load_identity_from_files(&dir);
+        let access_token = read_claude_ai_oauth_str_field(&dir, "accessToken")
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+        let expires_at = read_claude_ai_oauth_i64_field(&dir, "expiresAt");
+        candidates.push(DirCandidate {
+            dir,
+            identity,
+            access_token,
+            expires_at,
+        });
+    }
+    Ok(candidates)
+}
+
+/// The strict identity of the candidate directory whose token equals `token`.
+fn token_owner_identity(candidates: &[DirCandidate], token: &str) -> Option<ClaudeIdentity> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate
+                .access_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                == Some(token)
+        })
+        .map(|candidate| candidate.identity.clone())
+}
+
+/// The identity a materialization/switch source claims, resolved by source
+/// kind. For an `Ambient` source this also surfaces (via `tracing::warn!`, no
+/// repair) the G6 case where the ambient `.credentials.json` token's owner
+/// disagrees with the ambient `~/.claude.json` label — the token is tier 1 and
+/// already outranks the label, and the switch's own ambient `oauthAccount`
+/// write is the repair.
+fn source_identity_of(account: &ClaudeAccount) -> ClaudeIdentity {
+    match account.source {
+        ClaudeAccountSource::Ambient => {
+            let label = load_identity_from_path(&ambient_claude_json_path());
+            if let Ok(candidates) = managed_dir_candidates() {
+                let ambient_token =
+                    read_claude_ai_oauth_str_field(&ambient_claude_config_dir(), "accessToken");
+                if let Some(token) = ambient_token
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    && let Some(owner) = token_owner_identity(&candidates, token)
+                    && !identity_matches_strict(&label, &owner)
+                {
+                    tracing::warn!(
+                        label = ?label.email,
+                        owner = ?owner.email,
+                        "ambient ~/.claude.json identity disagrees with the ambient token's \
+                         owner; the token is ground truth (issue #14)"
+                    );
+                }
+            }
+            label
+        }
+        ClaudeAccountSource::ManagedByApp => load_identity_from_files(&account.claude_config_dir),
+    }
+}
+
+/// A managed-account row for `dir`, keyed by `stable_discovered_id` (so a
+/// uuid-named directory keeps its id — no churn) and hydrated from the
+/// directory's own `.claude.json`, falling back to `account`'s stored fields.
+fn managed_row_for_dir(account: &ClaudeAccount, dir: &Path) -> ClaudeAccount {
+    let identity = load_identity_from_files(dir);
+    let now = utc_now();
+    ClaudeAccount::new(
+        stable_discovered_id(dir, &identity),
+        account.nickname.clone(),
+        identity.email.or_else(|| account.email_hint.clone()),
+        identity.org_id.or_else(|| account.org_id.clone()),
+        identity.org_name.or_else(|| account.org_name.clone()),
+        identity
+            .subscription_type
+            .or_else(|| account.subscription_type.clone()),
+        dir.to_path_buf(),
+        ClaudeAccountSource::ManagedByApp,
+        account.created_at,
+        now,
+        Some(account.last_authenticated_at.unwrap_or(now)),
+    )
 }
 
 fn candidate_account(
@@ -683,11 +1089,14 @@ fn synthesize_oauth_account_object(account: &ClaudeAccount) -> Option<serde_json
 /// `oauthAccount` value to write into ambient `~/.claude.json` when switching
 /// to `target`: the target directory's real object if present, else a
 /// synthesized 3-field object (with a warning).
-fn target_oauth_account_value(target: &ClaudeAccount) -> Option<serde_json::Value> {
-    read_oauth_account_object(&claude_json_path(&target.claude_config_dir)).or_else(|| {
+fn target_oauth_account_value(
+    source_dir: &Path,
+    target: &ClaudeAccount,
+) -> Option<serde_json::Value> {
+    read_oauth_account_object(&claude_json_path(source_dir)).or_else(|| {
         tracing::warn!(
-            dir = %target.claude_config_dir.display(),
-            "target managed dir has no oauthAccount in .claude.json; synthesizing from the stored record"
+            dir = %source_dir.display(),
+            "switch source dir has no oauthAccount in .claude.json; synthesizing from the stored record"
         );
         synthesize_oauth_account_object(target)
     })
@@ -713,6 +1122,13 @@ fn source_oauth_account_value(account: &ClaudeAccount) -> Option<serde_json::Val
 /// Never deletes anything on disk. Never re-keys ids: managed directories are
 /// uuid-named, so `stable_discovered_id` returns the directory uuid verbatim
 /// regardless of identity, and hydrating email/org cannot change the id.
+///
+/// Stub-directory exclusion for the listing (`is_stub_managed_dir`: no
+/// `.credentials.json` AND no `oauthAccount`) is already enforced upstream —
+/// `discovered_managed_account` rejects such a directory, so it never reaches
+/// `managed` and its stored row (if any, always under `managed_root`) is
+/// dropped here as an orphan. The directory is left on disk; deletion happens
+/// only via `prune_stub_managed_dirs` from the removal command path (G7).
 pub fn reconcile_stored_accounts(
     existing: &[ClaudeAccount],
     managed: &[ClaudeAccount],
@@ -1444,5 +1860,449 @@ mod tests {
         clear_app_support_directory_override();
         clear_ambient_claude_config_dir_override();
         clear_ambient_claude_json_path_override();
+    }
+
+    // ── #14: ownership gate (resolve_credential_write_target) ────────────
+
+    fn dir_candidate(
+        dir: &str,
+        org_id: Option<&str>,
+        token: Option<&str>,
+        expires_at: Option<i64>,
+    ) -> DirCandidate {
+        DirCandidate {
+            dir: PathBuf::from(dir),
+            identity: ClaudeIdentity {
+                email: None,
+                org_id: org_id.map(str::to_string),
+                org_name: None,
+                subscription_type: None,
+            },
+            access_token: token.map(str::to_string),
+            expires_at,
+        }
+    }
+
+    fn identity_with_org(org_id: Option<&str>) -> ClaudeIdentity {
+        ClaudeIdentity {
+            email: None,
+            org_id: org_id.map(str::to_string),
+            org_name: None,
+            subscription_type: None,
+        }
+    }
+
+    // [R2] token equality wins over a fresher non-matching candidate.
+    #[test]
+    fn resolve_tier1_token_equality_beats_a_fresher_non_match() {
+        let candidates = [
+            dir_candidate("/m/owned", Some("org-src"), Some("T"), Some(100)),
+            dir_candidate("/m/other", Some("org-other"), Some("OTHER"), Some(999_999)),
+        ];
+        let got = resolve_credential_write_target(
+            Some("T"),
+            &identity_with_org(Some("org-src")),
+            &candidates,
+        )
+        .unwrap();
+        assert_eq!(got, WriteTarget::Existing(PathBuf::from("/m/owned")));
+    }
+
+    // [R3] tie-break: greater expiresAt wins when neither candidate agrees on
+    // identity; an identity-agreeing dir is preferred at equal expiresAt.
+    #[test]
+    fn resolve_tier1_tie_breaks_on_expires_then_identity_agreement() {
+        // Neither agrees on identity (source org is None) -> greater expiresAt.
+        let by_expiry = [
+            dir_candidate("/m/older", None, Some("T"), Some(100)),
+            dir_candidate("/m/newer", None, Some("T"), Some(200)),
+        ];
+        assert_eq!(
+            resolve_credential_write_target(Some("T"), &identity_with_org(None), &by_expiry)
+                .unwrap(),
+            WriteTarget::Existing(PathBuf::from("/m/newer")),
+        );
+
+        // Equal expiresAt -> the identity-agreeing dir is preferred.
+        let by_identity = [
+            dir_candidate("/m/disagree", None, Some("T"), Some(500)),
+            dir_candidate("/m/agree", Some("org-src"), Some("T"), Some(500)),
+        ];
+        assert_eq!(
+            resolve_credential_write_target(
+                Some("T"),
+                &identity_with_org(Some("org-src")),
+                &by_identity,
+            )
+            .unwrap(),
+            WriteTarget::Existing(PathBuf::from("/m/agree")),
+        );
+    }
+
+    // [R4] tier 2: a rotated token with an equal org_id resolves to `Existing`,
+    // never an error (G4 — a normal refresh rotates the token).
+    #[test]
+    fn resolve_tier2_rotated_token_same_org_is_existing_not_error() {
+        let candidates = [dir_candidate(
+            "/m/rotated",
+            Some("org-src"),
+            Some("ROTATED-TOKEN"),
+            Some(42),
+        )];
+        let got = resolve_credential_write_target(
+            Some("CURRENT-TOKEN"),
+            &identity_with_org(Some("org-src")),
+            &candidates,
+        )
+        .unwrap();
+        assert_eq!(got, WriteTarget::Existing(PathBuf::from("/m/rotated")));
+    }
+
+    // [R5] email-only source identity + only foreign-token dirs -> the gate
+    // refuses with `NoOwnedCandidate` and performs no write.
+    #[test]
+    fn resolve_email_only_source_with_foreign_dirs_is_no_owned_candidate() {
+        let candidates = [
+            dir_candidate("/m/a", Some("org-a"), Some("TA"), Some(1)),
+            dir_candidate("/m/b", Some("org-b"), Some("TB"), Some(2)),
+        ];
+        let got =
+            resolve_credential_write_target(Some("UNKNOWN"), &identity_with_org(None), &candidates);
+        assert_eq!(got, Err(WriteTargetError::NoOwnedCandidate));
+    }
+
+    // [R2-R5] `CreateNew` only when there are no candidates at all.
+    #[test]
+    fn resolve_create_new_only_when_candidates_empty() {
+        assert_eq!(
+            resolve_credential_write_target(Some("T"), &identity_with_org(Some("o")), &[]).unwrap(),
+            WriteTarget::CreateNew,
+        );
+    }
+
+    // [R10] `is_stub_managed_dir` truth table.
+    #[test]
+    fn is_stub_managed_dir_truth_table() {
+        assert!(is_stub_managed_dir(false, false));
+        assert!(!is_stub_managed_dir(true, false));
+        assert!(!is_stub_managed_dir(false, true));
+        assert!(!is_stub_managed_dir(true, true));
+    }
+
+    // [R10b] the prune decision: a stub is prunable only once it is older than
+    // the grace window; an unknown age is never prunable.
+    #[test]
+    fn stub_dir_is_prunable_respects_grace_window() {
+        assert!(stub_dir_is_prunable(
+            false,
+            false,
+            Some(Duration::from_secs(601))
+        ));
+        assert!(!stub_dir_is_prunable(
+            false,
+            false,
+            Some(Duration::from_secs(30))
+        ));
+        assert!(!stub_dir_is_prunable(false, false, None));
+        assert!(!stub_dir_is_prunable(
+            true,
+            false,
+            Some(Duration::from_secs(10_000))
+        ));
+    }
+
+    // [R10b] prune IO: a fresh stub survives (in-flight-login guard) and a dir
+    // with `.credentials.json` survives.
+    #[test]
+    fn prune_stub_managed_dirs_spares_fresh_stub_and_dirs_with_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        with_app_support_directory(dir.path().to_path_buf());
+        ensure_directories().unwrap();
+
+        let fresh_stub = managed_configs_directory().join("fresh-stub");
+        fs::create_dir_all(&fresh_stub).unwrap();
+        fs::write(claude_json_path(&fresh_stub), r#"{"numStartups":1}"#).unwrap();
+
+        let has_creds = managed_configs_directory().join("has-creds");
+        write_credentials(&has_creds, "tok", "pro");
+
+        let removed = ClaudeAccountManager::new()
+            .prune_stub_managed_dirs()
+            .unwrap();
+
+        assert_eq!(removed, 0, "a fresh stub is inside the grace window");
+        assert!(fresh_stub.exists());
+        assert!(has_creds.exists());
+
+        clear_app_support_directory_override();
+    }
+
+    // [R6] removal deletes EVERY managed dir matching the account's identity and
+    // leaves unrelated dirs intact.
+    #[test]
+    fn remove_deletes_every_matching_managed_dir_and_leaves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        with_app_support_directory(dir.path().to_path_buf());
+        ensure_directories().unwrap();
+
+        let d1 = managed_configs_directory().join("11111111-1111-1111-1111-111111111111");
+        write_credentials(&d1, "tok-1", "pro");
+        write_managed_claude_json(&d1, "dup@x.com", "org-dup");
+        let d2 = managed_configs_directory().join("22222222-2222-2222-2222-222222222222");
+        write_credentials(&d2, "tok-2", "pro");
+        write_managed_claude_json(&d2, "dup@x.com", "org-dup");
+        let d3 = managed_configs_directory().join("33333333-3333-3333-3333-333333333333");
+        write_credentials(&d3, "tok-3", "pro");
+        write_managed_claude_json(&d3, "other@x.com", "org-other");
+
+        let account = make_account(d1.clone(), "dup@x.com", "org-dup");
+        ClaudeAccountManager::new()
+            .remove_managed_files_if_owned(&account)
+            .unwrap();
+
+        assert!(!d1.exists(), "the recorded dir is deleted");
+        assert!(
+            !d2.exists(),
+            "a second dir sharing the identity is also deleted"
+        );
+        assert!(d3.exists(), "an unrelated managed dir is untouched");
+
+        clear_app_support_directory_override();
+    }
+
+    // [R8] materialize never overwrites a foreign-token dir: a dir that only
+    // shares the email (no org match, no token match) is left byte-identical and
+    // a fresh dir is created instead.
+    #[test]
+    fn materialize_never_writes_into_a_foreign_token_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        with_app_support_directory(dir.path().to_path_buf());
+        ensure_directories().unwrap();
+        let ambient_json = dir.path().join(".claude.json");
+        with_ambient_claude_json_path(ambient_json.clone());
+        let ambient_dir = dir.path().join("ambient");
+        with_ambient_claude_config_dir(ambient_dir.clone());
+        write_ambient_claude_json(&ambient_json, "shared@x.com", "org-src");
+
+        let foreign = managed_configs_directory().join("ffffffff-ffff-ffff-ffff-ffffffffffff");
+        write_credentials(&foreign, "foreign-token", "pro");
+        write_managed_claude_json(&foreign, "shared@x.com", "org-foreign");
+        let foreign_creds_before =
+            fs::read(credentials_merge::credentials_file_path(&foreign)).unwrap();
+        let foreign_json_before = fs::read(claude_json_path(&foreign)).unwrap();
+
+        write_credentials(&ambient_dir, "src-token", "max");
+        let mut ambient_acct = make_account(ambient_dir.clone(), "shared@x.com", "org-src");
+        ambient_acct.source = ClaudeAccountSource::Ambient;
+
+        let before = fs::read_dir(managed_configs_directory()).unwrap().count();
+        let out = ClaudeAccountManager::new()
+            .materialize_as_managed(&ambient_acct, &[])
+            .unwrap();
+        let after = fs::read_dir(managed_configs_directory()).unwrap().count();
+
+        assert_eq!(after, before + 1, "a fresh dir is created");
+        assert_ne!(out.claude_config_dir, foreign);
+        assert_eq!(
+            fs::read(credentials_merge::credentials_file_path(&foreign)).unwrap(),
+            foreign_creds_before,
+            "foreign .credentials.json byte-identical"
+        );
+        assert_eq!(
+            fs::read(claude_json_path(&foreign)).unwrap(),
+            foreign_json_before,
+            "foreign .claude.json byte-identical"
+        );
+
+        clear_app_support_directory_override();
+        clear_ambient_claude_json_path_override();
+        clear_ambient_claude_config_dir_override();
+    }
+
+    // [R8b] materialize into a token-owned dir: no new dir, `claudeAiOauth`
+    // refreshed, `mcpOAuth` preserved, and the mislabelled `.claude.json`
+    // relabelled to the source identity (G2 self-heal).
+    #[test]
+    fn materialize_token_owned_dir_refreshes_and_relabels_without_new_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        with_app_support_directory(dir.path().to_path_buf());
+        ensure_directories().unwrap();
+        let ambient_json = dir.path().join(".claude.json");
+        with_ambient_claude_json_path(ambient_json.clone());
+        let ambient_dir = dir.path().join("ambient");
+        with_ambient_claude_config_dir(ambient_dir.clone());
+        write_ambient_claude_json(&ambient_json, "real@x.com", "org-real");
+
+        let owned = managed_configs_directory().join("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        write_credentials(&owned, "the-token", "pro");
+        write_managed_claude_json(&owned, "wrong@x.com", "org-wrong");
+
+        write_credentials(&ambient_dir, "the-token", "max");
+        let mut ambient_acct = make_account(ambient_dir.clone(), "real@x.com", "org-real");
+        ambient_acct.source = ClaudeAccountSource::Ambient;
+
+        let before = fs::read_dir(managed_configs_directory()).unwrap().count();
+        let out = ClaudeAccountManager::new()
+            .materialize_as_managed(&ambient_acct, &[])
+            .unwrap();
+        let after = fs::read_dir(managed_configs_directory()).unwrap().count();
+
+        assert_eq!(before, after, "no new dir when a dir is token-owned");
+        assert_eq!(out.claude_config_dir, owned);
+        assert_eq!(
+            out.id,
+            Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap()
+        );
+
+        let refreshed = credentials_merge::read_root(&owned).unwrap();
+        assert_eq!(refreshed["claudeAiOauth"]["accessToken"], "the-token");
+        assert_eq!(refreshed["claudeAiOauth"]["subscriptionType"], "max");
+        assert_eq!(
+            refreshed["mcpOAuth"]["some-server"]["accessToken"],
+            "keepme"
+        );
+
+        let relabelled: serde_json::Value =
+            serde_json::from_slice(&fs::read(claude_json_path(&owned)).unwrap()).unwrap();
+        assert_eq!(relabelled["oauthAccount"]["emailAddress"], "real@x.com");
+        assert_eq!(relabelled["oauthAccount"]["organizationUuid"], "org-real");
+
+        clear_app_support_directory_override();
+        clear_ambient_claude_json_path_override();
+        clear_ambient_claude_config_dir_override();
+    }
+
+    // [R9] switch re-resolves the credential source among duplicate dirs by
+    // token ownership, tie-broken on freshest `expiresAt`.
+    #[test]
+    fn switch_reads_from_the_token_owning_duplicate_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let rootp = dir.path();
+        with_app_support_directory(rootp.to_path_buf());
+        let ambient_dir = rootp.join(".claude");
+        with_ambient_claude_config_dir(ambient_dir.clone());
+        let ambient_json = rootp.join(".claude.json");
+        with_ambient_claude_json_path(ambient_json.clone());
+        ensure_directories().unwrap();
+
+        write_credentials(&ambient_dir, "old-token", "pro");
+        write_ambient_claude_json(&ambient_json, "old@x.com", "org-old");
+
+        // The listing hands us `stale`; the fresher duplicate `fresh` actually
+        // holds the target token (both carry the same token here).
+        let stale = managed_configs_directory().join("11111111-1111-1111-1111-111111111111");
+        write_credentials(&stale, "target-token", "pro");
+        write_managed_claude_json(&stale, "t@x.com", "org-t");
+        set_expires_at(&stale, 1_000);
+        let fresh = managed_configs_directory().join("22222222-2222-2222-2222-222222222222");
+        write_credentials(&fresh, "target-token", "max");
+        write_managed_claude_json(&fresh, "t@x.com", "org-t");
+        set_expires_at(&fresh, 9_999);
+
+        let target_account = make_account(stale.clone(), "t@x.com", "org-t");
+        ClaudeAccountManager::new()
+            .switch_active_account(&target_account, std::slice::from_ref(&target_account))
+            .unwrap();
+
+        let ambient_root = credentials_merge::read_root(&ambient_dir).unwrap();
+        assert_eq!(ambient_root["claudeAiOauth"]["accessToken"], "target-token");
+        assert_eq!(
+            ambient_root["claudeAiOauth"]["subscriptionType"], "max",
+            "the fresher duplicate (expiresAt 9999) was the credential source"
+        );
+
+        clear_app_support_directory_override();
+        clear_ambient_claude_config_dir_override();
+        clear_ambient_claude_json_path_override();
+    }
+
+    // [R10c] no id churn: a uuid-named dir keeps its id across a materialize
+    // dedupe hit.
+    #[test]
+    fn materialize_dedupe_hit_keeps_uuid_dir_id() {
+        let dir = tempfile::tempdir().unwrap();
+        with_app_support_directory(dir.path().to_path_buf());
+        ensure_directories().unwrap();
+        let ambient_json = dir.path().join(".claude.json");
+        with_ambient_claude_json_path(ambient_json.clone());
+        let ambient_dir = dir.path().join("ambient");
+        with_ambient_claude_config_dir(ambient_dir.clone());
+        write_ambient_claude_json(&ambient_json, "c@x.com", "org-c");
+
+        let uuid = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+        let owned = managed_configs_directory().join(uuid);
+        write_credentials(&owned, "cc-token", "pro");
+        write_managed_claude_json(&owned, "c@x.com", "org-c");
+
+        write_credentials(&ambient_dir, "cc-token", "max");
+        let mut ambient_acct = make_account(ambient_dir.clone(), "c@x.com", "org-c");
+        ambient_acct.source = ClaudeAccountSource::Ambient;
+
+        let out = ClaudeAccountManager::new()
+            .materialize_as_managed(&ambient_acct, &[])
+            .unwrap();
+        assert_eq!(out.id, Uuid::parse_str(uuid).unwrap());
+        assert_eq!(out.claude_config_dir, owned);
+
+        clear_app_support_directory_override();
+        clear_ambient_claude_json_path_override();
+        clear_ambient_claude_config_dir_override();
+    }
+
+    // [R10d] ambient token owned by dir B while ambient `~/.claude.json` labels
+    // A: the switch still succeeds and the displaced ambient identity is
+    // materialized into B (its token owner), not a fresh dir.
+    #[test]
+    fn switch_with_incoherent_ambient_label_uses_token_owner_and_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let rootp = dir.path();
+        with_app_support_directory(rootp.to_path_buf());
+        let ambient_dir = rootp.join(".claude");
+        with_ambient_claude_config_dir(ambient_dir.clone());
+        let ambient_json = rootp.join(".claude.json");
+        with_ambient_claude_json_path(ambient_json.clone());
+        ensure_directories().unwrap();
+
+        let dir_b = managed_configs_directory().join("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        write_credentials(&dir_b, "ambient-token", "max");
+        write_managed_claude_json(&dir_b, "b@x.com", "org-b");
+
+        write_credentials(&ambient_dir, "ambient-token", "pro");
+        // Lying label: ambient identity file says A, but the token belongs to B.
+        write_ambient_claude_json(&ambient_json, "a@x.com", "org-a");
+
+        let dir_t = managed_configs_directory().join("cccccccc-cccc-cccc-cccc-cccccccccccc");
+        write_credentials(&dir_t, "t-token", "max");
+        write_managed_claude_json(&dir_t, "t@x.com", "org-t");
+        let target_account = make_account(dir_t.clone(), "t@x.com", "org-t");
+
+        let result = ClaudeAccountManager::new()
+            .switch_active_account(&target_account, std::slice::from_ref(&target_account));
+        assert!(
+            result.is_ok(),
+            "switch must not hard-error on ambient incoherence"
+        );
+
+        let dir_count = fs::read_dir(managed_configs_directory())
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().is_dir())
+            .count();
+        assert_eq!(
+            dir_count, 2,
+            "the displaced ambient identity was materialized into B, no fresh dir"
+        );
+
+        let ambient_root = credentials_merge::read_root(&ambient_dir).unwrap();
+        assert_eq!(ambient_root["claudeAiOauth"]["accessToken"], "t-token");
+
+        clear_app_support_directory_override();
+        clear_ambient_claude_config_dir_override();
+        clear_ambient_claude_json_path_override();
+    }
+
+    fn set_expires_at(dir: &Path, expires_at: i64) {
+        let mut root = credentials_merge::read_root(dir).unwrap();
+        root["claudeAiOauth"]["expiresAt"] = serde_json::json!(expires_at);
+        credentials_merge::write_root(dir, &root).unwrap();
     }
 }

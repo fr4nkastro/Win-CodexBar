@@ -1,5 +1,24 @@
 # Changelog
 
+## [Windows] 0.56.2 - 2026-08-29
+
+### Fixed
+- Claude accounts: removing an account is now permanent. Removal deletes every
+  app-managed directory whose identity matches the account (not only its last
+  recorded directory), records a removed-identity marker, and account discovery
+  filters against that marker, so a leftover directory or credential file can no
+  longer resurrect a removed account. Re-adding the same account clears its
+  removed marker (#14).
+- Claude accounts: switching accounts no longer cross-contaminates credentials
+  between accounts. Every credential-write target is now chosen by a
+  token-ownership gate — the destination directory must already hold the
+  source's `claudeAiOauth.accessToken`, or match on exact organization id (never
+  on email alone), with the freshest `expiresAt` as the tie-break. When no
+  directory is owned by the account, materialization creates a fresh directory
+  instead of overwriting a directory that belongs to someone else (#14).
+
+---
+
 ## [Windows] 0.56.1 - 2026-08-29
 
 ### Fixed
