@@ -81,11 +81,10 @@ impl ClaudeAccountManager {
 
     /// Remove app-owned managed config directories matching this account.
     ///
-    /// RED stub (task 1.16): deliberately skips the `canonicalize` +
-    /// `strip_prefix` containment guard, so
-    /// `remove_refuses_a_path_outside_the_managed_configs_root` and
-    /// `remove_refuses_the_managed_configs_root_itself` fail until the next
-    /// commit restores the guard (Threat Matrix: Destructive file writes).
+    /// Threat Matrix — Destructive file writes: refuses to remove anything
+    /// that does not `canonicalize` + `strip_prefix` inside
+    /// `managed_configs_directory()`, guarding against a symlink or a
+    /// corrupted `claude_config_dir` pointing outside the app's own root.
     pub fn remove_managed_files_if_owned(
         &self,
         account: &ClaudeAccount,
@@ -93,8 +92,22 @@ impl ClaudeAccountManager {
         if !account.source.owns_files() {
             return Ok(());
         }
+
+        let root = fs::canonicalize(managed_configs_directory())
+            .unwrap_or_else(|_| managed_configs_directory());
         let target = std::path::absolute(&account.claude_config_dir)
             .unwrap_or_else(|_| account.claude_config_dir.clone());
+        let resolved = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+        let relative = resolved.strip_prefix(&root).map_err(|_| {
+            ClaudeAccountManagerError::Message(
+                "This path is not an app-managed config directory.".to_string(),
+            )
+        })?;
+        if relative.as_os_str().is_empty() {
+            return Err(ClaudeAccountManagerError::Message(
+                "Refusing to remove the managed-configs root.".to_string(),
+            ));
+        }
         if target.exists() {
             fs::remove_dir_all(&target)?;
         }
