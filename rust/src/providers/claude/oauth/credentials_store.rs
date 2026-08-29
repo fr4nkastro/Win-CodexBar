@@ -10,13 +10,15 @@
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use super::ClaudeOAuthCredentials;
 use crate::core::ProviderError;
 
-const CREDENTIALS_PATH: &str = ".claude/.credentials.json";
+/// File name of Claude Code's credentials file within a config directory
+/// (ambient `~/.claude`, or a `claude_accounts` managed directory).
+const CREDENTIALS_FILE_NAME: &str = ".credentials.json";
 const KEYRING_SERVICE: &str = "Claude Code-credentials";
 const ENV_TOKEN_KEY: &str = "CODEXBAR_CLAUDE_OAUTH_TOKEN";
 const ENV_SCOPES_KEY: &str = "CODEXBAR_CLAUDE_OAUTH_SCOPES";
@@ -146,7 +148,16 @@ fn load_from_environment() -> Option<ClaudeOAuthCredentials> {
 
 /// Load credentials from ~/.claude/.credentials.json
 fn load_from_file() -> Result<ClaudeOAuthCredentials, ProviderError> {
-    let path = credentials_path()?;
+    load_credentials_in(&ambient_claude_config_dir()?)
+}
+
+/// Load credentials from `dir`'s `.credentials.json` (ambient or a
+/// `claude_accounts` managed directory). The file-source branch of
+/// [`load_credentials`]; env and keyring sources are meaningless for a
+/// managed directory, so only this branch is directory-scoped (design
+/// decision D1).
+pub(crate) fn load_credentials_in(dir: &Path) -> Result<ClaudeOAuthCredentials, ProviderError> {
+    let path = credentials_path_in(dir);
 
     if !path.exists() {
         return Err(ProviderError::OAuth(
@@ -323,16 +334,31 @@ fn push_keyring_candidate(candidates: &mut Vec<String>, value: String) {
     candidates.push(value.to_string());
 }
 
-/// Get the credentials file path
-fn credentials_path() -> Result<PathBuf, ProviderError> {
+/// Ambient (ie. not a `claude_accounts` managed directory) Claude Code config
+/// directory: `~/.claude`. Deliberately does NOT honor `CLAUDE_CONFIG_DIR` —
+/// this local helper only replicates what `credentials_path()` always
+/// computed, so the ambient-facing wrappers below stay byte-for-byte
+/// unchanged (spec: "Default remains ambient").
+fn ambient_claude_config_dir() -> Result<PathBuf, ProviderError> {
     dirs::home_dir()
-        .map(|home| home.join(CREDENTIALS_PATH))
+        .map(|home| home.join(".claude"))
         .ok_or_else(|| ProviderError::OAuth("Could not find home directory".to_string()))
 }
 
-/// Persist refreshed tokens back to `~/.claude/.credentials.json`, updating
-/// only the `claudeAiOauth` token fields and leaving everything else (e.g.
-/// `mcpOAuth`) untouched. Written atomically via a temp file + rename.
+/// Join a config directory with the credentials file name.
+pub(crate) fn credentials_path_in(config_dir: &Path) -> PathBuf {
+    config_dir.join(CREDENTIALS_FILE_NAME)
+}
+
+/// Get the ambient credentials file path. Signature and behavior unchanged
+/// from before the `claude_accounts` refactor.
+fn credentials_path() -> Result<PathBuf, ProviderError> {
+    Ok(credentials_path_in(&ambient_claude_config_dir()?))
+}
+
+/// Persist refreshed tokens back to the ambient `.claude/.credentials.json`,
+/// gated by consent as today. Signature and behavior unchanged from before
+/// the `claude_accounts` refactor.
 pub(super) fn persist_refreshed_credentials(
     credentials: &ClaudeOAuthCredentials,
 ) -> Result<(), ProviderError> {
@@ -341,10 +367,23 @@ pub(super) fn persist_refreshed_credentials(
     if !crate::providers::claude::claude_code_consent() {
         return Ok(());
     }
+    persist_refreshed_credentials_in(&ambient_claude_config_dir()?, credentials)
+}
 
-    let path = credentials_path()?;
+/// Persist refreshed tokens back to `dir`'s `.credentials.json`, updating
+/// only the `claudeAiOauth` token fields and leaving everything else (e.g.
+/// `mcpOAuth`) untouched. Written atomically via a temp file + rename. Carries
+/// no consent gate of its own (design decision D6): managed-directory writes
+/// are app-owned files, not Claude Code's ambient store; the ambient wrapper
+/// above keeps its existing gate byte-for-byte.
+pub(crate) fn persist_refreshed_credentials_in(
+    dir: &Path,
+    credentials: &ClaudeOAuthCredentials,
+) -> Result<(), ProviderError> {
+    let path = credentials_path_in(dir);
     if !path.exists() {
-        // Loaded from keyring/env; there is no file to update.
+        // Loaded from keyring/env, or the managed directory has no
+        // credentials yet; there is no file to update.
         return Ok(());
     }
 
@@ -421,7 +460,8 @@ fn apply_refresh_to_credentials_json(
 mod tests {
     use super::{
         CredentialSource, apply_refresh_to_credentials_json, cached_refreshed_if_fresher,
-        parse_credentials_json, store_refreshed,
+        credentials_path_in, load_credentials_in, parse_credentials_json,
+        persist_refreshed_credentials_in, store_refreshed,
     };
     use crate::providers::claude::oauth::ClaudeOAuthCredentials;
 
@@ -520,6 +560,90 @@ mod tests {
         assert_eq!(
             root["claudeAiOauth"]["scopes"],
             serde_json::json!(["user:profile", "user:inference"])
+        );
+    }
+
+    /// Extends `apply_refresh_updates_only_oauth_block_and_preserves_others`
+    /// to the `_in` path with a non-default (tempfile) config dir (spec:
+    /// "mcpOAuth preservation holds under any config-dir").
+    #[test]
+    fn persist_refreshed_credentials_in_preserves_mcp_oauth_under_non_default_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = credentials_path_in(dir.path());
+        std::fs::write(
+            &path,
+            r#"{
+                "mcpOAuth": {"some-server": {"accessToken": "keepme"}},
+                "claudeAiOauth": {
+                    "accessToken": "old",
+                    "refreshToken": "old-refresh",
+                    "expiresAt": 1000,
+                    "scopes": ["user:profile"],
+                    "subscriptionType": "max"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let creds = ClaudeOAuthCredentials {
+            access_token: "fresh-access".to_string(),
+            refresh_token: Some("fresh-refresh".to_string()),
+            expires_at: chrono::DateTime::from_timestamp(2_000, 0),
+            scopes: vec!["user:profile".to_string()],
+            rate_limit_tier: None,
+        };
+
+        persist_refreshed_credentials_in(dir.path(), &creds).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["mcpOAuth"]["some-server"]["accessToken"], "keepme");
+        assert_eq!(root["claudeAiOauth"]["subscriptionType"], "max");
+        assert_eq!(root["claudeAiOauth"]["accessToken"], "fresh-access");
+
+        // No leftover temp file after a successful atomic rename.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("codexbar-tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn load_credentials_in_reads_a_config_dir_scoped_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            credentials_path_in(dir.path()),
+            r#"{"claudeAiOauth": {"accessToken": "scoped-token"}}"#,
+        )
+        .unwrap();
+
+        let creds = load_credentials_in(dir.path()).unwrap();
+        assert_eq!(creds.access_token, "scoped-token");
+    }
+
+    #[test]
+    fn load_credentials_in_missing_file_errors_without_touching_ambient() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = load_credentials_in(dir.path()).expect_err("no file in this dir");
+        assert!(
+            error
+                .to_string()
+                .contains("Claude OAuth credentials not found")
+        );
+    }
+
+    /// `credentials_path_in` is the same join logic as the ambient wrapper,
+    /// just parameterized by root (spec: "Config-dir override targets a
+    /// managed account" / design: "credentials_path_in(dir) vs ambient
+    /// credentials_path() parity").
+    #[test]
+    fn credentials_path_in_matches_ambient_join_logic_for_a_different_root() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            credentials_path_in(dir.path()),
+            dir.path().join(".credentials.json")
         );
     }
 
