@@ -1,7 +1,7 @@
 {
   "name": "desktop-tauri",
   "private": true,
-  "version": "0.55.1",
+  "version": "0.55.2",
   "packageManager": "pnpm@11.24.0",
   "type": "module",
   "scripts": {

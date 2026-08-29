@@ -1,5 +1,20 @@
 # Changelog
 
+## [Windows] 0.55.2 - 2026-08-28
+
+### Fixed
+- Codex accounts: switching a Codex account from Settings → Providers → Codex now
+  triggers a provider refresh, so the tray icon and Codex provider card reflect
+  the newly-active identity immediately instead of waiting for a scheduled tick
+  (matching the tray menu's switch behaviour) (#4).
+- Codex accounts: both the Settings section and the tray menu now show an
+  explicit "Active" badge and disable the Switch button on the account that
+  matches the live `~/.codex` identity. The indicator is derived from a new
+  `activeAccountId` field rather than `source`, so it stays correct after a
+  switch materializes the previous account as managed (#4).
+
+---
+
 ## [Windows] 0.55.1 - 2026-08-28
 
 ### Fixed
