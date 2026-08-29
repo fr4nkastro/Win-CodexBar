@@ -10,12 +10,14 @@
 //! (design decision D2 — the key structural divergence from `codex_accounts`,
 //! which copies the whole `auth.json`).
 
+pub mod account_manager;
 pub mod credentials_merge;
 pub mod file_locations;
 pub mod identity;
 pub mod login_runner;
 pub mod models;
 
+pub use account_manager::{ClaudeAccountManager, ClaudeAccountManagerError, ClaudeSwitchResult};
 pub use identity::{
     AmbientClaudeIdentity, AmbientOauthAccount, ClaudeIdentity, ClaudeIdentityError,
     active_account_id, derive_account_uuid, parse_auth_status_json, stable_discovered_id,
