@@ -148,7 +148,7 @@ fn load_from_environment() -> Option<ClaudeOAuthCredentials> {
 
 /// Load credentials from ~/.claude/.credentials.json
 fn load_from_file() -> Result<ClaudeOAuthCredentials, ProviderError> {
-    load_credentials_in(&ambient_claude_config_dir()?)
+    load_credentials_in(&legacy_ambient_claude_config_dir()?)
 }
 
 /// Load credentials from `dir`'s `.credentials.json` (ambient or a
@@ -339,7 +339,7 @@ fn push_keyring_candidate(candidates: &mut Vec<String>, value: String) {
 /// this local helper only replicates what `credentials_path()` always
 /// computed, so the ambient-facing wrappers below stay byte-for-byte
 /// unchanged (spec: "Default remains ambient").
-fn ambient_claude_config_dir() -> Result<PathBuf, ProviderError> {
+fn legacy_ambient_claude_config_dir() -> Result<PathBuf, ProviderError> {
     dirs::home_dir()
         .map(|home| home.join(".claude"))
         .ok_or_else(|| ProviderError::OAuth("Could not find home directory".to_string()))
@@ -353,7 +353,7 @@ pub(crate) fn credentials_path_in(config_dir: &Path) -> PathBuf {
 /// Get the ambient credentials file path. Signature and behavior unchanged
 /// from before the `claude_accounts` refactor.
 fn credentials_path() -> Result<PathBuf, ProviderError> {
-    Ok(credentials_path_in(&ambient_claude_config_dir()?))
+    Ok(credentials_path_in(&legacy_ambient_claude_config_dir()?))
 }
 
 /// Persist refreshed tokens back to the ambient `.claude/.credentials.json`,
@@ -367,7 +367,7 @@ pub(super) fn persist_refreshed_credentials(
     if !crate::providers::claude::claude_code_consent() {
         return Ok(());
     }
-    persist_refreshed_credentials_in(&ambient_claude_config_dir()?, credentials)
+    persist_refreshed_credentials_in(&legacy_ambient_claude_config_dir()?, credentials)
 }
 
 /// Persist refreshed tokens back to `dir`'s `.credentials.json`, updating
