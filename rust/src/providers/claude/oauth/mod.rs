@@ -15,6 +15,12 @@ use crate::core::{NamedRateWindow, ProviderError, ProviderFetchResult, RateWindo
 mod credentials_store;
 mod refresh;
 
+/// Re-exported for `providers::claude::mod.rs`'s `claude_accounts` facade
+/// (`read_credentials_in`/`persist_credentials_in`). `credentials_store`
+/// itself stays private — only these two directory-scoped functions are
+/// reachable from outside `oauth` (design decision D1).
+pub(crate) use credentials_store::{load_credentials_in, persist_refreshed_credentials_in};
+
 /// OAuth credentials from Claude CLI
 #[derive(Debug, Clone)]
 pub struct ClaudeOAuthCredentials {

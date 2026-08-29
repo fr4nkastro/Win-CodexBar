@@ -79,6 +79,27 @@ fn is_oauth_revoked_error(error: &ProviderError) -> bool {
 pub use oauth::ClaudeOAuthFetcher;
 pub use web_api::ClaudeWebApiFetcher;
 
+/// Facade for `claude_accounts`: reads/persists OAuth credentials scoped to
+/// an explicit config directory (ambient or a managed account's own
+/// directory), without exposing `oauth::credentials_store`'s internals
+/// (design decision D1). `claude_accounts` never touches
+/// `oauth::credentials_store` directly.
+pub(crate) fn read_credentials_in(
+    dir: &std::path::Path,
+) -> Result<oauth::ClaudeOAuthCredentials, ProviderError> {
+    oauth::load_credentials_in(dir)
+}
+
+/// See [`read_credentials_in`]. Carries no consent gate of its own — the
+/// ambient path's existing gate is untouched; managed-directory writes are
+/// app-owned files, not Claude Code's ambient store (design decision D6).
+pub(crate) fn persist_credentials_in(
+    dir: &std::path::Path,
+    credentials: &oauth::ClaudeOAuthCredentials,
+) -> Result<(), ProviderError> {
+    oauth::persist_refreshed_credentials_in(dir, credentials)
+}
+
 /// Whether the user explicitly consented to reading (and refreshing) Claude
 /// Code's own credentials. Upstream #2634/#2745: without consent the
 /// file/keyring sources stay closed and refreshed tokens are never rotated
