@@ -943,4 +943,5 @@ export interface CodexSwitchResult {
 export interface CodexAccountsStateBridge {
   accounts: CodexAccount[];
   snapshots: Record<string, CodexAccountUsageSnapshot>;
+  activeAccountId?: string | null;
 }

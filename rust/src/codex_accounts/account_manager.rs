@@ -691,6 +691,64 @@ fn looks_like_uuid(value: &str) -> bool {
     Uuid::parse_str(value.trim()).is_ok()
 }
 
+/// Id of the listed account whose identity matches the live `~/.codex`
+/// identity, or `None` when nothing matches (or `identity` is `None`).
+///
+/// Pure computation: no filesystem, network, or Windows-only syscalls, so it is
+/// fully exercised by `cargo test` on Linux/WSL2.
+///
+/// Mirrors [`CodexAccount::matches`] MINUS its home-path clause (post-switch the
+/// managed home and `~/.codex` are different paths with identical auth, so path
+/// matching would fail). Three ordered passes over `accounts` in slice order,
+/// first hit wins:
+/// 1. `provider_account_id` equal, present on both sides.
+/// 2. `auth_subject` equal — skipping any account that also carries a
+///    `provider_account_id` while the identity has one (they already failed
+///    pass 1; this is the `models.rs` guard that stops a provider-id mismatch
+///    from falling through to a subject/email match).
+/// 3. `email` ↔ `email_hint` equal, same skip rule.
+pub fn active_account_id(
+    accounts: &[CodexAccount],
+    identity: Option<&AuthBackedIdentity>,
+) -> Option<Uuid> {
+    let identity = identity?;
+    let identity_provider = normalized(identity.provider_account_id.as_deref());
+    let identity_subject = normalized(identity.auth_subject.as_deref());
+    let identity_email = normalized(identity.email.as_deref());
+
+    if let Some(identity_provider) = identity_provider.as_deref() {
+        for account in accounts {
+            if account.normalized_provider_account_id().as_deref() == Some(identity_provider) {
+                return Some(account.id);
+            }
+        }
+    }
+
+    if let Some(identity_subject) = identity_subject.as_deref() {
+        for account in accounts {
+            if identity_provider.is_some() && account.normalized_provider_account_id().is_some() {
+                continue;
+            }
+            if account.normalized_auth_subject().as_deref() == Some(identity_subject) {
+                return Some(account.id);
+            }
+        }
+    }
+
+    if let Some(identity_email) = identity_email.as_deref() {
+        for account in accounts {
+            if identity_provider.is_some() && account.normalized_provider_account_id().is_some() {
+                continue;
+            }
+            if account.normalized_email_hint().as_deref() == Some(identity_email) {
+                return Some(account.id);
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +824,161 @@ mod tests {
             serde_json::to_vec_pretty(&auth_payload).unwrap(),
         )
         .unwrap();
+    }
+
+    fn identity_of(
+        email: Option<&str>,
+        auth_subject: Option<&str>,
+        provider_account_id: Option<&str>,
+    ) -> AuthBackedIdentity {
+        AuthBackedIdentity {
+            email: email.map(str::to_string),
+            auth_subject: auth_subject.map(str::to_string),
+            plan: None,
+            provider_account_id: provider_account_id.map(str::to_string),
+        }
+    }
+
+    fn account_fields(
+        home_path: &str,
+        email: Option<&str>,
+        auth_subject: Option<&str>,
+        provider_account_id: Option<&str>,
+    ) -> CodexAccount {
+        CodexAccount::new(
+            Uuid::new_v4(),
+            None,
+            email.map(str::to_string),
+            auth_subject.map(str::to_string),
+            provider_account_id.map(str::to_string),
+            PathBuf::from(home_path),
+            CodexAccountSource::ManagedByApp,
+            utc_now(),
+            utc_now(),
+            Some(utc_now()),
+        )
+    }
+
+    #[test]
+    fn active_account_id_matches_by_provider_account_id() {
+        let a = account_fields("/h/a", Some("a@x.com"), Some("auth0|sub-a"), Some("prov-1"));
+        let b = account_fields("/h/b", Some("b@x.com"), Some("auth0|sub-b"), Some("prov-2"));
+        let accounts = vec![a, b.clone()];
+        // Identity email/subject differ; only the normalized provider id agrees.
+        let identity = identity_of(Some("other@x.com"), Some("auth0|other"), Some("PROV-2"));
+        assert_eq!(
+            active_account_id(&accounts, Some(&identity)),
+            Some(b.id),
+            "provider_account_id is the strongest key and is normalized"
+        );
+    }
+
+    #[test]
+    fn active_account_id_falls_back_to_auth_subject() {
+        let a = account_fields("/h/a", Some("a@x.com"), Some("auth0|sub-a"), None);
+        let b = account_fields("/h/b", Some("b@x.com"), Some("auth0|sub-b"), None);
+        let accounts = vec![a, b.clone()];
+        let identity = identity_of(Some("nomatch@x.com"), Some("AUTH0|SUB-B"), None);
+        assert_eq!(active_account_id(&accounts, Some(&identity)), Some(b.id));
+    }
+
+    #[test]
+    fn active_account_id_falls_back_to_email_hint() {
+        let a = account_fields("/h/a", Some("a@x.com"), None, None);
+        let b = account_fields("/h/b", Some("b@x.com"), None, None);
+        let accounts = vec![a, b.clone()];
+        let identity = identity_of(Some("B@X.COM"), None, None);
+        assert_eq!(active_account_id(&accounts, Some(&identity)), Some(b.id));
+    }
+
+    #[test]
+    fn active_account_id_provider_mismatch_blocks_subject_and_email_fallback() {
+        // Account and identity share auth_subject and email, but both carry a
+        // (different) provider_account_id -> models.rs:195-199 guard: no
+        // fall-through to a subject/email match.
+        let a = account_fields(
+            "/h/a",
+            Some("same@x.com"),
+            Some("auth0|same-sub"),
+            Some("prov-account"),
+        );
+        let identity = identity_of(
+            Some("same@x.com"),
+            Some("auth0|same-sub"),
+            Some("prov-identity"),
+        );
+        assert_eq!(
+            active_account_id(std::slice::from_ref(&a), Some(&identity)),
+            None
+        );
+    }
+
+    #[test]
+    fn active_account_id_none_identity_is_none() {
+        let a = account_fields("/h/a", Some("a@x.com"), Some("auth0|sub-a"), Some("prov-1"));
+        assert_eq!(active_account_id(std::slice::from_ref(&a), None), None);
+    }
+
+    #[test]
+    fn active_account_id_no_match_is_none() {
+        let a = account_fields("/h/a", Some("a@x.com"), Some("auth0|sub-a"), Some("prov-1"));
+        let identity = identity_of(Some("z@x.com"), Some("auth0|sub-z"), Some("prov-z"));
+        assert_eq!(
+            active_account_id(std::slice::from_ref(&a), Some(&identity)),
+            None
+        );
+    }
+
+    #[test]
+    fn active_account_id_first_match_in_slice_order_wins() {
+        let a = account_fields("/h/a", Some("dup@x.com"), None, None);
+        let b = account_fields("/h/b", Some("dup@x.com"), None, None);
+        let accounts = vec![a.clone(), b];
+        let identity = identity_of(Some("dup@x.com"), None, None);
+        assert_eq!(active_account_id(&accounts, Some(&identity)), Some(a.id));
+    }
+
+    #[test]
+    fn active_account_id_picks_managed_account_matching_live_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::file_locations::with_app_support_directory(root.to_path_buf());
+
+        let ambient_home = root.join(".codex");
+        let managed_a = root.join("managed-homes").join("aaaaaaaa");
+        let managed_b = root.join("managed-homes").join("bbbbbbbb");
+        for home in [&ambient_home, &managed_a, &managed_b] {
+            std::fs::create_dir_all(home).unwrap();
+        }
+        write_auth(&managed_a, "a@example.com", "provider-a");
+        write_auth(&managed_b, "b@example.com", "provider-b");
+        // Live ambient identity is the same account as managed_b.
+        write_auth(&ambient_home, "b@example.com", "provider-b");
+        super::super::file_locations::with_ambient_codex_home(ambient_home.clone());
+
+        let manager = CodexAccountManager::new();
+        let accounts = manager.discover_managed_accounts(&[]).unwrap();
+        assert!(
+            accounts
+                .iter()
+                .all(|account| account.source == CodexAccountSource::ManagedByApp),
+            "every listed account is ManagedByApp (regression: source must not gate the active row)"
+        );
+        let identity = manager.load_active_identity();
+        assert!(identity.is_some());
+
+        let expected = accounts
+            .iter()
+            .find(|account| account.codex_home_path.as_path() == managed_b.as_path())
+            .expect("managed_b discovered")
+            .id;
+        assert_eq!(
+            active_account_id(&accounts, identity.as_ref()),
+            Some(expected)
+        );
+
+        super::super::file_locations::clear_app_support_directory_override();
+        super::super::file_locations::clear_ambient_codex_home_override();
     }
 
     #[test]

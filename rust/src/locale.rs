@@ -532,6 +532,7 @@ locale_keys! {
     CodexAccountsEmpty,
     CodexAccountsSourceAmbient,
     CodexAccountsSourceManaged,
+    CodexAccountsActive,
     CodexAccountsUsageUnavailable,
     CodexSwitchSuccess,
     CodexSwitchRestartPrompt,

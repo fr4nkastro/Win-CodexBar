@@ -301,6 +301,7 @@ CodexAccountsRemoveButton = Remove
 CodexAccountsEmpty = No Codex accounts found.
 CodexAccountsSourceAmbient = Ambient
 CodexAccountsSourceManaged = Managed
+CodexAccountsActive = Active
 CodexAccountsUsageUnavailable = No usage data
 CodexSwitchSuccess = Active account switched.
 CodexSwitchRestartPrompt = Restart Codex Desktop to load the restored session?

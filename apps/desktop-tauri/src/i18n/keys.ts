@@ -314,6 +314,7 @@ export const ALL_LOCALE_KEYS = [
   "CodexAccountsEmpty",
   "CodexAccountsSourceAmbient",
   "CodexAccountsSourceManaged",
+  "CodexAccountsActive",
   "CodexAccountsUsageUnavailable",
   "CodexSwitchSuccess",
   "CodexSwitchRestartPrompt",

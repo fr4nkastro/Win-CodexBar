@@ -15,6 +15,7 @@ const tauriMocks = vi.hoisted(() => ({
   codexAccountRemove: vi.fn(),
   codexAccountSwitch: vi.fn(),
   codexAccountRestartDesktop: vi.fn(),
+  refreshProviders: vi.fn().mockResolvedValue(undefined),
 }));
 
 const eventMocks = vi.hoisted(() => ({
@@ -139,6 +140,70 @@ describe("CodexAccountsSection", () => {
       screen.getByText("CodexAccountsRestartDesktop").click();
     });
     expect(tauriMocks.codexAccountRestartDesktop).toHaveBeenCalledTimes(1);
+    // R1: the Settings switch triggers a provider refresh exactly once.
+    expect(tauriMocks.refreshProviders).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the switch success state when the provider refresh rejects (R2)", async () => {
+    tauriMocks.getCodexAccountsState.mockResolvedValue(
+      { accounts: [account("1")], snapshots: {} } as CodexAccountsStateBridge,
+    );
+    tauriMocks.codexAccountSwitch.mockResolvedValue(
+      { desktopSessionRestoreExists: false } as CodexSwitchResult,
+    );
+    tauriMocks.refreshProviders.mockRejectedValueOnce(new Error("refresh boom"));
+    render(<CodexAccountsSection t={t} />);
+    await waitFor(() => {
+      expect(screen.getByText("CodexAccountsSwitchButton")).toBeDefined();
+    });
+
+    await act(async () => {
+      screen.getByText("CodexAccountsSwitchButton").click();
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/CodexSwitchSuccess/)).toBeDefined();
+    });
+    expect(tauriMocks.refreshProviders).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("marks only the activeAccountId row active and disables its switch (R5)", async () => {
+    tauriMocks.getCodexAccountsState.mockResolvedValue(
+      {
+        accounts: [account("1"), account("2")],
+        snapshots: {},
+        activeAccountId: "2",
+      } as CodexAccountsStateBridge,
+    );
+    render(<CodexAccountsSection t={t} />);
+    await waitFor(() => {
+      expect(screen.getByText("user-1@example.com")).toBeDefined();
+    });
+
+    expect(screen.getAllByText("CodexAccountsActive")).toHaveLength(1);
+
+    const switches = screen.getAllByText("CodexAccountsSwitchButton");
+    // account("1") renders first, account("2") second.
+    expect((switches[0] as HTMLButtonElement).disabled).toBe(false);
+    expect((switches[1] as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("renders no active row when activeAccountId is absent (R7)", async () => {
+    tauriMocks.getCodexAccountsState.mockResolvedValue(
+      {
+        accounts: [account("1"), account("2")],
+        snapshots: {},
+      } as CodexAccountsStateBridge,
+    );
+    render(<CodexAccountsSection t={t} />);
+    await waitFor(() => {
+      expect(screen.getByText("user-1@example.com")).toBeDefined();
+    });
+
+    expect(screen.queryByText("CodexAccountsActive")).toBeNull();
+    for (const button of screen.getAllByText("CodexAccountsSwitchButton")) {
+      expect((button as HTMLButtonElement).disabled).toBe(false);
+    }
   });
 });
 

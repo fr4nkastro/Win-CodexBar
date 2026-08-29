@@ -11,7 +11,7 @@ import { LocaleProvider } from "../i18n/LocaleProvider";
 const tauriMocks = vi.hoisted(() => ({
   getCodexAccountsState: vi.fn(),
   codexAccountSwitch: vi.fn(),
-  refreshProviders: vi.fn(),
+  refreshProviders: vi.fn().mockResolvedValue(undefined),
   getLocaleStrings: vi.fn(),
 }));
 
@@ -84,27 +84,33 @@ describe("CodexAccountsMenu", () => {
     });
   });
 
-  it("lists multiple accounts with usage bars and marks the ambient one active", async () => {
+  it("marks the activeAccountId row active even when every account is managed", async () => {
     const { container } = renderMenu(false, {
-      accounts: [
-        account("1", { source: "ambient" }),
-        account("2"),
-      ],
+      accounts: [account("1"), account("2")],
       snapshots: { "1": snapshot(30), "2": snapshot(70) },
+      activeAccountId: "1",
     });
     await screen.findByText("user-1@example.com");
     expect(screen.getByText("user-2@example.com")).toBeDefined();
 
     const rows = container.querySelectorAll(".codex-menu-accounts__row");
     expect(rows.length).toBe(2);
-    // Ambient row is marked active; its switch is disabled.
+    // The active row is keyed off activeAccountId, not source === "ambient".
     expect(
       rows[0].className.includes("codex-menu-accounts__row--active"),
     ).toBe(true);
     expect(
+      rows[1].className.includes("codex-menu-accounts__row--active"),
+    ).toBe(false);
+    expect(
       (rows[0].querySelector(".codex-menu-accounts__switch") as HTMLButtonElement)
         .disabled,
     ).toBe(true);
+    expect(
+      (rows[1].querySelector(".codex-menu-accounts__switch") as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+    expect(screen.getAllByText("CodexAccountsActive")).toHaveLength(1);
 
     // Usage bar widths map to the snapshot percentages.
     const fills = container.querySelectorAll(".codex-menu-accounts__bar-fill");
@@ -143,15 +149,17 @@ describe("CodexAccountsMenu", () => {
 
   it("switches an account and kicks a provider refresh", async () => {
     renderMenu(false, {
-      accounts: [account("1", { source: "ambient" }), account("2")],
+      accounts: [account("1"), account("2")],
       snapshots: {},
+      activeAccountId: "1",
     });
     await screen.findByText("user-1@example.com");
 
     tauriMocks.codexAccountSwitch.mockResolvedValue({});
     tauriMocks.getCodexAccountsState.mockResolvedValue({
-      accounts: [account("1", { source: "ambient" }), account("2")],
+      accounts: [account("1"), account("2")],
       snapshots: {},
+      activeAccountId: "1",
     });
     const switchButtons = screen.getAllByText("CodexAccountsSwitchButton");
     const activeSwitch = switchButtons.find((b) => !(b as HTMLButtonElement).disabled);

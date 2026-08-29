@@ -28,6 +28,7 @@ export default function CodexAccountsMenu({ hideEmail }: { hideEmail: boolean })
   const [snapshots, setSnapshots] = useState<
     Record<string, CodexAccountUsageSnapshot>
   >({});
+  const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -38,6 +39,7 @@ export default function CodexAccountsMenu({ hideEmail }: { hideEmail: boolean })
       const next: CodexAccountsStateBridge = await getCodexAccountsState();
       setAccounts(next.accounts);
       setSnapshots(next.snapshots);
+      setActiveAccountId(next.activeAccountId ?? null);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -110,14 +112,20 @@ export default function CodexAccountsMenu({ hideEmail }: { hideEmail: boolean })
             shrink(account.id);
           const shown = hideEmail ? maskEmail(label) : label;
           const isAmbient = account.source === "ambient";
+          const isActive = account.id === activeAccountId;
           return (
             <li key={account.id}>
               <div
-                className={`codex-menu-accounts__row${isAmbient ? " codex-menu-accounts__row--active" : ""}`}
+                className={`codex-menu-accounts__row${isActive ? " codex-menu-accounts__row--active" : ""}`}
               >
                 <div className="codex-menu-accounts__meta">
                   <span className="codex-menu-accounts__email" title={label}>
                     {shown}
+                    {isActive && (
+                      <span className="codex-menu-accounts__badge">
+                        {t("CodexAccountsActive")}
+                      </span>
+                    )}
                     {isAmbient && (
                       <span className="codex-menu-accounts__badge">
                         {t("CodexAccountsSourceAmbient")}
@@ -136,7 +144,7 @@ export default function CodexAccountsMenu({ hideEmail }: { hideEmail: boolean })
                 <button
                   type="button"
                   className="codex-menu-accounts__switch"
-                  disabled={busy || isAmbient}
+                  disabled={busy || isActive}
                   onClick={() => void handleSwitch(account.id)}
                 >
                   {t("CodexAccountsSwitchButton")}
