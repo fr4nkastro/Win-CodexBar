@@ -1,5 +1,23 @@
 # Changelog
 
+## [Windows] 0.56.0 - 2026-08-29
+
+### Added
+- Claude accounts: multi-account support for Claude Code, mirroring the Codex
+  accounts feature. Add, switch, remove, and refresh per-account usage for
+  managed Claude Code accounts from both the tray menu and Settings → Providers
+  → Claude. Each managed account lives in its own `CLAUDE_CONFIG_DIR`; switching
+  merges the `claudeAiOauth` block into the ambient `~/.claude/.credentials.json`
+  (MCP server tokens are preserved). Add-account drives `claude auth login
+  --claudeai` into an isolated config dir. An explicit "Active" badge marks the
+  account matching the live ambient identity (#6).
+- Settings → Providers → Claude: new "Allow managing Claude Code accounts"
+  consent toggle (off by default). Every account write path is rejected until it
+  is enabled, and the Settings accounts section stays hidden while it is off
+  (#6).
+
+---
+
 ## [Windows] 0.55.2 - 2026-08-28
 
 ### Fixed
