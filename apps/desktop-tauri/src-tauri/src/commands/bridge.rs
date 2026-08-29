@@ -718,6 +718,7 @@ pub struct SettingsSnapshot {
     promote_tray_icon: bool,
     claude_daily_routines_usage_visible: bool,
     claude_allow_reading_claude_code_credentials: bool,
+    claude_allow_managing_claude_code_accounts: bool,
     alibaba_token_plan_region: String,
     weekly_progress_work_days: Option<u8>,
     cost_summary_display_style: &'static str,
@@ -832,6 +833,8 @@ impl From<Settings> for SettingsSnapshot {
             claude_daily_routines_usage_visible: settings.claude_daily_routines_usage_visible,
             claude_allow_reading_claude_code_credentials: settings
                 .claude_allow_reading_claude_code_credentials,
+            claude_allow_managing_claude_code_accounts: settings
+                .claude_allow_managing_claude_code_accounts,
             alibaba_token_plan_region: settings.alibaba_token_plan_region,
             weekly_progress_work_days: settings.weekly_progress_work_days,
             cost_summary_display_style: cost_summary_display_style_label(
