@@ -2513,6 +2513,48 @@ body:has(.tray-panel-reveal) {
   white-space: nowrap;
 }
 
+.claude-accounts-list {
+  gap: 6px;
+}
+
+.claude-accounts-card {
+  padding: 8px 10px;
+}
+
+.claude-accounts-add {
+  margin-top: 8px;
+}
+
+.claude-usage {
+  font-size: 0.74rem;
+  font-weight: 500;
+  color: var(--provider-row-text-secondary);
+}
+
+/* ClaudeAccountsSection cards sit in the same fixed 720px settings window as
+   CodexAccountsSection's cards; mirror that containment exactly (see the
+   .codex-accounts-card rules above) so a long account email cannot overflow
+   the info column and paint over the actions row. */
+.claude-accounts-card .credential-card__info {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.claude-accounts-card .credential-card__info strong {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.claude-accounts-card .credential-card__actions {
+  flex-shrink: 0;
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+
 .provider-detail-pace__stage {
   font-size: 0.86rem;
   font-weight: 600;
