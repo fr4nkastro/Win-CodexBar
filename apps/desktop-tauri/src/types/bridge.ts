@@ -253,6 +253,13 @@ export interface SettingsSnapshot {
    * usage (upstream #2634/#2745).
    */
   claudeAllowReadingClaudeCodeCredentials: boolean;
+  /**
+   * Explicit consent to add, switch, and remove managed Claude Code
+   * accounts (claude-multi-account). Default false — every write path in
+   * the `claude_account_*` IPC surface is rejected before touching disk
+   * while this is off.
+   */
+  claudeAllowManagingClaudeCodeAccounts: boolean;
   /** Alibaba Token Plan region: cn | intl | cn-personal | intl-personal. */
   alibabaTokenPlanRegion: string;
   /** Optional work-week length [2,6] for session-equivalent weekly forecast. */
@@ -315,6 +322,7 @@ export interface SettingsUpdate {
   powertoysStatusPipeEnabled?: boolean;
   claudeAvoidKeychainPrompts?: boolean;
   claudeAllowReadingClaudeCodeCredentials?: boolean;
+  claudeAllowManagingClaudeCodeAccounts?: boolean;
   codexSparkUsageVisible?: boolean;
   disableKeychainAccess?: boolean;
   /** Map of provider CLI name → metric preference label. */
@@ -943,5 +951,50 @@ export interface CodexSwitchResult {
 export interface CodexAccountsStateBridge {
   accounts: CodexAccount[];
   snapshots: Record<string, CodexAccountUsageSnapshot>;
+  activeAccountId?: string | null;
+}
+
+// ── Claude multi-account (mirrors Codex multi-account 1:1) ──────────
+
+export type ClaudeAccountSource = "ambient" | "managedByApp";
+
+export interface ClaudeAccount {
+  id: string;
+  nickname: string | null;
+  emailHint: string | null;
+  orgId: string | null;
+  orgName: string | null;
+  subscriptionType: string | null;
+  claudeConfigDir: string;
+  source: ClaudeAccountSource;
+  createdAt: string;
+  updatedAt: string;
+  lastAuthenticatedAt: string | null;
+}
+
+export interface ClaudeUsageWindow {
+  usedPercent: number;
+  resetAt: string | null;
+  limitWindowSeconds: number;
+}
+
+export interface ClaudeAccountUsageSnapshot {
+  email: string | null;
+  orgId: string | null;
+  plan: string | null;
+  primaryWindow: ClaudeUsageWindow | null;
+  secondaryWindow: ClaudeUsageWindow | null;
+  updatedAt: string;
+}
+
+export interface ClaudeSwitchResult {
+  materializedAccount: ClaudeAccount | null;
+  backupPath: string | null;
+  ambientAccount: ClaudeAccount | null;
+}
+
+export interface ClaudeAccountsStateBridge {
+  accounts: ClaudeAccount[];
+  snapshots: Record<string, ClaudeAccountUsageSnapshot>;
   activeAccountId?: string | null;
 }
