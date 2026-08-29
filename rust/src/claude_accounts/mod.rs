@@ -13,12 +13,14 @@
 pub mod credentials_merge;
 pub mod file_locations;
 pub mod identity;
+pub mod login_runner;
 pub mod models;
 
 pub use identity::{
     AmbientClaudeIdentity, AmbientOauthAccount, ClaudeIdentity, ClaudeIdentityError,
     active_account_id, derive_account_uuid, parse_auth_status_json, stable_discovered_id,
 };
+pub use login_runner::{ClaudeLoginOutcome, ClaudeLoginResult, ManagedLoginProcess};
 pub use models::{
     ClaudeAccount, ClaudeAccountSource, ClaudeAccountUsageSnapshot, RemovedAccountIdentity,
     UsageWindowSnapshot, utc_now,
