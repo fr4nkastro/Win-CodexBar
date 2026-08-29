@@ -184,6 +184,7 @@ function settings(overrides: Partial<SettingsSnapshot> = {}): SettingsSnapshot {
     floatBarShowCost: false,
     claudeDailyRoutinesUsageVisible: true,
     claudeAllowReadingClaudeCodeCredentials: false,
+    claudeAllowManagingClaudeCodeAccounts: false,
     alibabaTokenPlanRegion: "cn",
     weeklyProgressWorkDays: null,
     costSummaryDisplayStyle: "compact",

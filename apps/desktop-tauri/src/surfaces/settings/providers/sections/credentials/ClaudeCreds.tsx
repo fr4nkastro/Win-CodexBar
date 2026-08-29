@@ -23,6 +23,8 @@ export function ClaudeCreds({ t }: Props) {
   );
   const [allowReadingClaudeCodeCredentials, setAllowReadingClaudeCodeCredentials] =
     useState<boolean | null>(null);
+  const [allowManagingClaudeCodeAccounts, setAllowManagingClaudeCodeAccounts] =
+    useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -35,6 +37,9 @@ export function ClaudeCreds({ t }: Props) {
         setShowDailyRoutines(s.claudeDailyRoutinesUsageVisible ?? true);
         setAllowReadingClaudeCodeCredentials(
           s.claudeAllowReadingClaudeCodeCredentials ?? false,
+        );
+        setAllowManagingClaudeCodeAccounts(
+          s.claudeAllowManagingClaudeCodeAccounts ?? false,
         );
       })
       .catch((e) => !cancelled && setError(String(e)));
@@ -87,10 +92,27 @@ export function ClaudeCreds({ t }: Props) {
     }
   };
 
+  const toggleAllowManagingClaudeCodeAccounts = async (next: boolean) => {
+    setSaving(true);
+    try {
+      const updated = await updateSettings({
+        claudeAllowManagingClaudeCodeAccounts: next,
+      });
+      setAllowManagingClaudeCodeAccounts(
+        updated.claudeAllowManagingClaudeCodeAccounts ?? next,
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   if (
     avoidKeychain === null ||
     showDailyRoutines === null ||
-    allowReadingClaudeCodeCredentials === null
+    allowReadingClaudeCodeCredentials === null ||
+    allowManagingClaudeCodeAccounts === null
   )
     return null;
 
@@ -144,6 +166,24 @@ export function ClaudeCreds({ t }: Props) {
           </span>
           <span className="provider-detail-toggle__helper">
             {t("ProviderClaudeAllowReadingClaudeCodeCredentialsHelp")}
+          </span>
+        </span>
+      </label>
+      <label className="provider-detail-toggle">
+        <input
+          type="checkbox"
+          checked={allowManagingClaudeCodeAccounts}
+          disabled={saving}
+          onChange={(e) =>
+            void toggleAllowManagingClaudeCodeAccounts(e.target.checked)
+          }
+        />
+        <span>
+          <span className="provider-detail-toggle__label">
+            {t("ProviderClaudeAllowManagingClaudeCodeAccounts")}
+          </span>
+          <span className="provider-detail-toggle__helper">
+            {t("ProviderClaudeAllowManagingClaudeCodeAccountsHelp")}
           </span>
         </span>
       </label>

@@ -39,6 +39,10 @@ import type {
   CodexAccountUsageSnapshot,
   CodexAccountsStateBridge,
   CodexSwitchResult,
+  ClaudeAccount,
+  ClaudeAccountUsageSnapshot,
+  ClaudeAccountsStateBridge,
+  ClaudeSwitchResult,
   DeepSeekPricingStatus,
 } from "../types/bridge";
 
@@ -527,4 +531,40 @@ export function codexAccountRestartDesktop(
 
 export function getCodexAccountsState(): Promise<CodexAccountsStateBridge> {
   return invoke<CodexAccountsStateBridge>("get_codex_accounts_state");
+}
+
+// ── Claude multi-account (claude-multi-account) ──────────────────────
+
+export function claudeAccountsList(): Promise<ClaudeAccount[]> {
+  return invoke<ClaudeAccount[]>("claude_accounts_list");
+}
+
+export function claudeAccountAdd(): Promise<ClaudeAccount> {
+  return invoke<ClaudeAccount>("claude_account_add");
+}
+
+export function claudeAccountRemove(id: string): Promise<void> {
+  return invoke<void>("claude_account_remove", { id });
+}
+
+export function claudeAccountSwitch(id: string): Promise<ClaudeSwitchResult> {
+  return invoke<ClaudeSwitchResult>("claude_account_switch", { id });
+}
+
+export function claudeAccountFetch(
+  id: string,
+): Promise<ClaudeAccountUsageSnapshot> {
+  return invoke<ClaudeAccountUsageSnapshot>("claude_account_fetch", { id });
+}
+
+export function claudeAccountSnapshots(): Promise<
+  Record<string, ClaudeAccountUsageSnapshot>
+> {
+  return invoke<Record<string, ClaudeAccountUsageSnapshot>>(
+    "claude_account_snapshots",
+  );
+}
+
+export function getClaudeAccountsState(): Promise<ClaudeAccountsStateBridge> {
+  return invoke<ClaudeAccountsStateBridge>("get_claude_accounts_state");
 }

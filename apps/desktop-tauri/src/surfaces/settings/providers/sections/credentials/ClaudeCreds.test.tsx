@@ -18,6 +18,7 @@ type ClaudeSettingsSnapshot = Pick<
   | "claudeAvoidKeychainPrompts"
   | "claudeDailyRoutinesUsageVisible"
   | "claudeAllowReadingClaudeCodeCredentials"
+  | "claudeAllowManagingClaudeCodeAccounts"
 >;
 
 function snapshot(
@@ -27,6 +28,7 @@ function snapshot(
     claudeAvoidKeychainPrompts: false,
     claudeDailyRoutinesUsageVisible: true,
     claudeAllowReadingClaudeCodeCredentials: false,
+    claudeAllowManagingClaudeCodeAccounts: false,
     ...overrides,
   };
 }
@@ -67,6 +69,39 @@ describe("ClaudeCreds", () => {
     await waitFor(() =>
       expect(tauriMocks.updateSettings).toHaveBeenCalledWith({
         claudeAllowReadingClaudeCodeCredentials: true,
+      }),
+    );
+    await waitFor(() => expect(checkbox).toBeChecked());
+  });
+
+  it("renders the Claude account-management consent toggle, off by default", async () => {
+    tauriMocks.getSettingsSnapshot.mockResolvedValue(snapshot());
+
+    render(<ClaudeCreds t={(key) => key} />);
+
+    const checkbox = await screen.findByRole("checkbox", {
+      name: "ProviderClaudeAllowManagingClaudeCodeAccounts ProviderClaudeAllowManagingClaudeCodeAccountsHelp",
+    });
+    expect(checkbox).not.toBeChecked();
+  });
+
+  it("toggling the account-management consent checkbox calls updateSettings and reflects the response", async () => {
+    tauriMocks.getSettingsSnapshot.mockResolvedValue(snapshot());
+    tauriMocks.updateSettings.mockResolvedValue(
+      snapshot({ claudeAllowManagingClaudeCodeAccounts: true }),
+    );
+
+    render(<ClaudeCreds t={(key) => key} />);
+
+    const checkbox = await screen.findByRole("checkbox", {
+      name: "ProviderClaudeAllowManagingClaudeCodeAccounts ProviderClaudeAllowManagingClaudeCodeAccountsHelp",
+    });
+
+    fireEvent.click(checkbox);
+
+    await waitFor(() =>
+      expect(tauriMocks.updateSettings).toHaveBeenCalledWith({
+        claudeAllowManagingClaudeCodeAccounts: true,
       }),
     );
     await waitFor(() => expect(checkbox).toBeChecked());
