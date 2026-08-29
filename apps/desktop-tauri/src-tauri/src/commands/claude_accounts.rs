@@ -8,7 +8,7 @@ use codexbar::claude_accounts::{
     ClaudeAccount, ClaudeAccountManager, ClaudeAccountManagerError, ClaudeAccountSource,
     ClaudeAccountStore, ClaudeAccountUsageSnapshot, ClaudeSnapshotStore, ClaudeSwitchResult,
     RemovedAccountIdentity, active_account_id, credentials_merge, file_locations,
-    reconcile_stored_accounts, usage,
+    group_lanes_by_identity, reconcile_stored_accounts, usage,
 };
 use codexbar::core::{ProviderFetchResult, RateWindow};
 use codexbar::providers::claude::ClaudeOAuthFetcher;
@@ -168,14 +168,22 @@ pub(crate) async fn refresh_claude_account_lanes(
         return;
     }
 
-    let mut handles = Vec::with_capacity(accounts.len());
-    for account in accounts {
+    // Coalesce the usage-probe burst: one `GET /api/oauth/usage` per distinct
+    // Claude identity, not one per account (#16). Accounts that resolve to the
+    // same identity (ambient + its managed twin, or two managed dirs of one
+    // org) share a single fetch; the ambient member always leads its group so
+    // only it can rotate the ambient refresh token (design D3/D5).
+    let groups = group_lanes_by_identity(&accounts);
+    let mut handles = Vec::with_capacity(groups.len());
+    for group in groups {
+        let leader = accounts[group.leader].clone();
+        let member_ids: Vec<Uuid> = group.members.iter().map(|idx| accounts[*idx].id).collect();
         let permits = Arc::clone(&fetch_permits);
         handles.push(tokio::spawn(async move {
             let Ok(_permit) = permits.acquire_owned().await else {
                 return None;
             };
-            let is_ambient = account.source == ClaudeAccountSource::Ambient;
+            let is_ambient = leader.source == ClaudeAccountSource::Ambient;
             let fetch_result =
                 tokio::time::timeout(Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECONDS), async {
                     if is_ambient {
@@ -184,18 +192,18 @@ pub(crate) async fn refresh_claude_account_lanes(
                             .await
                             .map(|result| claude_usage_snapshot_from_fetch_result(&result))
                     } else {
-                        usage::fetch_snapshot(&account.claude_config_dir).await
+                        usage::fetch_snapshot(&leader.claude_config_dir).await
                     }
                 })
                 .await;
             match fetch_result {
-                Ok(Ok(snapshot)) => Some((account.id, snapshot)),
+                Ok(Ok(snapshot)) => Some((member_ids, snapshot)),
                 Ok(Err(e)) => {
-                    tracing::debug!("claude account lane {} failed: {}", account.id, e);
+                    tracing::debug!("claude account lane {} failed: {}", leader.id, e);
                     None
                 }
                 Err(_) => {
-                    tracing::debug!("claude account lane {} timed out", account.id);
+                    tracing::debug!("claude account lane {} timed out", leader.id);
                     None
                 }
             }
@@ -204,8 +212,12 @@ pub(crate) async fn refresh_claude_account_lanes(
 
     let mut snapshots = ClaudeSnapshotStore::new().load().unwrap_or_default();
     for handle in handles {
-        if let Ok(Some((id, snapshot))) = handle.await {
-            snapshots.insert(id, snapshot);
+        if let Ok(Some((ids, snapshot))) = handle.await {
+            // Every member of the identity group renders from the shared
+            // snapshot but keeps its own row in `snapshots.json`.
+            for id in ids {
+                snapshots.insert(id, snapshot.clone());
+            }
         }
     }
     if let Err(e) = ClaudeSnapshotStore::new().save(&snapshots) {
@@ -323,9 +335,17 @@ pub async fn claude_account_add(app: tauri::AppHandle) -> Result<ClaudeAccount, 
         .await
         .map_err(|e| e.to_string())??;
 
+    // `refresh_persisted_accounts` consumes `app` and already emits
+    // `settings-changed` (:409). Clone first so the add path also emits
+    // `claude-accounts-updated` at the mutation site, exactly like
+    // `claude_account_remove`/`claude_account_switch`. Without it the tray
+    // Claude submenu and the provider card only reflect the new account after
+    // a full app restart (#16).
+    let app_for_event = app.clone();
     if let Err(e) = refresh_persisted_accounts(app) {
         tracing::error!("failed to persist accounts after add: {e}");
     }
+    events::emit_claude_accounts_updated(&app_for_event);
     Ok(account)
 }
 

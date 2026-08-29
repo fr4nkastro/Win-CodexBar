@@ -109,6 +109,9 @@ export function ClaudeAccountsSection({ t }: Props) {
     try {
       await claudeAccountAdd();
       await load();
+      // Mirror handleSwitch: re-probe providers so the Claude provider card
+      // reflects the new account without waiting for a refresh tick (#16).
+      void refreshProviders().catch(() => {});
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

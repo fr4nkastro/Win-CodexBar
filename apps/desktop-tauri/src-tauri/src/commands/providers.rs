@@ -548,6 +548,15 @@ pub(super) fn preserve_last_good_transient_failure(
         .find(|cached| cached.provider_id == id.cli_name() && cached.error.is_none())
         .cloned()
     else {
+        // No error-free snapshot to fall back to. A bounded, self-healing
+        // OAuth 429 backoff (R4/R5) must not render as the red "failed from
+        // all sources" banner — flag it transient so surfaces show the
+        // refreshing affordance instead. `error` text is retained for
+        // logs/copy (design D5); hard auth loss already short-circuited
+        // above, and any non-bounded failure leaves `transient` false.
+        let transient = is_bounded_oauth_backoff(error);
+        let mut snapshot = snapshot;
+        snapshot.transient = transient;
         return snapshot;
     };
 
@@ -625,6 +634,23 @@ fn is_claude_timeout_failure(error: Option<&str>) -> bool {
         return false;
     };
     error.eq_ignore_ascii_case("timeout") || error.to_ascii_lowercase().contains("timed out")
+}
+
+/// Upper bound for treating a Claude OAuth 429 backoff as a transient
+/// "refreshing" state instead of a hard error. Matches the OAuth layer's own
+/// `DEFAULT_RATE_LIMIT_BACKOFF` (5 min, `oauth/mod.rs`); a `Retry-After` above
+/// this fails open to the red error banner (design D6).
+const TRANSIENT_PRESENTATION_CEILING: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// True when `error` is a Claude OAuth rate-limit failure AND the OAuth
+/// layer's authoritative backoff gate is currently active within
+/// [`TRANSIENT_PRESENTATION_CEILING`]. The gate self-expires, so suppression
+/// keyed off this predicate ends on its own once the window elapses. Reads the
+/// gate without mutating it (design D6).
+pub(super) fn is_bounded_oauth_backoff(error: Option<&str>) -> bool {
+    is_claude_cli_rate_limit_failure(error)
+        && codexbar::providers::claude::ClaudeOAuthFetcher::rate_limit_backoff_peek()
+            .is_some_and(|remaining| remaining <= TRANSIENT_PRESENTATION_CEILING)
 }
 
 async fn fetch_provider_snapshot(
@@ -1174,6 +1200,7 @@ mod reset_backfill_tests {
             source_label: String::new(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             error: None,
+            transient: false,
             pace: None,
             account_organization: None,
             tray_status_label: None,

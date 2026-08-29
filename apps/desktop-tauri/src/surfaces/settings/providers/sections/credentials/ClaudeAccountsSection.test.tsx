@@ -137,6 +137,37 @@ describe("ClaudeAccountsSection", () => {
       expect(screen.getByText("user-1@example.com")).toBeDefined();
     });
     expect(tauriMocks.claudeAccountAdd).toHaveBeenCalledTimes(1);
+    // Mirror handleSwitch: the add re-probes providers so the Claude card
+    // reflects the new account without waiting for a refresh tick (#16).
+    expect(tauriMocks.refreshProviders).toHaveBeenCalledTimes(1);
+    const stateOrders = tauriMocks.getClaudeAccountsState.mock.invocationCallOrder;
+    const addOrder = tauriMocks.claudeAccountAdd.mock.invocationCallOrder[0];
+    const lastStateOrder = stateOrders[stateOrders.length - 1];
+    const refreshOrder = tauriMocks.refreshProviders.mock.invocationCallOrder[0];
+    // add → load (reload) → refreshProviders
+    expect(addOrder).toBeLessThan(lastStateOrder);
+    expect(lastStateOrder).toBeLessThan(refreshOrder);
+  });
+
+  it("does not refresh providers when the add fails", async () => {
+    tauriMocks.getClaudeAccountsState.mockResolvedValue({
+      accounts: [],
+      snapshots: {},
+    } as ClaudeAccountsStateBridge);
+    render(<ClaudeAccountsSection t={t} />);
+    await waitFor(() => {
+      expect(screen.getByText("ClaudeAccountsAddButton")).toBeDefined();
+    });
+
+    tauriMocks.claudeAccountAdd.mockRejectedValue(new Error("login cancelled"));
+    await act(async () => {
+      screen.getByText("ClaudeAccountsAddButton").click();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("login cancelled");
+    });
+    expect(tauriMocks.refreshProviders).not.toHaveBeenCalled();
+    expect(screen.getByText("ClaudeAccountsEmpty")).toBeDefined();
   });
 
   it("switches an account, shows success, and triggers a provider refresh", async () => {
