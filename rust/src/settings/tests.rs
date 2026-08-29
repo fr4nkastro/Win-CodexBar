@@ -23,10 +23,30 @@ fn test_settings_default() {
     assert!(settings.promote_tray_icon);
     assert!(settings.claude_daily_routines_usage_visible);
     assert!(!settings.claude_allow_reading_claude_code_credentials);
+    assert!(!settings.claude_allow_managing_claude_code_accounts);
     assert_eq!(
         settings.low_power_mode_preference,
         LowPowerModePreference::Off
     );
+}
+
+#[test]
+fn claude_allow_managing_claude_code_accounts_default_off_and_round_trip() {
+    let defaulted: Settings = serde_json::from_str(r#"{ "enabled_providers": [] }"#)
+        .expect("missing claude_allow_managing_claude_code_accounts defaults false");
+    assert!(!defaulted.claude_allow_managing_claude_code_accounts);
+
+    let enabled = Settings {
+        claude_allow_managing_claude_code_accounts: true,
+        ..Settings::default()
+    };
+    let json =
+        serde_json::to_string(&enabled).expect("serialize claude accounts management consent");
+    assert!(json.contains(r#""claude_allow_managing_claude_code_accounts":true"#));
+
+    let loaded: Settings =
+        serde_json::from_str(&json).expect("deserialize claude accounts management consent");
+    assert!(loaded.claude_allow_managing_claude_code_accounts);
 }
 
 #[test]
