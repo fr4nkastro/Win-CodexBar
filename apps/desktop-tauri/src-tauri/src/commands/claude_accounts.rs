@@ -7,7 +7,8 @@ use uuid::Uuid;
 use codexbar::claude_accounts::{
     ClaudeAccount, ClaudeAccountManager, ClaudeAccountManagerError, ClaudeAccountSource,
     ClaudeAccountStore, ClaudeAccountUsageSnapshot, ClaudeSnapshotStore, ClaudeSwitchResult,
-    active_account_id, credentials_merge, file_locations, reconcile_stored_accounts, usage,
+    RemovedAccountIdentity, active_account_id, credentials_merge, file_locations,
+    reconcile_stored_accounts, usage,
 };
 use codexbar::core::{ProviderFetchResult, RateWindow};
 use codexbar::providers::claude::ClaudeOAuthFetcher;
@@ -34,13 +35,23 @@ fn claude_accounts_consent() -> bool {
 /// All stored + discovered Claude accounts, with the stored list preferred.
 pub(crate) fn load_claude_accounts() -> Result<Vec<ClaudeAccount>, String> {
     let store = ClaudeAccountStore::new();
-    let existing = store.load_accounts().map_err(|e| e.to_string())?;
+    let (existing, removed) = store.load().map_err(|e| e.to_string())?;
 
     let manager = ClaudeAccountManager::new();
     let managed = manager
         .discover_managed_accounts(&existing)
         .map_err(|e| e.to_string())?;
     let ambient = manager.discover_ambient_account(&existing);
+
+    // Filter out any account matching a removed-identity BEFORE the merge, so a
+    // leftover directory or credential file cannot resurrect a removed account
+    // (#14 bug 1). Matched accounts are excluded from the listing only — never
+    // deleted here.
+    let managed: Vec<ClaudeAccount> = managed
+        .into_iter()
+        .filter(|account| !removed.iter().any(|r| r.matches(account)))
+        .collect();
+    let ambient = ambient.filter(|account| !removed.iter().any(|r| r.matches(account)));
 
     let mut merged: Vec<ClaudeAccount> = managed.clone();
     if let Some(ambient) = ambient {
@@ -67,7 +78,11 @@ pub(crate) fn load_claude_accounts() -> Result<Vec<ClaudeAccount>, String> {
         }
     }
 
-    Ok(reconciled)
+    // Final pass: a stale stored row cannot survive a removal either.
+    Ok(reconciled
+        .into_iter()
+        .filter(|account| !removed.iter().any(|r| r.matches(account)))
+        .collect())
 }
 
 /// Persist the given accounts to the account store.
@@ -212,9 +227,24 @@ fn add_claude_account_gated(consent: bool) -> Result<ClaudeAccount, String> {
     if !consent {
         return Err(CONSENT_DENIED_MESSAGE.to_string());
     }
-    ClaudeAccountManager::new()
+    let account = ClaudeAccountManager::new()
         .add_managed_account(None)
-        .map_err(into_user_message)
+        .map_err(into_user_message)?;
+
+    // G9: un-remove on re-add. Drop every `removed` entry matching the newly
+    // added account's identity, otherwise remove-then-`claude auth login`-then-
+    // re-add would silently produce a permanently invisible account.
+    let store = ClaudeAccountStore::new();
+    let (stored, removed) = store.load().map_err(|e| e.to_string())?;
+    let kept: Vec<RemovedAccountIdentity> = removed
+        .into_iter()
+        .filter(|r| !r.matches(&account))
+        .collect();
+    store
+        .save(&stored, Some(&kept))
+        .map_err(|e| e.to_string())?;
+
+    Ok(account)
 }
 
 fn remove_claude_account_gated(consent: bool, id: &str) -> Result<Vec<ClaudeAccount>, String> {
@@ -232,11 +262,35 @@ fn remove_claude_account_gated(consent: bool, id: &str) -> Result<Vec<ClaudeAcco
         .remove_managed_files_if_owned(target)
         .map_err(into_user_message)?;
 
+    // Record the removed identity so discovery filters it out permanently
+    // (#14 bug 1). Build it before `accounts` is consumed below.
+    let removed_identity = RemovedAccountIdentity::from_account(target);
+
     let remaining: Vec<ClaudeAccount> = accounts
         .into_iter()
         .filter(|account| account.id.to_string() != id)
         .collect();
-    persist_claude_accounts(&remaining)?;
+
+    // Persist `remaining` together with the appended removed-identity list.
+    // `persist_claude_accounts` already round-trips `removed` but cannot
+    // append, so the remove path calls `store.save` directly.
+    let store = ClaudeAccountStore::new();
+    let (_stored, mut removed) = store.load().map_err(|e| e.to_string())?;
+    removed.push(removed_identity);
+    removed.sort_by_key(|r| r.removed_at);
+    removed.dedup_by(|a, b| {
+        a.claude_config_dir == b.claude_config_dir
+            && a.org_id == b.org_id
+            && a.email_hint == b.email_hint
+    });
+    store
+        .save(&remaining, Some(&removed))
+        .map_err(|e| e.to_string())?;
+
+    // Best-effort: never fails the removal (G7 — mtime-guarded, removal path
+    // only).
+    let _ = manager.prune_stub_managed_dirs();
+
     Ok(remaining)
 }
 
@@ -663,5 +717,129 @@ mod tests {
             300 * 60
         );
         assert_eq!(snapshot.email.as_deref(), Some("a@example.com"));
+    }
+
+    // ── #14: removed-identity filter (R7) + un-remove on re-add (R7b) ─────
+    //
+    // NOTE: these live in the Tauri crate's `#[cfg(test)]` and cannot be run
+    // on WSL2 (the crate links GTK/atk via pkg-config). They run on CI and on
+    // the maintainer's Windows host. The equivalent library-crate coverage of
+    // the deletion / gate primitives lives in
+    // `rust/src/claude_accounts/account_manager.rs`.
+
+    fn write_managed_claude_json(dir: &std::path::Path, email: &str, org_uuid: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let payload = serde_json::json!({
+            "oauthAccount": {
+                "emailAddress": email,
+                "organizationUuid": org_uuid,
+                "organizationName": format!("{org_uuid}-name"),
+            }
+        });
+        fs::write(
+            dir.join(".claude.json"),
+            serde_json::to_vec_pretty(&payload).unwrap(),
+        )
+        .unwrap();
+    }
+
+    // [R7] once an account is in `removed_accounts`, a matching managed
+    // directory left on disk (e.g. from a later `claude auth login`) is
+    // excluded from the listing — it never resurrects.
+    #[test]
+    fn removed_identity_keeps_account_hidden_despite_a_leftover_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        file_locations::with_app_support_directory(dir.path().to_path_buf());
+        file_locations::with_ambient_claude_config_dir(dir.path().join(".claude"));
+        file_locations::with_ambient_claude_json_path(dir.path().join(".claude.json"));
+
+        let leftover = file_locations::managed_configs_directory()
+            .join("11111111-1111-1111-1111-111111111111");
+        write_credentials(&leftover, "leftover-token");
+        write_managed_claude_json(&leftover, "gone@example.com", "org-gone");
+
+        let removed_marker = RemovedAccountIdentity::from_account(&sample_account(
+            leftover.clone(),
+            ClaudeAccountSource::ManagedByApp,
+        ));
+        let mut removed_marker = removed_marker;
+        removed_marker.email_hint = Some("gone@example.com".to_string());
+        removed_marker.org_id = Some("org-gone".to_string());
+
+        ClaudeAccountStore::new()
+            .save(&[], Some(&[removed_marker]))
+            .unwrap();
+
+        let listed = load_claude_accounts().unwrap();
+
+        let still_on_disk = leftover.exists();
+        file_locations::clear_app_support_directory_override();
+        file_locations::clear_ambient_claude_config_dir_override();
+        file_locations::clear_ambient_claude_json_path_override();
+
+        assert!(
+            listed
+                .iter()
+                .all(|a| a.org_id.as_deref() != Some("org-gone")),
+            "a removed identity must not reappear in the listing"
+        );
+        assert!(
+            still_on_disk,
+            "the leftover directory is excluded from the listing, not deleted here"
+        );
+    }
+
+    // [R7b] purging the removed marker (what `add_claude_account_gated` does
+    // after a successful re-add) makes the identity visible again.
+    #[test]
+    fn purging_the_removed_marker_makes_the_account_visible_again() {
+        let dir = tempfile::tempdir().unwrap();
+        file_locations::with_app_support_directory(dir.path().to_path_buf());
+        file_locations::with_ambient_claude_config_dir(dir.path().join(".claude"));
+        file_locations::with_ambient_claude_json_path(dir.path().join(".claude.json"));
+
+        let managed = file_locations::managed_configs_directory()
+            .join("22222222-2222-2222-2222-222222222222");
+        write_credentials(&managed, "back-token");
+        write_managed_claude_json(&managed, "back@example.com", "org-back");
+        let account = sample_account(managed.clone(), ClaudeAccountSource::ManagedByApp);
+        let mut account = account;
+        account.email_hint = Some("back@example.com".to_string());
+        account.org_id = Some("org-back".to_string());
+
+        let store = ClaudeAccountStore::new();
+        store
+            .save(
+                std::slice::from_ref(&account),
+                Some(&[RemovedAccountIdentity::from_account(&account)]),
+            )
+            .unwrap();
+        assert!(
+            load_claude_accounts()
+                .unwrap()
+                .iter()
+                .all(|a| a.org_id.as_deref() != Some("org-back")),
+            "precondition: the marker hides the account"
+        );
+
+        // G9: drop every removed marker matching the re-added identity.
+        let (stored, removed) = store.load().unwrap();
+        let kept: Vec<RemovedAccountIdentity> = removed
+            .into_iter()
+            .filter(|r| !r.matches(&account))
+            .collect();
+        store.save(&stored, Some(&kept)).unwrap();
+
+        let listed = load_claude_accounts().unwrap();
+        file_locations::clear_app_support_directory_override();
+        file_locations::clear_ambient_claude_config_dir_override();
+        file_locations::clear_ambient_claude_json_path_override();
+
+        assert!(
+            listed
+                .iter()
+                .any(|a| a.org_id.as_deref() == Some("org-back")),
+            "after the marker is purged the account is visible again"
+        );
     }
 }

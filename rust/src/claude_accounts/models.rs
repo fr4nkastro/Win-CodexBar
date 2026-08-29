@@ -14,7 +14,7 @@ pub fn utc_now() -> DateTime<Utc> {
     Utc::now()
 }
 
-fn normalize_identifier(value: Option<&str>) -> Option<String> {
+pub(crate) fn normalize_identifier(value: Option<&str>) -> Option<String> {
     value
         .map(|v| v.trim().to_lowercase())
         .filter(|v| !v.is_empty())
@@ -171,6 +171,22 @@ impl ClaudeAccount {
             return true;
         }
         false
+    }
+
+    /// Strict identity for credential-WRITE decisions. Exact normalized
+    /// `org_id` equality, or the same standardized config directory. NEVER
+    /// falls back to `email_hint`: that fallback (loosened in v0.56.1 for
+    /// display hydration, L160-167) is what let one account claim another
+    /// account's directory (#14). `matches()` is deliberately left untouched
+    /// for display/dedupe/hydration.
+    pub fn matches_strict(&self, other: &ClaudeAccount) -> bool {
+        if self.standardized_config_dir() == other.standardized_config_dir() {
+            return true;
+        }
+        matches!(
+            (self.normalized_org_id(), other.normalized_org_id()),
+            (Some(a), Some(b)) if a == b
+        )
     }
 
     /// Merge a fresher discovery into this account, preferring managed/recency.
@@ -528,5 +544,101 @@ mod tests {
         assert!(!b.matches(&a));
         let removed = RemovedAccountIdentity::from_account(&a);
         assert!(!removed.matches(&b));
+    }
+
+    // ── matches_strict: credential-write identity (#14, R1) ─────────────
+
+    #[test]
+    fn matches_strict_true_on_equal_org_id_case_insensitive() {
+        let a = acct(
+            "11111111-1111-1111-1111-111111111111",
+            "/x/a",
+            Some("ORG-1"),
+            Some("a@x.com"),
+        );
+        let b = acct(
+            "22222222-2222-2222-2222-222222222222",
+            "/y/b",
+            Some("org-1"),
+            Some("other@x.com"),
+        );
+        assert!(a.matches_strict(&b));
+        assert!(b.matches_strict(&a));
+    }
+
+    #[test]
+    fn matches_strict_true_on_same_standardized_dir() {
+        let a = acct(
+            "11111111-1111-1111-1111-111111111111",
+            "/x/shared",
+            None,
+            None,
+        );
+        let b = acct(
+            "22222222-2222-2222-2222-222222222222",
+            "/x/shared",
+            Some("org-9"),
+            Some("b@x.com"),
+        );
+        assert!(a.matches_strict(&b));
+    }
+
+    #[test]
+    fn matches_strict_false_on_asymmetric_org_id_even_with_equal_email() {
+        // `matches()` is deliberately email-tolerant here; `matches_strict()`
+        // is NOT — this is the exact case that let #14 happen.
+        let with_org = acct(
+            "11111111-1111-1111-1111-111111111111",
+            "/x/a",
+            Some("org-1"),
+            Some("shared@x.com"),
+        );
+        let without_org = acct(
+            "22222222-2222-2222-2222-222222222222",
+            "/y/b",
+            None,
+            Some("shared@x.com"),
+        );
+        assert!(
+            with_org.matches(&without_org),
+            "loose matches stays tolerant"
+        );
+        assert!(!with_org.matches_strict(&without_org));
+        assert!(!without_org.matches_strict(&with_org));
+    }
+
+    #[test]
+    fn matches_strict_false_when_both_org_ids_absent_and_only_email_is_equal() {
+        let a = acct(
+            "11111111-1111-1111-1111-111111111111",
+            "/x/a",
+            None,
+            Some("same@x.com"),
+        );
+        let b = acct(
+            "22222222-2222-2222-2222-222222222222",
+            "/y/b",
+            None,
+            Some("SAME@x.com"),
+        );
+        assert!(a.matches(&b), "loose matches unifies on email");
+        assert!(!a.matches_strict(&b), "strict never falls back to email");
+    }
+
+    #[test]
+    fn matches_strict_false_on_two_distinct_org_ids() {
+        let a = acct(
+            "11111111-1111-1111-1111-111111111111",
+            "/x/a",
+            Some("org-1"),
+            Some("a@x.com"),
+        );
+        let b = acct(
+            "22222222-2222-2222-2222-222222222222",
+            "/y/b",
+            Some("org-2"),
+            Some("a@x.com"),
+        );
+        assert!(!a.matches_strict(&b));
     }
 }
