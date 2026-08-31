@@ -497,4 +497,159 @@ mod tests {
             other => panic!("expected original error unchanged, got {other:?}"),
         }
     }
+
+    // --- Tests for issue #17: Token Plan weekly window (REQ-1, REQ-2) ----
+
+    /// Inline fixture for the Token Plan · Monthly Plus bug case: a
+    /// non-text-generation `model_name` with populated non-placeholder
+    /// `current_weekly_*` fields. Mirrors the issue screenshot.
+    fn token_plan_plus_monthly_real_weekly_json() -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "model_remains": [{
+                    "model_name": "MiniMax-Plus-Monthly",
+                    "current_interval_total_count": 5000,
+                    "current_interval_usage_count": 1500,
+                    "current_interval_remaining_percent": 70,
+                    "current_interval_status": 0,
+                    "start_time": 1785754800,
+                    "end_time": 1785772800,
+                    "current_weekly_total_count": 10000,
+                    "current_weekly_usage_count": 9500,
+                    "current_weekly_remaining_percent": 5,
+                    "current_weekly_status": 0,
+                    "weekly_start_time": 1785715200,
+                    "weekly_end_time": 1786320000
+                }]
+            }
+        })
+    }
+
+    /// Inline fixture for the Token Plan Free / Trial tier: only the rolling
+    /// 5-hour interval fields are populated; no `current_weekly_*` data.
+    fn token_plan_free_no_weekly_fields_json() -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "model_remains": [{
+                    "model_name": "MiniMax-Free",
+                    "current_interval_total_count": 1000,
+                    "current_interval_usage_count": 200,
+                    "current_interval_remaining_percent": 80,
+                    "current_interval_status": 0,
+                    "start_time": 1785754800,
+                    "end_time": 1785772800
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn token_plan_real_weekly_quota_populates_secondary() {
+        // REQ-1 bug case (issue #17): Token Plan · Monthly Plus returns a
+        // populated, non-placeholder weekly row whose `model_name` does not
+        // match the text-generation heuristic. The Token-Plan-only parser
+        // entry must surface it so `to_usage_snapshot` picks it as
+        // `usage.secondary`.
+        let snapshot = coding_plan::parse_token_plan_value(
+            &token_plan_plus_monthly_real_weekly_json(),
+            fixed_now(),
+        )
+        .unwrap();
+        let usage = coding_plan_html::to_usage_snapshot(&snapshot, fixed_now()).unwrap();
+
+        // 5h primary: remaining 70 → used 30%, 300-minute window.
+        assert!((usage.primary.used_percent - 30.0).abs() < 0.01);
+        assert_eq!(usage.primary.window_minutes, Some(300));
+
+        // Weekly secondary: remaining 5 → used 95%, 7-day window.
+        let secondary = usage.secondary.expect("weekly lane populated");
+        assert!((secondary.used_percent - 95.0).abs() < 0.01);
+        assert_eq!(secondary.window_minutes, Some(10080));
+        assert!(secondary.resets_at.is_some());
+        // Regression guard: status != 3 + remaining_percent != 100 →
+        // not unlimited.
+        assert_ne!(secondary.reset_description.as_deref(), Some("Unlimited"));
+    }
+
+    #[test]
+    fn token_plan_status_3_weekly_collapse_preserved_via_token_plan_entry() {
+        // REQ-1 scenario 2 regression guard: status==3 weekly lane must
+        // still collapse to "Unlimited" via the new Token-Plan-only entry,
+        // matching the unlimited behaviour exercised by the shared parser.
+        let json = reporter_token_plan_usage_json();
+        let snapshot =
+            coding_plan::parse_token_plan_value(&json, fixed_now()).unwrap();
+        let coding_plan::MiniMaxCodingPlanSnapshot::Remains { rows, .. } = &snapshot else {
+            panic!("expected Remains");
+        };
+        let weekly = rows.iter().find(|r| r.is_weekly).expect("weekly row");
+        assert!(weekly.is_unlimited);
+        assert_eq!(weekly.reset_description.as_deref(), Some("Unlimited"));
+        assert!((weekly.percent - 0.0).abs() < 0.01);
+
+        let usage = coding_plan_html::to_usage_snapshot(&snapshot, fixed_now()).unwrap();
+        let secondary = usage.secondary.expect("weekly lane");
+        assert_eq!(secondary.used_percent, 0.0);
+        assert_eq!(secondary.reset_description.as_deref(), Some("Unlimited"));
+    }
+
+    #[test]
+    fn token_plan_no_weekly_fields_yields_no_secondary() {
+        // REQ-2: Token Plan Free / Trial entries that carry only
+        // `current_interval_*` fields must not emit a weekly row, so
+        // `usage.secondary` stays null.
+        let snapshot = coding_plan::parse_token_plan_value(
+            &token_plan_free_no_weekly_fields_json(),
+            fixed_now(),
+        )
+        .unwrap();
+        let coding_plan::MiniMaxCodingPlanSnapshot::Remains { rows, .. } = &snapshot else {
+            panic!("expected Remains");
+        };
+        assert_eq!(rows.len(), 1);
+        assert!(rows.iter().all(|r| !r.is_weekly));
+
+        let usage = coding_plan_html::to_usage_snapshot(&snapshot, fixed_now()).unwrap();
+        assert!(usage.secondary.is_none());
+    }
+
+    #[test]
+    fn token_plan_real_weekly_full_snapshot_assembly() {
+        // End-to-end assembly for the REQ-1 bug case: combine the
+        // real-weekly snapshot with the usage_summary view and a plan title
+        // to mirror what `fetch_token_plan_with_cookie` returns.
+        let snapshot = coding_plan::parse_token_plan_value(
+            &token_plan_plus_monthly_real_weekly_json(),
+            fixed_now(),
+        )
+        .unwrap();
+        let summary = parse_token_plan_summary(&reporter_usage_summary_json()).unwrap();
+
+        let result = assemble_token_plan_result(
+            Some(snapshot),
+            Some(summary),
+            Some("TokenPlanPlus annual membership".to_string()),
+            ProviderError::Other("original".into()),
+            fixed_now(),
+        )
+        .unwrap();
+
+        // Plan title → login_method.
+        assert_eq!(
+            result.usage.login_method.as_deref(),
+            Some("TokenPlanPlus annual membership")
+        );
+        // Weekly secondary carries the real quota (≈ 95% used).
+        let secondary = result.usage.secondary.expect("weekly lane");
+        assert!((secondary.used_percent - 95.0).abs() < 0.01);
+        assert_eq!(secondary.window_minutes, Some(10080));
+        // Summary window is attached as an extra rate window.
+        let summary_window = result
+            .usage
+            .extra_rate_windows
+            .iter()
+            .find(|w| w.id == "token-plan-summary")
+            .expect("token-plan-summary attached");
+        assert_eq!(summary_window.title, "Token Plan");
+    }
 }
