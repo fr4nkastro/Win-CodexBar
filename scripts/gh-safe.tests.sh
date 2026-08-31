@@ -27,7 +27,16 @@ elif [[ "${1:-}" == pr && "${2:-}" == view ]]; then
 elif [[ "${1:-}" == issue && "${2:-}" == view ]]; then
   printf '%s\n' 'https://github.com/nesszer/Win-CodexBar/issues/123'
 elif [[ "${1:-}" == api ]]; then
-  printf '%s\n' 'https://github.com/nesszer/Win-CodexBar/releases/tag/v1.2.3'
+  case "${2:-}" in
+    *releases/tags/v1.2.3)
+      printf '%s\n' 'https://github.com/nesszer/Win-CodexBar/releases/tag/v1.2.3'
+      ;;
+    *actions/workflows/*)
+      wf="${2##*/}"
+      rpo="${2#repos/}"; rpo="${rpo%%/actions/*}"
+      printf '%s\n' "https://github.com/$rpo/actions/workflows/$wf"
+      ;;
+  esac
 fi
 EOF
 chmod +x "$test_root/bin/gh"
@@ -60,6 +69,16 @@ expect_fail bash "$repo_root/scripts/gh-safe.sh" \
 bash "$repo_root/scripts/gh-safe.sh" \
   --repo fr4nkastro/Win-CodexBar --verify-kind repo --what-if -- \
   pr create --title test --body test >/dev/null
+
+# workflow verify-kind: trigger a workflow_dispatch on the allowlisted repo.
+bash "$repo_root/scripts/gh-safe.sh" \
+  --repo fr4nkastro/Win-CodexBar --verify-kind workflow --target signpath-test.yml --what-if -- \
+  workflow run signpath-test.yml --ref v0.56.4 --field tag=v0.56.4 >/dev/null
+
+# workflow verify-kind: rejected when target does not match gh_args[2].
+expect_fail bash "$repo_root/scripts/gh-safe.sh" \
+  --repo fr4nkastro/Win-CodexBar --verify-kind workflow --target other-workflow.yml --what-if -- \
+  workflow run signpath-test.yml --ref v0.56.4 --field tag=v0.56.4
 
 expect_fail bash "$repo_root/scripts/gh-safe.sh" \
   --repo nesszer/Win-CodexBar --verify-kind pr --target 361 --what-if -- \

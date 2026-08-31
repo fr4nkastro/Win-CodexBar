@@ -34,7 +34,7 @@ done
 gh_args=("$@")
 
 [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "Invalid --repo '$repo'; expected owner/repo." >&2; exit 2; }
-case "$verify_kind" in repo|pr|issue|release) ;; *) echo "Invalid --verify-kind '$verify_kind'." >&2; exit 2 ;; esac
+case "$verify_kind" in repo|pr|issue|release|workflow) ;; *) echo "Invalid --verify-kind '$verify_kind'." >&2; exit 2 ;; esac
 ((${#gh_args[@]} > 0)) || { echo 'No gh command supplied after --.' >&2; exit 2; }
 
 if [[ "${repo,,}" == "steipete/codexbar" ]]; then
@@ -65,6 +65,13 @@ case "$verify_kind" in
   pr) verified_url="$(gh pr view "$target" --repo "$repo" --json url --jq .url)" ;;
   issue) verified_url="$(gh issue view "$target" --repo "$repo" --json url --jq .url)" ;;
   release) verified_url="$(gh api "repos/$repo/releases/tags/$target" --jq .html_url)" ;;
+  workflow)
+    # Resolve the workflow (by name like `signpath-test.yml` or numeric ID) via
+    # the actions API; the read-back confirms the workflow exists on the
+    # verified repo before the forwarded `gh workflow run ... --ref X --field K=V`
+    # invocation actually fires it.
+    verified_url="$(gh api "repos/$repo/actions/workflows/$target" --jq .html_url)"
+    ;;
 esac
 
 expected_prefix="https://github.com/$repo/"
@@ -74,6 +81,7 @@ case "$verify_kind" in
   pr) [[ "$verified_url" == *"/pull/$target" ]] || { echo "GitHub target mismatch: '$verified_url' does not end with '/pull/$target'." >&2; exit 4; } ;;
   issue) [[ "$verified_url" == *"/issues/$target" ]] || { echo "GitHub target mismatch: '$verified_url' does not end with '/issues/$target'." >&2; exit 4; } ;;
   release) [[ "$verified_url" == *"/releases/tag/$target" ]] || { echo "GitHub target mismatch: '$verified_url' does not end with '/releases/tag/$target'." >&2; exit 4; } ;;
+  workflow) [[ "$verified_url" == *"/actions/workflows/$target" ]] || { echo "GitHub target mismatch: '$verified_url' does not end with '/actions/workflows/$target'." >&2; exit 4; } ;;
 esac
 shopt -u nocasematch
 
