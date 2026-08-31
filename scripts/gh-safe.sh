@@ -67,9 +67,10 @@ case "$verify_kind" in
   release) verified_url="$(gh api "repos/$repo/releases/tags/$target" --jq .html_url)" ;;
   workflow)
     # Resolve the workflow (by name like `signpath-test.yml` or numeric ID) via
-    # the actions API; the read-back confirms the workflow exists on the
-    # verified repo before the forwarded `gh workflow run ... --ref X --field K=V`
-    # invocation actually fires it.
+    # the actions API. The returned `html_url` points to the workflow YAML blob
+    # in the repo (e.g. /blob/main/.github/workflows/signpath-test.yml), not to
+    # the actions run page; the URL pattern check at the end verifies both the
+    # repo prefix and the workflow-file suffix instead of a single tail match.
     verified_url="$(gh api "repos/$repo/actions/workflows/$target" --jq .html_url)"
     ;;
 esac
@@ -81,7 +82,7 @@ case "$verify_kind" in
   pr) [[ "$verified_url" == *"/pull/$target" ]] || { echo "GitHub target mismatch: '$verified_url' does not end with '/pull/$target'." >&2; exit 4; } ;;
   issue) [[ "$verified_url" == *"/issues/$target" ]] || { echo "GitHub target mismatch: '$verified_url' does not end with '/issues/$target'." >&2; exit 4; } ;;
   release) [[ "$verified_url" == *"/releases/tag/$target" ]] || { echo "GitHub target mismatch: '$verified_url' does not end with '/releases/tag/$target'." >&2; exit 4; } ;;
-  workflow) [[ "$verified_url" == *"/actions/workflows/$target" ]] || { echo "GitHub target mismatch: '$verified_url' does not end with '/actions/workflows/$target'." >&2; exit 4; } ;;
+  workflow) [[ "$verified_url" == "https://github.com/$repo/"* && "$verified_url" == *"/$target" ]] || { echo "GitHub target mismatch: '$verified_url' is not a workflow YAML path on '$repo'." >&2; exit 4; } ;;
 esac
 shopt -u nocasematch
 

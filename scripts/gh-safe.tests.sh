@@ -34,7 +34,9 @@ elif [[ "${1:-}" == api ]]; then
     *actions/workflows/*)
       wf="${2##*/}"
       rpo="${2#repos/}"; rpo="${rpo%%/actions/*}"
-      printf '%s\n' "https://github.com/$rpo/actions/workflows/$wf"
+      # Match the real GitHub API response: html_url points to the YAML blob
+      # in the repo, not to the actions run page.
+      printf '%s\n' "https://github.com/$rpo/blob/main/.github/workflows/$wf"
       ;;
   esac
 fi
