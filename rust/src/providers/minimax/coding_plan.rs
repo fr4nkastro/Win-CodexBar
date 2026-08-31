@@ -517,9 +517,16 @@ fn parse_plan_name_from_data(data: &Value) -> Option<String> {
 
 /// The single-service `model_remains[]` parser (upstream
 /// `parseCodingPlanRemains(payload:now:)`).
+///
+/// `force_weekly_window` bypasses the `should_render_weekly_window(&model_name)`
+/// gate so the Token Plan flow can emit a weekly row even when the upstream
+/// `model_name` does not match the text-generation heuristic (issue #17, R2).
+/// The coding-plan flow passes `false` so the existing gate behavior is
+/// preserved (REQ-3).
 fn parse_remains(
     json: &Value,
     now: DateTime<Utc>,
+    force_weekly_window: bool,
 ) -> Result<MiniMaxCodingPlanSnapshot, ProviderError> {
     // base_resp from data first, then root
     let base_resp = json
@@ -608,8 +615,9 @@ fn parse_remains(
             rows.push(row);
         }
 
-        // Weekly row (only for text-generation models)
-        if should_render_weekly_window(&model_name)
+        // Weekly row (text-generation models on the coding-plan flow, or any
+        // entry on the Token Plan flow when `force_weekly_window` is set).
+        if (force_weekly_window || should_render_weekly_window(&model_name))
             && let Some(mut row) = make_remains_row(
                 &service_type,
                 Some("Weekly"),
@@ -649,6 +657,7 @@ fn parse_remains(
 }
 
 /// The one parser used for page JSON, `__NEXT_DATA__` payloads, and remains API.
+/// Preserves the text-generation gate for the weekly row (REQ-3).
 pub(super) fn parse_coding_plan_value(
     json: &Value,
     now: DateTime<Utc>,
@@ -657,8 +666,28 @@ pub(super) fn parse_coding_plan_value(
     if let Some(rows) = parse_multi_service(json) {
         return Ok(MiniMaxCodingPlanSnapshot::Services(rows));
     }
-    // Fall through to single-service (model_remains)
-    parse_remains(json, now)
+    // Fall through to single-service (model_remains); coding-plan flow keeps
+    // the text-generation gate (force_weekly_window = false).
+    parse_remains(json, now, false)
+}
+
+/// Token-Plan-only parser entry. Bypasses the `should_render_weekly_window`
+/// gate so the upstream weekly quota is rendered even when the entry's
+/// `model_name` does not match the text-generation heuristic (issue #17, R2).
+/// The status==3 unlimited collapse inside `make_remains_row` /
+/// `is_unlimited_quota_window` is preserved, so an "Unlimited" weekly row
+/// still collapses to `is_unlimited = true` (REQ-1 scenario 2).
+pub(super) fn parse_token_plan_value(
+    json: &Value,
+    now: DateTime<Utc>,
+) -> Result<MiniMaxCodingPlanSnapshot, ProviderError> {
+    // Try multi-service shape first
+    if let Some(rows) = parse_multi_service(json) {
+        return Ok(MiniMaxCodingPlanSnapshot::Services(rows));
+    }
+    // Fall through to single-service (model_remains); Token Plan flow
+    // bypasses the text-generation gate for the weekly row.
+    parse_remains(json, now, true)
 }
 
 /// True when the coding-plan endpoint reports that this account has no coding
@@ -935,5 +964,72 @@ mod tests {
         assert!(is_token_plan_without_coding_plan(&ProviderError::Other(
             "No Active Token Plan Subscription".to_string()
         )));
+    }
+
+    // --- R2 guards for the new `parse_token_plan_value` entry (issue #17) ---
+
+    /// Inline fixture matching the Token Plan · Monthly Plus bug case: a
+    /// non-text-generation `model_name` (not matched by
+    /// `is_text_generation_model_name`) with populated non-placeholder
+    /// `current_weekly_*` fields. The Token Plan flow must bypass the gate
+    /// (`force_weekly_window = true`) so the weekly row survives.
+    fn token_plan_plus_monthly_weekly_json() -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "model_remains": [{
+                    "model_name": "MiniMax-Plus-Monthly",
+                    "current_interval_total_count": 5000,
+                    "current_interval_usage_count": 1500,
+                    "current_interval_remaining_percent": 70,
+                    "current_interval_status": 0,
+                    "start_time": 1785754800,
+                    "end_time": 1785772800,
+                    "current_weekly_total_count": 10000,
+                    "current_weekly_usage_count": 9500,
+                    "current_weekly_remaining_percent": 5,
+                    "current_weekly_status": 0,
+                    "weekly_start_time": 1785715200,
+                    "weekly_end_time": 1786320000
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn parse_token_plan_value_emits_weekly_when_model_name_not_text_gen() {
+        // R2 positive guard (issue #17, REQ-1): the Token-Plan-only entry
+        // must bypass the `should_render_weekly_window(&model_name)` gate so
+        // the upstream weekly quota populates `usage.secondary`.
+        let json = token_plan_plus_monthly_weekly_json();
+        let snapshot = parse_token_plan_value(&json, now()).unwrap();
+        let MiniMaxCodingPlanSnapshot::Remains { rows, .. } = snapshot else {
+            panic!("expected Remains");
+        };
+        // interval + weekly = 2 rows.
+        assert_eq!(rows.len(), 2);
+        let weekly = rows.iter().find(|r| r.is_weekly).expect("weekly row");
+        // remaining_percent 5 → used 95%.
+        assert!((weekly.percent - 95.0).abs() < 0.01);
+        // Not unlimited: status 0, remaining_percent != 100.
+        assert!(!weekly.is_unlimited);
+        // 7-day window → 10080 minutes.
+        assert_eq!(weekly.window_minutes, Some(10080));
+    }
+
+    #[test]
+    fn parse_coding_plan_value_still_gates_weekly_by_model_name() {
+        // R2 negative guard (REQ-3): the coding-plan entry must keep gating
+        // the weekly row by `should_render_weekly_window(&model_name)`. The
+        // same fixture routed through `parse_coding_plan_value` must skip
+        // the weekly row (model_name is not text-gen) — proving the bypass
+        // is exclusive to the Token Plan entry.
+        let json = token_plan_plus_monthly_weekly_json();
+        let snapshot = parse_coding_plan_value(&json, now()).unwrap();
+        let MiniMaxCodingPlanSnapshot::Remains { rows, .. } = snapshot else {
+            panic!("expected Remains");
+        };
+        // Only the interval row survives; weekly is gated out.
+        assert_eq!(rows.len(), 1);
+        assert!(rows.iter().all(|r| !r.is_weekly));
     }
 }
