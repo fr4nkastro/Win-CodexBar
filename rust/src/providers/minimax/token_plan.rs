@@ -577,8 +577,7 @@ mod tests {
         // still collapse to "Unlimited" via the new Token-Plan-only entry,
         // matching the unlimited behaviour exercised by the shared parser.
         let json = reporter_token_plan_usage_json();
-        let snapshot =
-            coding_plan::parse_token_plan_value(&json, fixed_now()).unwrap();
+        let snapshot = coding_plan::parse_token_plan_value(&json, fixed_now()).unwrap();
         let coding_plan::MiniMaxCodingPlanSnapshot::Remains { rows, .. } = &snapshot else {
             panic!("expected Remains");
         };
