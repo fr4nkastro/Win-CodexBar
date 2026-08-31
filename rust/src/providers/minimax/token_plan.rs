@@ -138,7 +138,7 @@ async fn fetch_token_plan_usage_once(
             return Ok(None);
         }
     };
-    match coding_plan::parse_coding_plan_value(&json, now) {
+    match coding_plan::parse_token_plan_value(&json, now) {
         Ok(snapshot) => Ok(Some(snapshot)),
         Err(e) => {
             tracing::debug!("MiniMax token plan usage parse failed: {e}");

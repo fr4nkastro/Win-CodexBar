@@ -517,9 +517,16 @@ fn parse_plan_name_from_data(data: &Value) -> Option<String> {
 
 /// The single-service `model_remains[]` parser (upstream
 /// `parseCodingPlanRemains(payload:now:)`).
+///
+/// `force_weekly_window` bypasses the `should_render_weekly_window(&model_name)`
+/// gate so the Token Plan flow can emit a weekly row even when the upstream
+/// `model_name` does not match the text-generation heuristic (issue #17, R2).
+/// The coding-plan flow passes `false` so the existing gate behavior is
+/// preserved (REQ-3).
 fn parse_remains(
     json: &Value,
     now: DateTime<Utc>,
+    force_weekly_window: bool,
 ) -> Result<MiniMaxCodingPlanSnapshot, ProviderError> {
     // base_resp from data first, then root
     let base_resp = json
@@ -608,8 +615,9 @@ fn parse_remains(
             rows.push(row);
         }
 
-        // Weekly row (only for text-generation models)
-        if should_render_weekly_window(&model_name)
+        // Weekly row (text-generation models on the coding-plan flow, or any
+        // entry on the Token Plan flow when `force_weekly_window` is set).
+        if (force_weekly_window || should_render_weekly_window(&model_name))
             && let Some(mut row) = make_remains_row(
                 &service_type,
                 Some("Weekly"),
@@ -649,6 +657,7 @@ fn parse_remains(
 }
 
 /// The one parser used for page JSON, `__NEXT_DATA__` payloads, and remains API.
+/// Preserves the text-generation gate for the weekly row (REQ-3).
 pub(super) fn parse_coding_plan_value(
     json: &Value,
     now: DateTime<Utc>,
@@ -657,8 +666,28 @@ pub(super) fn parse_coding_plan_value(
     if let Some(rows) = parse_multi_service(json) {
         return Ok(MiniMaxCodingPlanSnapshot::Services(rows));
     }
-    // Fall through to single-service (model_remains)
-    parse_remains(json, now)
+    // Fall through to single-service (model_remains); coding-plan flow keeps
+    // the text-generation gate (force_weekly_window = false).
+    parse_remains(json, now, false)
+}
+
+/// Token-Plan-only parser entry. Bypasses the `should_render_weekly_window`
+/// gate so the upstream weekly quota is rendered even when the entry's
+/// `model_name` does not match the text-generation heuristic (issue #17, R2).
+/// The status==3 unlimited collapse inside `make_remains_row` /
+/// `is_unlimited_quota_window` is preserved, so an "Unlimited" weekly row
+/// still collapses to `is_unlimited = true` (REQ-1 scenario 2).
+pub(super) fn parse_token_plan_value(
+    json: &Value,
+    now: DateTime<Utc>,
+) -> Result<MiniMaxCodingPlanSnapshot, ProviderError> {
+    // Try multi-service shape first
+    if let Some(rows) = parse_multi_service(json) {
+        return Ok(MiniMaxCodingPlanSnapshot::Services(rows));
+    }
+    // Fall through to single-service (model_remains); Token Plan flow
+    // bypasses the text-generation gate for the weekly row.
+    parse_remains(json, now, true)
 }
 
 /// True when the coding-plan endpoint reports that this account has no coding
