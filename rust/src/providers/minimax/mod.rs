@@ -678,25 +678,6 @@ impl MiniMaxProvider {
         };
         attach_billing_summary(ProviderFetchResult::new(usage, source_label), summary)
     }
-
-    /// Probe for MiniMax installation (credentials check)
-    async fn probe_cli(&self) -> Result<UsageSnapshot, ProviderError> {
-        // Check if API key is configured
-        let has_env_vars = std::env::var("MINIMAX_API_KEY").is_ok();
-        let has_config = Self::get_minimax_config_path()
-            .map(|p| p.join("config.json").exists())
-            .unwrap_or(false);
-
-        if has_env_vars || has_config {
-            let usage =
-                UsageSnapshot::new(RateWindow::new(0.0)).with_login_method("MiniMax (configured)");
-            Ok(usage)
-        } else {
-            Err(ProviderError::NotInstalled(
-                "MiniMax API not configured. Set MINIMAX_API_KEY and MINIMAX_GROUP_ID environment variables".to_string()
-            ))
-        }
-    }
 }
 
 fn parse_billing_summary(json: &serde_json::Value) -> Result<MiniMaxBillingSummary, ProviderError> {
@@ -1019,30 +1000,22 @@ impl Provider for MiniMaxProvider {
                 if let Ok(result) = self.fetch_via_web(region).await {
                     return Ok(result);
                 }
-                let usage = self.probe_cli().await?;
-                Ok(ProviderFetchResult::new(usage, "cli"))
+                return Err(ProviderError::AuthRequired);
             }
             SourceMode::Web => match self.resolve_web_cookie(ctx, region)? {
                 Some(cookie) => self.fetch_with_cookie(&cookie, region).await,
                 None => self.fetch_via_web(region).await,
             },
-            SourceMode::Cli => {
-                let usage = self.probe_cli().await?;
-                Ok(ProviderFetchResult::new(usage, "cli"))
-            }
+            SourceMode::Cli => Err(ProviderError::UnsupportedSource(SourceMode::Cli)),
             SourceMode::OAuth => Err(ProviderError::UnsupportedSource(SourceMode::OAuth)),
         }
     }
 
     fn available_sources(&self) -> Vec<SourceMode> {
-        vec![SourceMode::Auto, SourceMode::Web, SourceMode::Cli]
+        vec![SourceMode::Auto, SourceMode::Web]
     }
 
     fn supports_web(&self) -> bool {
-        true
-    }
-
-    fn supports_cli(&self) -> bool {
         true
     }
 }
@@ -1272,5 +1245,30 @@ mod tests {
         assert_eq!(summary.top_methods[0].tokens, 3000);
         assert_eq!(summary.top_methods[1].name, "chat");
         assert_eq!(summary.top_methods[1].tokens, 1000);
+    }
+
+    #[test]
+    fn minimax_provider_reports_no_cli_support() {
+        let provider = MiniMaxProvider::new();
+        // Trait default returns false; the override that returned true has been removed.
+        assert!(!provider.supports_cli());
+        assert_eq!(
+            provider.available_sources(),
+            vec![SourceMode::Auto, SourceMode::Web]
+        );
+    }
+
+    #[tokio::test]
+    async fn minimax_fetch_usage_rejects_cli_source() {
+        let provider = MiniMaxProvider::new();
+        let ctx = FetchContext {
+            source_mode: SourceMode::Cli,
+            ..FetchContext::default()
+        };
+        let result = provider.fetch_usage(&ctx).await;
+        assert!(matches!(
+            result,
+            Err(ProviderError::UnsupportedSource(SourceMode::Cli))
+        ));
     }
 }
