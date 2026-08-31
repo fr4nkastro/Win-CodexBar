@@ -17,7 +17,11 @@ if [[ "${FAKE_GH_MODE:-ok}" == cross ]]; then
   exit 0
 fi
 if [[ "${1:-}" == repo && "${2:-}" == view ]]; then
-  printf '%s\n' 'nesszer/Win-CodexBar|https://github.com/nesszer/Win-CodexBar'
+  case "${3:-}" in
+    nesszer/Win-CodexBar) printf '%s\n' 'nesszer/Win-CodexBar|https://github.com/nesszer/Win-CodexBar' ;;
+    fr4nkastro/Win-CodexBar) printf '%s\n' 'fr4nkastro/Win-CodexBar|https://github.com/fr4nkastro/Win-CodexBar' ;;
+    *) printf '%s\n' 'nesszer/Win-CodexBar|https://github.com/nesszer/Win-CodexBar' ;;
+  esac
 elif [[ "${1:-}" == pr && "${2:-}" == view ]]; then
   printf '%s\n' 'https://github.com/nesszer/Win-CodexBar/pull/361'
 elif [[ "${1:-}" == issue && "${2:-}" == view ]]; then
@@ -50,6 +54,12 @@ expect_fail bash "$repo_root/scripts/gh-safe.sh" \
 expect_fail bash "$repo_root/scripts/gh-safe.sh" \
   --repo other/repo --verify-kind repo --what-if -- \
   pr create --title test --body test
+
+# fr4nkastro/Win-CodexBar (personal fork) is allowlisted so the workflow can
+# land PRs and releases on the user's own fork without touching nesszer.
+bash "$repo_root/scripts/gh-safe.sh" \
+  --repo fr4nkastro/Win-CodexBar --verify-kind repo --what-if -- \
+  pr create --title test --body test >/dev/null
 
 expect_fail bash "$repo_root/scripts/gh-safe.sh" \
   --repo nesszer/Win-CodexBar --verify-kind pr --target 361 --what-if -- \

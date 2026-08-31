@@ -39,8 +39,8 @@ case "$verify_kind" in repo|pr|issue|release) ;; *) echo "Invalid --verify-kind 
 
 if [[ "${repo,,}" == "steipete/codexbar" ]]; then
   ((allow_upstream_write == 1)) || { echo 'Writes to steipete/CodexBar are blocked by default. Explicit current-turn authorization is required.' >&2; exit 3; }
-elif [[ "${repo,,}" != "nesszer/win-codexbar" ]]; then
-  echo "GitHub writes are not allowlisted for '$repo'. Expected nesszer/Win-CodexBar." >&2
+elif [[ "${repo,,}" != "nesszer/win-codexbar" && "${repo,,}" != "fr4nkastro/win-codexbar" ]]; then
+  echo "GitHub writes are not allowlisted for '$repo'. Expected nesszer/Win-CodexBar or fr4nkastro/Win-CodexBar." >&2
   exit 3
 fi
 
