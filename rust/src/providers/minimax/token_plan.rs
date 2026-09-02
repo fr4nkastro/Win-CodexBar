@@ -37,6 +37,17 @@ fn token_plan_credit_url(region: MiniMaxRegion) -> String {
     )
 }
 
+/// The console Token Plan quota view. Unlike the other console endpoints this
+/// one is served from the `platform.` host (not `www.`) and carries the rolling
+/// interval + weekly percentages the console UI renders (`current_*_used_percent`
+/// as `"NN%"` strings, counts as `-1` sentinels, ms epochs).
+fn token_plan_remains_percent_url(region: MiniMaxRegion) -> String {
+    format!(
+        "{}/backend/account/token_plan/remains_percent",
+        region.base_url()
+    )
+}
+
 /// Token Plan web fetch (issue #254): Token Plan accounts have no
 /// coding-plan subscription, so the coding-plan endpoints answer base_resp
 /// 2062 ("no active token plan subscription"). The console token-plan
@@ -51,9 +62,14 @@ pub(crate) async fn fetch_token_plan_with_cookie(
     tracing::debug!("MiniMax: fetching token-plan console endpoints");
     let now = Utc::now();
 
-    // (a) charge-API token-plan usage — same model_remains/services schema
-    // family as the coding-plan remains endpoint.
-    let usage_snapshot = fetch_token_plan_usage_once(cookie_header, region, now).await?;
+    // (a) Token Plan quota. Prefer the console `remains_percent` view (the
+    // rolling-interval + weekly percentages the console UI shows); fall back to
+    // the charge-API usage view for account shapes that only populate that one.
+    let usage_snapshot =
+        match fetch_token_plan_remains_percent_once(cookie_header, region, now).await? {
+            Some(snapshot) => Some(snapshot),
+            None => fetch_token_plan_usage_once(cookie_header, region, now).await?,
+        };
 
     // (b)/(c) console backend views — best-effort, every failure → absent.
     let summary =
@@ -109,6 +125,44 @@ async fn token_plan_get(
         )
         .send()
         .await?)
+}
+
+/// (a-preferred) `backend/account/token_plan/remains_percent` — the console
+/// quota view. 401/403 (or a `base_resp` login error) → AuthRequired; any other
+/// non-success or unparseable body is swallowed as absent so the caller can
+/// fall back to the charge-API usage view.
+async fn fetch_token_plan_remains_percent_once(
+    cookie_header: &str,
+    region: MiniMaxRegion,
+    now: DateTime<Utc>,
+) -> Result<Option<coding_plan::MiniMaxCodingPlanSnapshot>, ProviderError> {
+    let url = token_plan_remains_percent_url(region);
+    let response = token_plan_get(cookie_header, &url, region).await?;
+
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ProviderError::AuthRequired);
+    }
+    if !status.is_success() {
+        tracing::debug!("MiniMax token plan remains_percent returned status {status}");
+        return Ok(None);
+    }
+
+    let json: serde_json::Value = match response.json().await {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::debug!("MiniMax token plan remains_percent returned non-JSON body: {e}");
+            return Ok(None);
+        }
+    };
+    match coding_plan::parse_remains_percent(&json, now) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(e @ ProviderError::AuthRequired) => Err(e),
+        Err(e) => {
+            tracing::debug!("MiniMax token plan remains_percent parse failed: {e}");
+            Ok(None)
+        }
+    }
 }
 
 /// (a) `charge/token_plan/usage`. 401/403 → AuthRequired; any other

@@ -690,6 +690,180 @@ pub(super) fn parse_token_plan_value(
     parse_remains(json, now, true)
 }
 
+/// Parse a `"NN%"` / `"NN"` / numeric percent into a 0–100 clamped f64.
+fn percent_string_to_f64(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(n) => n.as_f64().map(|v| v.clamp(0.0, 100.0)),
+        Value::String(s) => {
+            let cleaned = s.trim().trim_end_matches('%').trim();
+            cleaned.parse::<f64>().ok().map(|v| v.clamp(0.0, 100.0))
+        }
+        _ => None,
+    }
+}
+
+/// Build one lane (`interval` or `Weekly`) of a `remains_percent` entry.
+/// Returns `None` for the status-3 "no quota for this lane" placeholder
+/// (e.g. the `video` model on a text-only Token Plan) or when the used
+/// percentage is missing.
+#[allow(clippy::too_many_arguments)]
+fn make_remains_percent_row(
+    service_type: &str,
+    used_percent: Option<f64>,
+    status: Option<i64>,
+    start: Option<i64>,
+    end: Option<i64>,
+    remains_time: Option<i64>,
+    now: DateTime<Utc>,
+    is_weekly: bool,
+) -> Option<RemainsRow> {
+    if status == Some(3) {
+        return None;
+    }
+    let percent = used_percent?;
+
+    let start_dt = date_from_epoch(start);
+    let end_dt = date_from_epoch(end);
+
+    let window_type = if is_weekly {
+        "Weekly".to_string()
+    } else {
+        window_type_from_duration(start_dt, end_dt)
+    };
+
+    let mut time_range = time_range_string(start_dt, end_dt);
+    if is_weekly
+        && let Some(weekly_range) = weekly_time_range_string(start_dt, end_dt)
+    {
+        time_range = weekly_range;
+    }
+
+    let resets = resets_at(end_dt, remains_time, now);
+    let desc = reset_description(&window_type, &time_range, now, resets);
+    let win_minutes = window_minutes(start_dt, end_dt);
+
+    Some(RemainsRow {
+        service_type: service_type.to_string(),
+        model_name: String::new(),
+        window_type,
+        percent,
+        window_minutes: win_minutes,
+        resets_at: resets,
+        reset_description: Some(desc),
+        is_unlimited: false,
+        is_weekly,
+    })
+}
+
+/// Parser for the Token Plan console `backend/account/token_plan/remains_percent`
+/// endpoint. Distinct schema from `parse_remains`: `*_used_percent` arrives as a
+/// `"NN%"` string (used, not remaining), the `*_count` fields use `-1` as an
+/// "uncounted" sentinel, and epochs / `remains_time` are milliseconds. Each
+/// entry yields an interval lane plus a weekly lane; status-3 lanes are dropped.
+pub(super) fn parse_remains_percent(
+    json: &Value,
+    now: DateTime<Utc>,
+) -> Result<MiniMaxCodingPlanSnapshot, ProviderError> {
+    let base_resp = json
+        .get("data")
+        .and_then(|d| d.get("base_resp"))
+        .or_else(|| json.get("base_resp"))
+        .or_else(|| json.get("baseResp"));
+    if let Some(base) = base_resp
+        && let Some(status_code) = value_i64(base.get("status_code"))
+        && status_code != 0
+    {
+        let status_msg = scalar_string(base.get("status_msg"))
+            .or_else(|| scalar_string(base.get("statusMessage")))
+            .unwrap_or_else(|| format!("MiniMax token plan status {status_code}"));
+        let lower = status_msg.to_lowercase();
+        if status_code == 1004
+            || lower.contains("cookie")
+            || lower.contains("log in")
+            || lower.contains("login")
+        {
+            return Err(ProviderError::AuthRequired);
+        }
+        return Err(ProviderError::Other(status_msg));
+    }
+
+    let model_remains = get_field(json, "model_remains", "modelRemains")
+        .or_else(|| {
+            json.get("data")
+                .and_then(|d| get_field(d, "model_remains", "modelRemains"))
+        })
+        .and_then(|v| v.as_array());
+    let entries = match model_remains {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return Err(ProviderError::Parse("Missing token plan remains data.".into())),
+    };
+
+    let data_obj = json.get("data").unwrap_or(json);
+    let plan_name = parse_plan_name_from_data(data_obj);
+
+    let mut rows: Vec<RemainsRow> = Vec::new();
+    for entry in entries {
+        let model_name = match scalar_string(get_field(entry, "model_name", "modelName")) {
+            Some(n) => n,
+            None => continue,
+        };
+        let service_type = map_model_name_to_service_type(&model_name);
+
+        if let Some(mut row) = make_remains_percent_row(
+            &service_type,
+            percent_string_to_f64(get_field(
+                entry,
+                "current_interval_used_percent",
+                "currentIntervalUsedPercent",
+            )),
+            value_i64(get_field(
+                entry,
+                "current_interval_status",
+                "currentIntervalStatus",
+            )),
+            value_i64(get_field(entry, "start_time", "startTime")),
+            value_i64(get_field(entry, "end_time", "endTime")),
+            value_i64(get_field(entry, "remains_time", "remainsTime")),
+            now,
+            false,
+        ) {
+            row.model_name = model_name.clone();
+            rows.push(row);
+        }
+
+        if let Some(mut row) = make_remains_percent_row(
+            &service_type,
+            percent_string_to_f64(get_field(
+                entry,
+                "current_weekly_used_percent",
+                "currentWeeklyUsedPercent",
+            )),
+            value_i64(get_field(
+                entry,
+                "current_weekly_status",
+                "currentWeeklyStatus",
+            )),
+            value_i64(get_field(entry, "weekly_start_time", "weeklyStartTime")),
+            value_i64(get_field(entry, "weekly_end_time", "weeklyEndTime")),
+            value_i64(get_field(
+                entry,
+                "weekly_remains_time",
+                "weeklyRemainsTime",
+            )),
+            now,
+            true,
+        ) {
+            row.model_name = model_name;
+            rows.push(row);
+        }
+    }
+
+    if rows.is_empty() {
+        return Err(ProviderError::Parse("Missing token plan remains data.".into()));
+    }
+    Ok(MiniMaxCodingPlanSnapshot::Remains { plan_name, rows })
+}
+
 /// True when the coding-plan endpoint reports that this account has no coding
 /// plan because it runs on a Token Plan subscription instead — live evidence:
 /// base_resp 2062 "no active token plan subscription" (issue #254). Such
@@ -1014,6 +1188,102 @@ mod tests {
         assert!(!weekly.is_unlimited);
         // 7-day window → 10080 minutes.
         assert_eq!(weekly.window_minutes, Some(10080));
+    }
+
+    /// Live fixture (redacted) from `backend/account/token_plan/remains_percent`
+    /// for a Token Plan · Monthly Plus account: a `general` model with a real
+    /// rolling interval + weekly percentage, and a `video` model that is a
+    /// status-3 placeholder.
+    fn remains_percent_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "model_remains": [
+                {
+                    "model_name": "general",
+                    "start_time": 1788343200000i64,
+                    "end_time": 1788361200000i64,
+                    "remains_time": 15457700i64,
+                    "current_interval_total_count": -1,
+                    "current_interval_used_count": -1,
+                    "current_interval_remains_count": -1,
+                    "current_interval_used_percent": "0%",
+                    "current_interval_total_percent": "100%",
+                    "current_interval_status": 1,
+                    "weekly_start_time": 1788134400000i64,
+                    "weekly_end_time": 1788739200000i64,
+                    "weekly_remains_time": 393457700i64,
+                    "current_weekly_total_count": -1,
+                    "current_weekly_used_count": -1,
+                    "current_weekly_remains_count": -1,
+                    "current_weekly_used_percent": "28%",
+                    "current_weekly_total_percent": "100%",
+                    "current_weekly_status": 1
+                },
+                {
+                    "model_name": "video",
+                    "start_time": 1788307200000i64,
+                    "end_time": 1788393600000i64,
+                    "remains_time": 47857700i64,
+                    "current_interval_total_count": 0,
+                    "current_interval_used_count": 0,
+                    "current_interval_remains_count": 0,
+                    "current_interval_used_percent": "0%",
+                    "current_interval_total_percent": "100%",
+                    "current_interval_status": 3,
+                    "weekly_start_time": 1788134400000i64,
+                    "weekly_end_time": 1788739200000i64,
+                    "weekly_remains_time": 393457700i64,
+                    "current_weekly_total_count": 0,
+                    "current_weekly_used_count": 0,
+                    "current_weekly_remains_count": 0,
+                    "current_weekly_used_percent": "0%",
+                    "current_weekly_total_percent": "100%",
+                    "current_weekly_status": 3
+                }
+            ],
+            "base_resp": { "status_code": 0, "status_msg": "success" }
+        })
+    }
+
+    #[test]
+    fn parse_remains_percent_maps_general_interval_and_weekly_and_drops_video() {
+        let snapshot = parse_remains_percent(&remains_percent_fixture(), now()).unwrap();
+        let MiniMaxCodingPlanSnapshot::Remains { rows, .. } = snapshot else {
+            panic!("expected Remains");
+        };
+        // `general` interval + `general` weekly; `video` (status 3) dropped.
+        assert_eq!(rows.len(), 2);
+
+        let interval = rows.iter().find(|r| !r.is_weekly).expect("interval row");
+        assert!((interval.percent - 0.0).abs() < 0.01);
+        // (end - start) = 18000 s = 5 hours → 300 minutes.
+        assert_eq!(interval.window_minutes, Some(300));
+        assert!(!interval.is_unlimited);
+
+        let weekly = rows.iter().find(|r| r.is_weekly).expect("weekly row");
+        assert!((weekly.percent - 28.0).abs() < 0.01);
+        // (weekly_end - weekly_start) = 604800 s = 7 days → 10080 minutes.
+        assert_eq!(weekly.window_minutes, Some(10080));
+        assert_eq!(weekly.window_type, "Weekly");
+    }
+
+    #[test]
+    fn parse_remains_percent_login_error_is_auth_required() {
+        let json = serde_json::json!({
+            "model_remains": [],
+            "base_resp": { "status_code": 1004, "status_msg": "cookie is missing, log in again" }
+        });
+        let err = parse_remains_percent(&json, now()).unwrap_err();
+        assert!(matches!(err, ProviderError::AuthRequired));
+    }
+
+    #[test]
+    fn parse_remains_percent_empty_is_parse_error() {
+        let json = serde_json::json!({
+            "total": 0,
+            "base_resp": { "status_code": 0, "status_msg": "success" }
+        });
+        let err = parse_remains_percent(&json, now()).unwrap_err();
+        assert!(matches!(err, ProviderError::Parse(_)));
     }
 
     #[test]

@@ -566,6 +566,44 @@ mod tests {
     }
 
     #[test]
+    fn remains_percent_snapshot_maps_primary_and_secondary() {
+        // Live `remains_percent` shape (redacted): general model, 0% rolling
+        // interval + 28% weekly; a status-3 `video` placeholder is dropped.
+        let json = serde_json::json!({
+            "model_remains": [
+                {
+                    "model_name": "general",
+                    "start_time": 1788343200000i64,
+                    "end_time": 1788361200000i64,
+                    "remains_time": 15457700i64,
+                    "current_interval_used_percent": "0%",
+                    "current_interval_status": 1,
+                    "weekly_start_time": 1788134400000i64,
+                    "weekly_end_time": 1788739200000i64,
+                    "weekly_remains_time": 393457700i64,
+                    "current_weekly_used_percent": "28%",
+                    "current_weekly_status": 1
+                },
+                {
+                    "model_name": "video",
+                    "current_interval_used_percent": "0%",
+                    "current_interval_status": 3,
+                    "current_weekly_used_percent": "0%",
+                    "current_weekly_status": 3
+                }
+            ],
+            "base_resp": { "status_code": 0, "status_msg": "success" }
+        });
+        let snapshot = super::super::coding_plan::parse_remains_percent(&json, now()).unwrap();
+        let usage = to_usage_snapshot(&snapshot, now()).unwrap();
+        assert!((usage.primary.used_percent - 0.0).abs() < 0.01);
+        assert_eq!(usage.primary.window_minutes, Some(300));
+        let secondary = usage.secondary.expect("weekly secondary");
+        assert!((secondary.used_percent - 28.0).abs() < 0.01);
+        assert_eq!(secondary.window_minutes, Some(10080));
+    }
+
+    #[test]
     fn to_usage_snapshot_html_informational_when_no_percent() {
         let snapshot = MiniMaxCodingPlanSnapshot::Html {
             plan_name: Some("Plus".to_string()),
