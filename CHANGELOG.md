@@ -1,6 +1,17 @@
 # Changelog
 
-## [Windows] 0.56.3 - 2026-08-29
+## [Windows] 0.56.6 - 2026-09-02
+
+### Fixed
+- MiniMax Token Plan: the tray now shows the real rolling 5-hour and weekly
+  usage bars instead of only the "N / 170 days active" subscription line. The
+  Token Plan fetch path now queries the console quota view
+  `platform.minimax.io/backend/account/token_plan/remains_percent` (previously
+  it only hit `www.minimax.io/.../charge/token_plan/usage`, which returns no
+  `model_remains` for these accounts). A new parser handles that view's schema:
+  `current_*_used_percent` as `"NN%"` strings, `-1` count sentinels, millisecond
+  epochs, and status-3 placeholder lanes (e.g. `video` on a text-only plan).
+  The charge-API view remains a fallback (#20).
 
 ### Fixed
 - Claude accounts: a newly added account now appears without an app restart.
