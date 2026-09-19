@@ -38,3 +38,9 @@ pub use models::{
     UsageWindowSnapshot, utc_now,
 };
 pub use stores::{ClaudeAccountStore, ClaudeSnapshotStore};
+
+/// Process-wide lock serializing every operation that reads-then-writes a
+/// Claude OAuth login: the ambient OAuth fetch + token refresh and CLI probes
+/// in `providers::claude` (both of which may rotate the refresh token).
+/// Moved here from upstream's saved-accounts backend (#22).
+pub static CREDENTIAL_OPERATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
