@@ -10,6 +10,7 @@ import type {
 const tauriMocks = vi.hoisted(() => ({
   getClaudeAccountsState: vi.fn(),
   claudeAccountAdd: vi.fn(),
+  claudeAccountCancelLogin: vi.fn(),
   claudeAccountFetch: vi.fn(),
   claudeAccountRemove: vi.fn(),
   claudeAccountSwitch: vi.fn(),
@@ -168,6 +169,63 @@ describe("ClaudeAccountsSection", () => {
     });
     expect(tauriMocks.refreshProviders).not.toHaveBeenCalled();
     expect(screen.getByText("ClaudeAccountsEmpty")).toBeDefined();
+  });
+
+  it("offers Cancel while signing in and stays quiet about the cancellation", async () => {
+    tauriMocks.getClaudeAccountsState.mockResolvedValue({
+      accounts: [],
+      snapshots: {},
+    } as ClaudeAccountsStateBridge);
+    render(<ClaudeAccountsSection t={t} />);
+    await waitFor(() => {
+      expect(screen.getByText("ClaudeAccountsAddButton")).toBeDefined();
+    });
+
+    let rejectAdd: (error: Error) => void = () => {};
+    tauriMocks.claudeAccountAdd.mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectAdd = reject;
+      }),
+    );
+    tauriMocks.claudeAccountCancelLogin.mockImplementation(async () => {
+      rejectAdd(new Error("Account setup cancelled."));
+      return true;
+    });
+    await act(async () => {
+      screen.getByText("ClaudeAccountsAddButton").click();
+    });
+    expect(screen.getByText("ClaudeAccountsSigningIn")).toBeDefined();
+    expect(screen.queryByText("ClaudeAccountsAddButton")).toBeNull();
+
+    await act(async () => {
+      screen.getByText("ClaudeAccountsCancelLogin").click();
+    });
+    expect(tauriMocks.claudeAccountCancelLogin).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(screen.getByText("ClaudeAccountsAddButton")).toBeDefined();
+    });
+    expect(screen.queryByText("ClaudeAccountsCancelLogin")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(tauriMocks.refreshProviders).not.toHaveBeenCalled();
+  });
+
+  it("offers Cancel for a sign-in started from the tray", async () => {
+    tauriMocks.getClaudeAccountsState.mockResolvedValue({
+      accounts: [account("1")],
+      snapshots: {},
+      loginInProgress: true,
+    } as ClaudeAccountsStateBridge);
+    tauriMocks.claudeAccountCancelLogin.mockResolvedValue(true);
+    render(<ClaudeAccountsSection t={t} />);
+    await waitFor(() => {
+      expect(screen.getByText("ClaudeAccountsCancelLogin")).toBeDefined();
+    });
+    expect(screen.queryByText("ClaudeAccountsAddButton")).toBeNull();
+
+    await act(async () => {
+      screen.getByText("ClaudeAccountsCancelLogin").click();
+    });
+    expect(tauriMocks.claudeAccountCancelLogin).toHaveBeenCalledTimes(1);
   });
 
   it("switches an account, shows success, and triggers a provider refresh", async () => {

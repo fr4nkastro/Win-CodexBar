@@ -553,6 +553,14 @@ export function claudeAccountAdd(): Promise<ClaudeAccount> {
   return invoke<ClaudeAccount>("claude_account_add");
 }
 
+/**
+ * Cancel the in-flight Add-account sign-in. Resolves `true` when one was
+ * running (its pending `claudeAccountAdd` then rejects), `false` otherwise.
+ */
+export function claudeAccountCancelLogin(): Promise<boolean> {
+  return invoke<boolean>("claude_account_cancel_login");
+}
+
 export function claudeAccountRemove(id: string): Promise<void> {
   return invoke<void>("claude_account_remove", { id });
 }

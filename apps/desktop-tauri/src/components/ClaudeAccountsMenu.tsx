@@ -8,6 +8,7 @@ import type {
 import { useLocale } from "../hooks/useLocale";
 import { maskEmail } from "./MenuCard";
 import {
+  claudeAccountCancelLogin,
   claudeAccountSwitch,
   getClaudeAccountsState,
   refreshProviders,
@@ -22,6 +23,8 @@ import {
  * Shows every account (ambient + managed) with a compact usage bar and a
  * Switch action. Switching updates the ambient identity and triggers a
  * provider refresh so the tray icon/menu reflect the now-active account.
+ * While an Add-account sign-in (started from Settings or the native tray
+ * menu) is running, a Cancel sign-in action is shown even for one account.
  */
 export default function ClaudeAccountsMenu({
   hideEmail,
@@ -36,6 +39,7 @@ export default function ClaudeAccountsMenu({
     Record<string, ClaudeAccountUsageSnapshot>
   >({});
   const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
+  const [loginInProgress, setLoginInProgress] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -47,6 +51,7 @@ export default function ClaudeAccountsMenu({
       setAccounts(next.accounts);
       setSnapshots(next.snapshots);
       setActiveAccountId(next.activeAccountId ?? null);
+      setLoginInProgress(next.loginInProgress ?? false);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -60,7 +65,7 @@ export default function ClaudeAccountsMenu({
 
   useEffect(() => {
     onLayoutChange?.();
-  }, [accounts.length, error, onLayoutChange]);
+  }, [accounts.length, error, loginInProgress, onLayoutChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -88,12 +93,37 @@ export default function ClaudeAccountsMenu({
     }
   };
 
+  const handleCancelLogin = async () => {
+    setError(null);
+    try {
+      await claudeAccountCancelLogin();
+      await load();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const cancelRow = loginInProgress ? (
+    <div className="claude-menu-accounts__signing-in" role="status">
+      <span>{t("ClaudeAccountsSigningIn")}</span>
+      <button
+        type="button"
+        className="claude-menu-accounts__switch"
+        onClick={() => void handleCancelLogin()}
+      >
+        {t("ClaudeAccountsCancelLogin")}
+      </button>
+    </div>
+  ) : null;
+
   if (accounts.length <= 1) {
-    return null;
+    return cancelRow;
   }
 
   return (
-    <details className="claude-menu-accounts" onToggle={onLayoutChange}>
+    <>
+      {cancelRow}
+      <details className="claude-menu-accounts" onToggle={onLayoutChange}>
       <summary className="claude-menu-accounts__summary">
         <span className="claude-menu-accounts__title">
           {t("ClaudeAccountsTitle")}
@@ -164,7 +194,8 @@ export default function ClaudeAccountsMenu({
           );
         })}
       </ul>
-    </details>
+      </details>
+    </>
   );
 }
 

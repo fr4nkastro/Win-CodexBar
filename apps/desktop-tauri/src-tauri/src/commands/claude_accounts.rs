@@ -7,8 +7,8 @@ use uuid::Uuid;
 use codexbar::claude_accounts::{
     ClaudeAccount, ClaudeAccountManager, ClaudeAccountManagerError, ClaudeAccountSource,
     ClaudeAccountStore, ClaudeAccountUsageSnapshot, ClaudeSnapshotStore, ClaudeSwitchResult,
-    RemovedAccountIdentity, active_account_id, credentials_merge, file_locations,
-    group_lanes_by_identity, reconcile_stored_accounts, require_cli_closed, usage,
+    ManagedLoginProcess, RemovedAccountIdentity, active_account_id, credentials_merge,
+    file_locations, group_lanes_by_identity, reconcile_stored_accounts, require_cli_closed, usage,
 };
 use codexbar::core::{ProviderFetchResult, RateWindow};
 use codexbar::providers::claude::ClaudeOAuthFetcher;
@@ -30,6 +30,58 @@ const CONSENT_DENIED_MESSAGE: &str =
 
 fn claude_accounts_consent() -> bool {
     Settings::load().claude_allow_managing_claude_code_accounts
+}
+
+/// Returned when a second sign-in is started while one is still running.
+const LOGIN_IN_PROGRESS_MESSAGE: &str =
+    "A Claude sign-in is already in progress. Finish or cancel it first.";
+
+/// Cancel handle of the one in-flight `claude auth login` (Add account), so
+/// Settings, the tray card, and the native tray menu can all cancel it.
+static IN_FLIGHT_LOGIN: Mutex<Option<ManagedLoginProcess>> = Mutex::new(None);
+
+/// Registration of the in-flight login; clears the slot when dropped, so the
+/// slot is released on every exit path of the add command.
+struct InFlightLogin;
+
+impl InFlightLogin {
+    fn begin() -> Result<(Self, ManagedLoginProcess), String> {
+        let mut slot = IN_FLIGHT_LOGIN.lock().map_err(|e| e.to_string())?;
+        if slot.is_some() {
+            return Err(LOGIN_IN_PROGRESS_MESSAGE.to_string());
+        }
+        let handle = ManagedLoginProcess::default();
+        *slot = Some(handle.clone());
+        Ok((Self, handle))
+    }
+}
+
+impl Drop for InFlightLogin {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = IN_FLIGHT_LOGIN.lock() {
+            *slot = None;
+        }
+    }
+}
+
+/// Whether an Add-account sign-in is currently running.
+pub(crate) fn claude_login_in_progress() -> bool {
+    IN_FLIGHT_LOGIN.lock().is_ok_and(|slot| slot.is_some())
+}
+
+/// Cancel the in-flight sign-in, if any. Returns whether one was cancelled.
+fn cancel_in_flight_login() -> bool {
+    let handle = IN_FLIGHT_LOGIN
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().cloned());
+    match handle {
+        Some(handle) => {
+            handle.cancel();
+            true
+        }
+        None => false,
+    }
 }
 
 /// All stored + discovered Claude accounts, with the stored list preferred.
@@ -235,12 +287,15 @@ pub(crate) async fn refresh_claude_account_lanes(
 // also makes the gate independently unit-testable without a live Tauri
 // `AppHandle` or a global settings file.
 
-fn add_claude_account_gated(consent: bool) -> Result<ClaudeAccount, String> {
+fn add_claude_account_gated(
+    consent: bool,
+    handle: &ManagedLoginProcess,
+) -> Result<ClaudeAccount, String> {
     if !consent {
         return Err(CONSENT_DENIED_MESSAGE.to_string());
     }
     let account = ClaudeAccountManager::new()
-        .add_managed_account(None)
+        .add_managed_account(Some(handle))
         .map_err(into_user_message)?;
 
     // G9: un-remove on re-add. Drop every `removed` entry matching the newly
@@ -334,9 +389,18 @@ pub fn claude_accounts_list() -> Result<Vec<ClaudeAccount>, String> {
 #[tauri::command]
 pub async fn claude_account_add(app: tauri::AppHandle) -> Result<ClaudeAccount, String> {
     let consent = claude_accounts_consent();
-    let account = tauri::async_runtime::spawn_blocking(move || add_claude_account_gated(consent))
-        .await
-        .map_err(|e| e.to_string())??;
+    if !consent {
+        return Err(CONSENT_DENIED_MESSAGE.to_string());
+    }
+    let (registration, handle) = InFlightLogin::begin()?;
+    notify_login_state_changed(&app);
+    let result =
+        tauri::async_runtime::spawn_blocking(move || add_claude_account_gated(consent, &handle))
+            .await
+            .map_err(|e| e.to_string());
+    drop(registration);
+    notify_login_state_changed(&app);
+    let account = result??;
 
     // `refresh_persisted_accounts` consumes `app` and already emits
     // `settings-changed` (:409). Clone first so the add path also emits
@@ -350,6 +414,21 @@ pub async fn claude_account_add(app: tauri::AppHandle) -> Result<ClaudeAccount, 
     }
     events::emit_claude_accounts_updated(&app_for_event);
     Ok(account)
+}
+
+/// Cancel an in-flight Add-account sign-in. Resolves `true` when a sign-in
+/// was running (its `claude_account_add` call then fails with the
+/// cancellation message), `false` when there was nothing to cancel.
+#[tauri::command]
+pub fn claude_account_cancel_login() -> bool {
+    cancel_in_flight_login()
+}
+
+/// Tell every surface (Settings, tray card, native tray menu) that a sign-in
+/// started or ended, so Cancel appears/disappears everywhere.
+fn notify_login_state_changed(app: &tauri::AppHandle) {
+    events::emit_claude_accounts_updated(app);
+    crate::tray_bridge::rebuild_tray_menu(app);
 }
 
 #[tauri::command]
@@ -451,6 +530,8 @@ pub struct ClaudeAccountsStateBridge {
     /// state, or `None` when it is absent/unreadable or matches no listed
     /// account. Additive and optional — legacy consumers ignore it.
     pub active_account_id: Option<Uuid>,
+    /// Whether an Add-account sign-in is running (Cancel is offered).
+    pub login_in_progress: bool,
 }
 
 /// File-based only (spec: "Active-account detection") — no `claude`
@@ -464,6 +545,7 @@ fn build_claude_accounts_state() -> Result<ClaudeAccountsStateBridge, String> {
         accounts,
         snapshots: claude_account_snapshots()?,
         active_account_id: active,
+        login_in_progress: claude_login_in_progress(),
     })
 }
 
@@ -556,17 +638,20 @@ mod tests {
             accounts: vec![account.clone()],
             snapshots: HashMap::new(),
             active_account_id: Some(account.id),
+            login_in_progress: true,
         };
         let json = serde_json::to_value(&bridge).unwrap();
         assert_eq!(
             json.get("activeAccountId").and_then(|v| v.as_str()),
             Some(account.id.to_string().as_str())
         );
+        assert_eq!(json["loginInProgress"], serde_json::json!(true));
 
         let none = ClaudeAccountsStateBridge {
             accounts: vec![],
             snapshots: HashMap::new(),
             active_account_id: None,
+            login_in_progress: false,
         };
         assert!(serde_json::to_value(&none).unwrap()["activeAccountId"].is_null());
     }
@@ -631,7 +716,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         file_locations::with_app_support_directory(dir.path().to_path_buf());
 
-        let result = add_claude_account_gated(false);
+        let result = add_claude_account_gated(false, &ManagedLoginProcess::default());
 
         let managed_dir_entries = fs::read_dir(dir.path().join("managed-configs"))
             .map(|entries| entries.count())
@@ -737,6 +822,28 @@ mod tests {
         // fails for the real reason (id not in the persisted/discovered
         // list) instead of the consent message.
         assert_eq!(result.unwrap_err(), "Claude account not found.");
+    }
+
+    // ── #22: cancellable, single in-flight sign-in ────────────────────────
+
+    #[test]
+    fn in_flight_login_is_exclusive_cancellable_and_released_on_drop() {
+        assert!(!cancel_in_flight_login(), "nothing to cancel while idle");
+
+        let (registration, handle) = InFlightLogin::begin().unwrap();
+        assert!(claude_login_in_progress());
+        assert_eq!(
+            InFlightLogin::begin().err().as_deref(),
+            Some(LOGIN_IN_PROGRESS_MESSAGE),
+            "a second sign-in must not start while one is running"
+        );
+
+        assert!(cancel_in_flight_login());
+        assert!(handle.is_cancelled(), "cancel reaches the runner's handle");
+
+        drop(registration);
+        assert!(!claude_login_in_progress());
+        assert!(!cancel_in_flight_login());
     }
 
     // ── D5 refresh-lane mapping ───────────────────────────────────────────

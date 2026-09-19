@@ -20,6 +20,7 @@ use crate::tray_menu::TrayMenuEntry;
 pub(crate) enum AccountMenuAction {
     AddCodexAccount,
     AddClaudeAccount,
+    CancelClaudeLogin,
     SwitchClaudeAccount(String),
     SwitchCodexAccount(String),
 }
@@ -48,6 +49,7 @@ pub(crate) fn prepend_account_menus(spec: &mut Vec<TrayMenuEntry>, settings: &Se
             claude_accounts_menu(
                 &claude_accounts,
                 active,
+                crate::commands::claude_login_in_progress(),
                 settings.ui_language,
                 settings.hide_personal_info,
             ),
@@ -59,6 +61,7 @@ pub(crate) fn resolve_action(id: &str) -> Option<AccountMenuAction> {
     match id {
         "add_codex_account" => Some(AccountMenuAction::AddCodexAccount),
         "add_claude_account" => Some(AccountMenuAction::AddClaudeAccount),
+        "cancel_claude_login" => Some(AccountMenuAction::CancelClaudeLogin),
         _ if id.starts_with("switch_claude_account:") => {
             let id = id.strip_prefix("switch_claude_account:")?;
             uuid::Uuid::parse_str(id).ok()?;
@@ -124,6 +127,10 @@ pub(crate) fn handle_action(app: &AppHandle, action: AccountMenuAction) {
                 }
             });
         }
+        AccountMenuAction::CancelClaudeLogin => {
+            // The pending add call reports the cancellation; nothing to show.
+            let _cancelled = crate::commands::claude_account_cancel_login();
+        }
         action @ (AccountMenuAction::AddClaudeAccount
         | AccountMenuAction::SwitchClaudeAccount(_)) => {
             let handle = app.clone();
@@ -144,6 +151,12 @@ pub(crate) fn handle_action(app: &AppHandle, action: AccountMenuAction) {
                     }
                     _ => return,
                 };
+                // A user-initiated cancel is not an error worth a dialog.
+                if result.as_ref().is_err_and(|error| {
+                    error == codexbar::claude_accounts::SIGN_IN_CANCELLED_MESSAGE
+                }) {
+                    return;
+                }
                 handle
                     .dialog()
                     .message(result.map_or_else(|error| error, str::to_string))
@@ -216,6 +229,7 @@ fn codex_account_menu_label(
 fn claude_accounts_menu(
     accounts: &[ClaudeAccount],
     active: Option<Uuid>,
+    login_in_progress: bool,
     lang: Language,
     hide_personal_info: bool,
 ) -> TrayMenuEntry {
@@ -241,10 +255,19 @@ fn claude_accounts_menu(
         ));
     }
     children.push(TrayMenuEntry::separator());
-    children.push(TrayMenuEntry::item(
-        "add_claude_account",
-        text(LocaleKey::ClaudeAccountsAddButton),
-    ));
+    // While a sign-in runs, Add is replaced by Cancel: only one sign-in can
+    // be in flight, and the browser flow may be abandoned at any time.
+    children.push(if login_in_progress {
+        TrayMenuEntry::item(
+            "cancel_claude_login",
+            text(LocaleKey::ClaudeAccountsCancelLogin),
+        )
+    } else {
+        TrayMenuEntry::item(
+            "add_claude_account",
+            text(LocaleKey::ClaudeAccountsAddButton),
+        )
+    });
     TrayMenuEntry::submenu(
         "claude_accounts",
         text(LocaleKey::ClaudeAccountsTitle),
@@ -283,6 +306,10 @@ mod tests {
         assert_eq!(
             resolve_action("add_claude_account"),
             Some(AccountMenuAction::AddClaudeAccount)
+        );
+        assert_eq!(
+            resolve_action("cancel_claude_login"),
+            Some(AccountMenuAction::CancelClaudeLogin)
         );
         let claude_id = "00000000-0000-0000-0000-00000000000a";
         assert_eq!(
@@ -438,6 +465,7 @@ mod tests {
         let menu = claude_accounts_menu(
             &[current.clone(), saved.clone()],
             Some(current.id),
+            false,
             Language::English,
             false,
         );
@@ -452,11 +480,21 @@ mod tests {
         assert_eq!(menu.children[1].checked, Some(false));
         assert!(!menu.children[1].disabled);
         assert!(menu_contains(&menu.children, "add_claude_account"));
+        assert!(!menu_contains(&menu.children, "cancel_claude_login"));
         assert!(menu_contains(
-            &claude_accounts_menu(&[], None, Language::English, false).children,
+            &claude_accounts_menu(&[], None, false, Language::English, false).children,
             "add_claude_account"
         ));
-        let hidden = claude_accounts_menu(&[saved], None, Language::English, true);
+        let signing_in = claude_accounts_menu(
+            std::slice::from_ref(&saved),
+            None,
+            true,
+            Language::English,
+            false,
+        );
+        assert!(menu_contains(&signing_in.children, "cancel_claude_login"));
+        assert!(!menu_contains(&signing_in.children, "add_claude_account"));
+        let hidden = claude_accounts_menu(&[saved], None, false, Language::English, true);
         assert_eq!(hidden.children[0].label, "Account 1");
     }
 }

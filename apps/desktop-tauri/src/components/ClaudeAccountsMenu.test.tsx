@@ -11,6 +11,7 @@ import { LocaleProvider } from "../i18n/LocaleProvider";
 const tauriMocks = vi.hoisted(() => ({
   getClaudeAccountsState: vi.fn(),
   claudeAccountSwitch: vi.fn(),
+  claudeAccountCancelLogin: vi.fn().mockResolvedValue(true),
   refreshProviders: vi.fn().mockResolvedValue(undefined),
   getLocaleStrings: vi.fn(),
 }));
@@ -175,5 +176,28 @@ describe("ClaudeAccountsMenu", () => {
     });
     expect(tauriMocks.claudeAccountSwitch).toHaveBeenCalledWith("2");
     expect(tauriMocks.refreshProviders).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers Cancel sign-in while a login runs, even for a single account", async () => {
+    const { container } = renderMenu(false, {
+      accounts: [account("1", { source: "ambient" })],
+      snapshots: {},
+      loginInProgress: true,
+    });
+    const cancel = await screen.findByText("ClaudeAccountsCancelLogin");
+    expect(container.querySelector(".claude-menu-accounts")).toBeNull();
+
+    tauriMocks.getClaudeAccountsState.mockResolvedValue({
+      accounts: [account("1", { source: "ambient" })],
+      snapshots: {},
+      loginInProgress: false,
+    });
+    await act(async () => {
+      cancel.click();
+    });
+    expect(tauriMocks.claudeAccountCancelLogin).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(screen.queryByText("ClaudeAccountsCancelLogin")).toBeNull();
+    });
   });
 });

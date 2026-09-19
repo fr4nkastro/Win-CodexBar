@@ -715,3 +715,5 @@ ProviderAccentColor = Color de acento
 ProviderAccentColorHelper = Anula el color de marca usado en barras de uso y gráficos. Introduce un color hexadecimal como #FF5733.
 ProviderAccentColorReset = Restablecer predeterminado
 ProviderAccentColorInvalid = Color hexadecimal no válido. Usa el formato #RRGGBB, por ejemplo #FF5733.
+ClaudeAccountsCancelLogin = Cancelar inicio de sesión
+ClaudeAccountsSigningIn = Completa el inicio de sesión de Claude en tu navegador. Tu cuenta actual de la CLI sigue activa hasta que cambies.

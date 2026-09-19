@@ -1046,4 +1046,6 @@ export interface ClaudeAccountsStateBridge {
   accounts: ClaudeAccount[];
   snapshots: Record<string, ClaudeAccountUsageSnapshot>;
   activeAccountId?: string | null;
+  /** True while an Add-account sign-in runs; Cancel is offered. */
+  loginInProgress?: boolean;
 }

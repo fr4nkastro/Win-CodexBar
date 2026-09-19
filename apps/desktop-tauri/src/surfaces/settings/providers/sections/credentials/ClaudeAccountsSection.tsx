@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type {
   ClaudeAccount,
@@ -8,6 +8,7 @@ import type {
 import type { LocaleKey } from "../../../../../i18n/keys";
 import {
   claudeAccountAdd,
+  claudeAccountCancelLogin,
   claudeAccountFetch,
   claudeAccountRemove,
   claudeAccountSwitch,
@@ -45,6 +46,11 @@ export function ClaudeAccountsSection({ t }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [switchSucceeded, setSwitchSucceeded] = useState(false);
+  // A sign-in started here (`adding`) or elsewhere, e.g. the tray menu
+  // (`loginInProgress` from the backend). Either way Cancel is offered.
+  const [adding, setAdding] = useState(false);
+  const [loginInProgress, setLoginInProgress] = useState(false);
+  const cancelRequested = useRef(false);
 
   // Gated on the `claudeAllowManagingClaudeCodeAccounts` consent flag: the
   // whole section stays hidden until the user opts in via `ClaudeCreds`'s
@@ -76,6 +82,7 @@ export function ClaudeAccountsSection({ t }: Props) {
       setAccounts(next.accounts);
       setSnapshots(next.snapshots);
       setActiveAccountId(next.activeAccountId ?? null);
+      setLoginInProgress(next.loginInProgress ?? false);
       setLoaded(true);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -104,8 +111,10 @@ export function ClaudeAccountsSection({ t }: Props) {
 
   const handleAdd = async () => {
     setBusy(true);
+    setAdding(true);
     setError(null);
     setSwitchSucceeded(false);
+    cancelRequested.current = false;
     try {
       await claudeAccountAdd();
       await load();
@@ -113,11 +122,28 @@ export function ClaudeAccountsSection({ t }: Props) {
       // reflects the new account without waiting for a refresh tick (#16).
       void refreshProviders().catch(() => {});
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
+      // A cancel the user asked for is not an error worth surfacing.
+      if (!cancelRequested.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
+      cancelRequested.current = false;
+      setAdding(false);
       setBusy(false);
     }
   };
+
+  const handleCancelLogin = async () => {
+    cancelRequested.current = true;
+    try {
+      await claudeAccountCancelLogin();
+    } catch (err: unknown) {
+      cancelRequested.current = false;
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const signingIn = adding || loginInProgress;
 
   const handleSwitch = async (id: string) => {
     setBusy(true);
@@ -172,7 +198,7 @@ export function ClaudeAccountsSection({ t }: Props) {
     <section className="provider-detail-section claude-accounts">
       <div className="provider-detail-section__header">
         <h4>{t("ClaudeAccountsTitle")}</h4>
-        {accounts.length === 0 && (
+        {accounts.length === 0 && !signingIn && (
           <button
             type="button"
             className="credential-btn credential-btn--primary"
@@ -185,6 +211,19 @@ export function ClaudeAccountsSection({ t }: Props) {
       </div>
       <p className="settings-section__hint">{t("ClaudeAccountsHint")}</p>
       <p className="settings-section__hint">{t("ClaudeAccountsCloseWarning")}</p>
+
+      {signingIn && (
+        <div className="provider-detail-note claude-accounts-signing-in" role="status">
+          <span>{t("ClaudeAccountsSigningIn")}</span>
+          <button
+            type="button"
+            className="credential-btn credential-btn--secondary"
+            onClick={() => void handleCancelLogin()}
+          >
+            {t("ClaudeAccountsCancelLogin")}
+          </button>
+        </div>
+      )}
 
       {error && (
         <div className="provider-detail-error" role="alert">
@@ -270,16 +309,18 @@ export function ClaudeAccountsSection({ t }: Props) {
               );
             })}
           </ul>
-          <div className="claude-accounts-add">
-            <button
-              type="button"
-              className="credential-btn credential-btn--primary"
-              disabled={busy}
-              onClick={() => void handleAdd()}
-            >
-              {t("ClaudeAccountsAddButton")}
-            </button>
-          </div>
+          {!signingIn && (
+            <div className="claude-accounts-add">
+              <button
+                type="button"
+                className="credential-btn credential-btn--primary"
+                disabled={busy}
+                onClick={() => void handleAdd()}
+              >
+                {t("ClaudeAccountsAddButton")}
+              </button>
+            </div>
+          )}
         </>
       )}
     </section>

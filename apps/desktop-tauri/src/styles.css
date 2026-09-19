@@ -4153,6 +4153,16 @@ html:has(.menu-surface--tray) {
   color: var(--provider-status-error);
 }
 
+.claude-menu-accounts__signing-in {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 0.72rem;
+  color: var(--provider-row-text-secondary);
+}
+
 .claude-menu-accounts__list {
   list-style: none;
   margin: 6px 0 0;

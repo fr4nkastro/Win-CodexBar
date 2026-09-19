@@ -188,6 +188,7 @@ fn main() {
             commands::get_codex_accounts_state,
             commands::claude_accounts_list,
             commands::claude_account_add,
+            commands::claude_account_cancel_login,
             commands::claude_account_remove,
             commands::claude_account_switch,
             commands::claude_account_fetch,
