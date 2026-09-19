@@ -595,8 +595,10 @@ fn run_arkcli_usage_plan() -> Result<Vec<u8>, ProviderError> {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                // Best-effort teardown of the timed-out child; the outcome is already
+                // reported as timed out.
+                let _killed = child.kill();
+                let _reaped = child.wait();
                 return Err(ProviderError::Other(
                     "arkcli usage timed out. Check arkcli authentication and try again.".into(),
                 ));
@@ -750,7 +752,14 @@ fn datetime_from_epoch(timestamp: f64) -> Option<DateTime<Utc>> {
     if !timestamp.is_finite() || timestamp <= 0.0 {
         return None;
     }
-    Utc.timestamp_opt(timestamp as i64, 0).single()
+    // Epoch seconds guarded finite and positive; the sub-second fraction is
+    // below timestamp resolution.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "epoch seconds; sub-second fraction below timestamp resolution"
+    )]
+    let whole_seconds = timestamp as i64;
+    Utc.timestamp_opt(whole_seconds, 0).single()
 }
 
 struct SignedVolcengineRequest {
@@ -916,6 +925,22 @@ impl Provider for DoubaoProvider {
 
     fn available_sources(&self) -> Vec<SourceMode> {
         vec![SourceMode::Auto, SourceMode::OAuth, SourceMode::Cli]
+    }
+
+    /// Doubao's arkcli probe raises `NotInstalled` when the `arkcli`
+    /// binary is missing from PATH/`ARKCLI_PATH` ("arkcli was not found.
+    /// Install arkcli, ...") — an installation gap, not a credential
+    /// problem — so it surfaces as an offline local runtime (matching the
+    /// pre-backend classifier's treatment of CLI-presence failures). The
+    /// guard is message-scoped: the shared "API key not found" producer
+    /// keeps the default sign-in mapping.
+    fn error_state_kind(&self, error: &ProviderError) -> crate::core::ProviderStateKind {
+        match error {
+            ProviderError::NotInstalled(msg) if msg.contains("arkcli was not found") => {
+                crate::core::ProviderStateKind::LocalRuntimeOffline
+            }
+            _ => error.state_kind(),
+        }
     }
 }
 
@@ -1140,5 +1165,24 @@ mod tests {
         let raw = br#"{ "viewer": { "auth_method": "none" }, "items": [] }"#;
         let err = decode_arkcli_usage(raw).unwrap_err();
         assert!(matches!(err, ProviderError::AuthRequired));
+    }
+
+    #[test]
+    fn arkcli_presence_maps_to_local_runtime_offline_but_api_key_stays_default() {
+        assert_eq!(
+            DoubaoProvider::new().error_state_kind(&ProviderError::NotInstalled(
+                "arkcli was not found. Install arkcli, run 'arkcli auth login', or configure \
+                 Doubao API credentials."
+                    .into(),
+            )),
+            crate::core::ProviderStateKind::LocalRuntimeOffline
+        );
+        // The shared API-key producer keeps the default mapping.
+        assert_eq!(
+            DoubaoProvider::new().error_state_kind(&ProviderError::NotInstalled(
+                "API key not found. Set ARK_API_KEY in Preferences or environment.".into(),
+            )),
+            crate::core::ProviderStateKind::NeedsAuthentication
+        );
     }
 }

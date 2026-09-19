@@ -1,13 +1,58 @@
 //! Claude Web API fetcher - uses browser cookies to fetch usage from claude.ai
 
 use chrono::{DateTime, Utc};
-use reqwest::{Client, header};
+use reqwest::{Client, StatusCode, header};
 use serde::Deserialize;
 
-use crate::browser::cookies::get_cookie_header;
 use crate::core::{
     CostSnapshot, NamedRateWindow, ProviderError, ProviderFetchResult, RateWindow, UsageSnapshot,
 };
+
+use super::CLOUDFLARE_CHALLENGE_MESSAGE;
+
+const CLOUDFLARE_BODY_PREFIX_BYTES: usize = 64 * 1024;
+
+fn is_cloudflare_challenge_response(
+    status: StatusCode,
+    headers: &header::HeaderMap,
+    body: &[u8],
+) -> bool {
+    if status != StatusCode::FORBIDDEN {
+        return false;
+    }
+
+    if headers
+        .get("cf-mitigated")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("challenge"))
+    {
+        return true;
+    }
+
+    let prefix = &body[..body.len().min(CLOUDFLARE_BODY_PREFIX_BYTES)];
+    std::str::from_utf8(prefix)
+        .ok()
+        .is_some_and(|text| text.to_ascii_lowercase().contains("just a moment"))
+}
+
+fn classify_web_http_error(
+    label: &str,
+    status: StatusCode,
+    headers: &header::HeaderMap,
+    body: &[u8],
+) -> ProviderError {
+    if status == StatusCode::UNAUTHORIZED {
+        return ProviderError::AuthRequired;
+    }
+    if status == StatusCode::FORBIDDEN {
+        if is_cloudflare_challenge_response(status, headers, body) {
+            return ProviderError::Other(CLOUDFLARE_CHALLENGE_MESSAGE.to_string());
+        }
+        return ProviderError::AuthRequired;
+    }
+    ProviderError::Other(format!("Failed to get {label}: {status}"))
+}
 
 /// Read the response body as text, then deserialize as JSON. On failure, include
 /// non-sensitive shape metadata so auth redirects, error envelopes, and schema
@@ -74,7 +119,10 @@ pub struct ClaudeWebApiFetcher {
 #[derive(Debug, Deserialize)]
 struct Organization {
     uuid: String,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "field mirrors the Claude API org payload; deserialized for round-trip fidelity but not read yet"
+    )]
     name: Option<String>,
 }
 
@@ -258,7 +306,6 @@ impl ClaudeWebApiFetcher {
             return self.fetch_with_cookie_header(&cookie_header).await;
         }
 
-        // Try multiple domains - Claude uses different domains for different services
         let domains = [
             "claude.ai",
             "claude.com",
@@ -266,22 +313,25 @@ impl ClaudeWebApiFetcher {
             "anthropic.com",
         ];
 
-        for domain in domains {
-            match get_cookie_header(domain) {
-                Ok(cookie_header) if !cookie_header.is_empty() => {
-                    tracing::debug!("Found cookies for {}", domain);
-                    return self.fetch_with_cookie_header(&cookie_header).await;
+        // A challenge is a network-path failure, not evidence that a cached
+        // session is invalid. Keep the last validated cookie for the next
+        // refresh and only invalidate it for an ordinary auth response.
+        use crate::browser::cookie_cache::CookieHeaderCache;
+        if let Some(cached) = CookieHeaderCache::load(crate::core::ProviderId::Claude) {
+            match self.fetch_with_cookie_header(&cached.cookie_header).await {
+                Ok(result) => return Ok(result),
+                Err(error) if is_cookie_authentication_failure(&error) => {
+                    CookieHeaderCache::clear(crate::core::ProviderId::Claude);
                 }
-                Ok(_) => {
-                    tracing::debug!("No cookies found for {}", domain);
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to get cookies for {}: {}", domain, e);
-                }
+                Err(error) => return Err(error),
             }
         }
 
-        Err(ProviderError::NoCookies)
+        let cookie_header = crate::providers::browser_cookie_header(&domains)?;
+        let result = self.fetch_with_cookie_header(&cookie_header).await?;
+        let _stored =
+            CookieHeaderCache::store(crate::core::ProviderId::Claude, &cookie_header, "browser");
+        Ok(result)
     }
 
     /// Fetch usage with a provided cookie header
@@ -467,11 +517,16 @@ impl ClaudeWebApiFetcher {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            return Err(ProviderError::Other(format!(
-                "Failed to get organizations: {}",
-                response.status()
-            )));
+        let status = response.status();
+        if !status.is_success() {
+            let response_headers = response.headers().clone();
+            let body = response.bytes().await?;
+            return Err(classify_web_http_error(
+                "organizations",
+                status,
+                &response_headers,
+                &body,
+            ));
         }
 
         let orgs: Vec<Organization> = parse_json_with_body(response, "organizations").await?;
@@ -497,11 +552,16 @@ impl ClaudeWebApiFetcher {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            return Err(ProviderError::Other(format!(
-                "Failed to get usage: {}",
-                response.status()
-            )));
+        let status = response.status();
+        if !status.is_success() {
+            let response_headers = response.headers().clone();
+            let body = response.bytes().await?;
+            return Err(classify_web_http_error(
+                "usage",
+                status,
+                &response_headers,
+                &body,
+            ));
         }
 
         parse_json_with_body(response, "usage").await
@@ -676,6 +736,10 @@ impl Default for ClaudeWebApiFetcher {
     }
 }
 
+fn is_cookie_authentication_failure(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::AuthRequired)
+}
+
 fn cookie_value(cookie_header: &str, name: &str) -> Option<String> {
     cookie_header.split(';').find_map(|part| {
         let (key, value) = part.trim().split_once('=')?;
@@ -848,6 +912,8 @@ mod tests {
     #[test]
     fn resolves_raw_session_key_from_primary_env_var() {
         let _guard = env_lock().lock().expect("env lock");
+        // SAFETY: running under env_lock() so no other test thread touches the
+        // environment concurrently; single-threaded w.r.t. these keys.
         unsafe {
             std::env::remove_var("CLAUDE_AI_SESSION_KEY");
             std::env::remove_var("CLAUDE_WEB_SESSION_KEY");
@@ -859,6 +925,8 @@ mod tests {
 
         assert_eq!(session_key.as_deref(), Some("sk-ant-primary"));
 
+        // SAFETY: same env_lock()-guarded mutation; restoring state after the
+        // assertions, before the lock is released.
         unsafe {
             std::env::remove_var("CLAUDE_AI_SESSION_KEY");
             std::env::remove_var("CLAUDE_WEB_SESSION_KEY");
@@ -868,6 +936,8 @@ mod tests {
     #[test]
     fn resolves_session_key_assignment_from_env_var() {
         let _guard = env_lock().lock().expect("env lock");
+        // SAFETY: env_lock() held for this whole test, so set_var/remove_var
+        // cannot race another thread's environment access.
         unsafe {
             std::env::remove_var("CLAUDE_AI_SESSION_KEY");
             std::env::remove_var("CLAUDE_WEB_SESSION_KEY");
@@ -878,6 +948,7 @@ mod tests {
 
         assert_eq!(session_key.as_deref(), Some("sk-ant-cookie-format"));
 
+        // SAFETY: cleanup while still holding the env_lock() guard.
         unsafe {
             std::env::remove_var("CLAUDE_AI_SESSION_KEY");
             std::env::remove_var("CLAUDE_WEB_SESSION_KEY");
@@ -1224,3 +1295,7 @@ mod tests {
         assert_eq!(snapshot.extra_rate_windows.len(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "cloudflare_tests.rs"]
+mod cloudflare_tests;

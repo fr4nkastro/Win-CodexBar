@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LocaleProvider } from "../i18n/LocaleProvider";
 import { buildBundle } from "../test/localeHarness";
 import {
+  normalizeResetDescription,
   useFormattedResetTime,
   type ResetTimeFormatMode,
 } from "./useFormattedResetTime";
@@ -61,6 +62,22 @@ describe("useFormattedResetTime", () => {
     vi.useRealTimers();
   });
 
+  it.each([
+    ["Reset", "Resets"],
+    ["Resets", "Resets"],
+    ["Reset Jul 10 at 2:59am (Europe/Prague)", "Resets Jul 10 at 2:59am (Europe/Prague)"],
+    ["Reset in 11m", "Resets in 11m"],
+    ["Resets in 11m", "Resets in 11m"],
+    ["Reset at 23:30 (UTC)", "Resets at 23:30 (UTC)"],
+    ["  rEsEt In 2h 5m \n", "Resets in 2h 5m"],
+    ["Reset demain à 23:30", "Resets demain à 23:30"],
+    ["at 23:30 (UTC)", "Resets at 23:30 (UTC)"],
+    ["Resetting soon", "Resets Resetting soon"],
+    ["   \n\t", null],
+  ] as const)("normalizes reset description %j", (description, expected) => {
+    expect(normalizeResetDescription(description)).toBe(expected);
+  });
+
   it("returns a complete localized countdown in relative mode", async () => {
     const target = new Date("2024-06-01T03:42:00Z").toISOString();
     await mountWithLocale(
@@ -77,11 +94,19 @@ describe("useFormattedResetTime", () => {
     expect(screen.getByTestId("reset")).toHaveTextContent("Resets in 40m");
   });
 
-  it("leaves fallback text unlabelled in relative mode", async () => {
+  it("normalizes a fallback reset description in relative mode", async () => {
     await mountWithLocale(
-      <Probe resetsAt={null} fallback="3h" relative={true} />,
+      <Probe resetsAt={null} fallback="Reset in 3h" relative={true} />,
     );
-    expect(screen.getByTestId("reset")).toHaveTextContent("3h");
+    expect(screen.getByTestId("reset")).toHaveTextContent("Resets in 3h");
+  });
+
+  it("gives a parsed reset timestamp precedence over fallback wording", async () => {
+    const target = new Date("2024-06-01T03:42:00Z").toISOString();
+    await mountWithLocale(
+      <Probe resetsAt={target} fallback="Reset in 99h" relative={true} />,
+    );
+    expect(screen.getByTestId("reset")).toHaveTextContent("Resets in 3h 42m");
   });
 
   it("returns an absolute local time without the reset label", async () => {

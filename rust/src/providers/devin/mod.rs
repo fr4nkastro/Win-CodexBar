@@ -9,6 +9,8 @@ use crate::core::{
 
 const CREDENTIAL_TARGET: &str = "codexbar-devin";
 const BASE_URL: &str = "https://api.devin.ai";
+const MISSING_ORGANIZATION_DETAIL: &str = "No organizations found for auth1 user";
+const MISSING_ORGANIZATION_MESSAGE: &str = "Devin organization context is missing. Set the organization in provider extras or DEVIN_ORG, then refresh.";
 
 pub struct DevinProvider {
     metadata: ProviderMetadata,
@@ -81,15 +83,15 @@ impl Provider for DevinProvider {
                     .header("Accept", "application/json")
                     .send()
                     .await?;
-                if response.status() == reqwest::StatusCode::UNAUTHORIZED
-                    || response.status() == reqwest::StatusCode::FORBIDDEN
-                {
-                    return Err(ProviderError::AuthRequired);
-                }
-                if !response.status().is_success() {
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.bytes().await.unwrap_or_default();
+                    if let Some(error) = auth_response_error(status, &body) {
+                        return Err(error);
+                    }
                     return Err(ProviderError::Other(format!(
                         "Devin quota returned status {}",
-                        response.status()
+                        status
                     )));
                 }
                 let value: Value = response.json().await.map_err(|e| {
@@ -113,6 +115,25 @@ fn devin_url(org: &str) -> Result<Url, ProviderError> {
     Url::parse(BASE_URL)
         .and_then(|u| u.join(&format!("{org}/billing/quota/usage")))
         .map_err(|e| ProviderError::Other(format!("Invalid Devin quota URL: {e}")))
+}
+
+fn auth_response_error(status: reqwest::StatusCode, body: &[u8]) -> Option<ProviderError> {
+    if status != reqwest::StatusCode::UNAUTHORIZED && status != reqwest::StatusCode::FORBIDDEN {
+        return None;
+    }
+
+    let is_missing_organization = serde_json::from_slice::<Value>(body)
+        .ok()
+        .is_some_and(|value| {
+            value.get("detail").and_then(Value::as_str) == Some(MISSING_ORGANIZATION_DETAIL)
+        });
+    if is_missing_organization {
+        Some(ProviderError::Other(
+            MISSING_ORGANIZATION_MESSAGE.to_string(),
+        ))
+    } else {
+        Some(ProviderError::AuthRequired)
+    }
 }
 
 fn normalized_org(raw: &str) -> String {
@@ -218,5 +239,42 @@ mod tests {
         );
 
         assert_eq!(result.cost.unwrap().used, 70.87);
+    }
+
+    #[test]
+    fn identifies_missing_organization_without_exposing_response_body() {
+        let body = br#"{"detail":"No organizations found for auth1 user","trace":"private-trace","token":"Bearer sk-private-fixture"}"#;
+
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            let error = auth_response_error(status, body).expect("authorization error");
+            assert!(matches!(error, ProviderError::Other(_)));
+            assert_eq!(error.to_string(), MISSING_ORGANIZATION_MESSAGE);
+            assert!(!error.to_string().contains("private-trace"));
+            assert!(!error.to_string().contains("sk-private-fixture"));
+        }
+    }
+
+    #[test]
+    fn keeps_unrelated_authorization_failures_as_auth_required() {
+        for body in [
+            br#"{"detail":"Unauthorized","trace":"private-trace"}"#.as_slice(),
+            br#"{"detail":"Token expired","trace":"private-trace"}"#.as_slice(),
+            br#"{"detail":"No organizations found for another user"}"#.as_slice(),
+            b"not-json".as_slice(),
+        ] {
+            let error = auth_response_error(reqwest::StatusCode::UNAUTHORIZED, body)
+                .expect("authorization error");
+            assert!(matches!(error, ProviderError::AuthRequired));
+            assert_eq!(error.to_string(), "Authentication required");
+        }
+    }
+
+    #[test]
+    fn ignores_organization_detail_on_non_authorization_responses() {
+        let body = br#"{"detail":"No organizations found for auth1 user"}"#;
+        assert!(auth_response_error(reqwest::StatusCode::NOT_FOUND, body).is_none());
     }
 }

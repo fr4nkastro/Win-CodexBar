@@ -3,6 +3,9 @@ mod pi_family_tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     // -------------------------------------------------------------------
     // Fixture + scaffolding helpers
@@ -48,7 +51,117 @@ mod pi_family_tests {
     }
 
     fn budget() -> DirectoryScanBudget {
-        DirectoryScanBudget::new(512, 1, std::time::Duration::from_secs(5))
+        DirectoryScanBudget::new(512, 1, std::time::Duration::from_secs(30))
+    }
+
+    #[test]
+    fn expired_enrichment_does_not_start_transform() {
+        let started_at = Instant::now();
+        let budget = DirectoryScanBudget::new_with_deadline_for_test(512, 1, started_at);
+        let values = vec![PathBuf::from("first.jsonl"), PathBuf::from("last.jsonl")];
+        let mut clock = || started_at;
+        let mut enriched = Vec::new();
+
+        let results = budget.compact_map_while_time_remaining_with_clock(
+            values,
+            &mut clock,
+            |path| {
+                enriched.push(path.clone());
+                Some(path)
+            },
+        );
+
+        assert!(enriched.is_empty());
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn enrichment_stops_between_items_when_deadline_expires() {
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_secs(1);
+        let budget = DirectoryScanBudget::new_with_deadline_for_test(512, 1, deadline);
+        let expired = Arc::new(AtomicBool::new(false));
+        let clock_expired = Arc::clone(&expired);
+        let mut clock = move || {
+            if clock_expired.load(Ordering::Relaxed) {
+                started_at + Duration::from_secs(2)
+            } else {
+                started_at
+            }
+        };
+        let values = vec![PathBuf::from("first.jsonl"), PathBuf::from("last.jsonl")];
+        let mut enriched = Vec::new();
+
+        let results = budget.compact_map_while_time_remaining_with_clock(
+            values,
+            &mut clock,
+            |path| {
+                enriched.push(path.clone());
+                expired.store(true, Ordering::Relaxed);
+                Some(path)
+            },
+        );
+
+        assert_eq!(enriched, vec![PathBuf::from("first.jsonl")]);
+        assert_eq!(results, enriched);
+    }
+
+    #[test]
+    fn live_enrichment_preserves_legacy_filtering_and_order() {
+        let started_at = Instant::now();
+        let budget = DirectoryScanBudget::new_with_deadline_for_test(
+            512,
+            1,
+            started_at + Duration::from_secs(1),
+        );
+        let values = vec![
+            PathBuf::from("first.jsonl"),
+            PathBuf::from("skip.txt"),
+            PathBuf::from("last.jsonl"),
+        ];
+        let expected = values
+            .iter()
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut clock = || started_at;
+
+        let actual = budget.compact_map_while_time_remaining_with_clock(
+            values,
+            &mut clock,
+            |path| {
+                (path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")).then_some(path)
+            },
+        );
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn entry_fetched_after_deadline_is_not_retained() {
+        let root = tempfile::tempdir().expect("tempdir");
+        fs::write(root.path().join("entry.jsonl"), "fixture").expect("fixture");
+        let started_at = Instant::now();
+        let mut budget = DirectoryScanBudget::new_with_deadline_for_test(
+            1,
+            1,
+            started_at + Duration::from_secs(1),
+        );
+        let clock_reads = Arc::new(AtomicUsize::new(0));
+        let clock_counter = Arc::clone(&clock_reads);
+        let mut clock = move || {
+            let read = clock_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if read < 3 {
+                started_at
+            } else {
+                started_at + Duration::from_secs(2)
+            }
+        };
+
+        let files = budget.files_with_clock(root.path(), &mut clock);
+
+        assert_eq!(clock_reads.load(Ordering::Relaxed), 3);
+        assert!(files.is_empty());
     }
 
     fn scan_helper(
@@ -681,5 +794,57 @@ mod pi_family_tests {
         assert_eq!(records.len(), 1, "duplicate ids collapse");
         assert_eq!(records[0].id, "same-id");
         assert_eq!(records[0].modified_at, now - chrono::Duration::seconds(5));
+    }
+
+    #[test]
+    fn deadline_gated_path_enrichment_preserves_records_with_time_to_spare() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let bucket = home.path().join("sessions").join("project");
+        let now = utc_ts(1_900_000_000);
+        write_jsonl_session(
+            &bucket.join("first.jsonl"),
+            PiSessionDialect::Pi,
+            "first",
+            Path::new("/tmp/project"),
+            (now - chrono::Duration::seconds(10)).into(),
+        );
+        write_jsonl_session(
+            &bucket.join("second.jsonl"),
+            PiSessionDialect::Pi,
+            "second",
+            Path::new("/tmp/project"),
+            (now - chrono::Duration::seconds(5)).into(),
+        );
+
+        let mut first_budget = DirectoryScanBudget::new_with_deadline_for_test(
+            512,
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        let mut second_budget = DirectoryScanBudget::new_with_deadline_for_test(
+            512,
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        let first = records_in_root(
+            &home.path().join("sessions"),
+            now,
+            PiSessionDialect::Pi,
+            RootLayout::ProjectDirectories,
+            &mut first_budget,
+        );
+        let second = records_in_root(
+            &home.path().join("sessions"),
+            now,
+            PiSessionDialect::Pi,
+            RootLayout::ProjectDirectories,
+            &mut second_budget,
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.iter().map(|record| record.id.as_str()).collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
     }
 }

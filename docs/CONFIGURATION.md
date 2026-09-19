@@ -72,6 +72,39 @@ $env:CODEXBAR_PROOF_MODE = "settings:menu"
 # then launch the desktop binary
 ```
 
+## Claude Code accounts
+
+In **Settings → Providers → Claude → Claude Code accounts**, use **Save current
+account** to retain an existing CLI login, or **Add account** to sign in to another
+Claude subscription in your browser. Adding an account leaves the current CLI
+login active. The native Claude Code executable must be installed.
+
+Close running Claude Code CLI sessions, select **Switch**, then reopen the CLI.
+The tray's **Claude Code accounts** submenu provides the same actions. Win-CodexBar
+saves the outgoing login before switching, including its latest refresh token.
+**Remove** forgets the saved copy; it does not log out an active CLI session.
+
+Saved logins are protected with the existing Windows DPAPI storage helper under
+`%APPDATA%\CodexBar\claude-accounts\accounts.json`. Sign-in uses a temporary
+`CLAUDE_CONFIG_DIR`; successful, failed, cancelled, and timed-out attempts clean up
+that directory. Switching updates `claudeAiOauth` in the CLI credentials file and
+`oauthAccount` in the CLI configuration, preserving other settings and MCP secrets.
+An absolute `CLAUDE_CONFIG_DIR` inherited by Win-CodexBar selects a custom CLI home.
+This account feature follows the [documented Windows Claude Code credential
+file](https://code.claude.com/docs/en/authentication), `.claude\.credentials.json`.
+It does not manage macOS Keychain logins or custom keyring integrations.
+On Windows, the isolated sign-in process belongs to a job that terminates it if
+Win-CodexBar exits. Startup also removes abandoned UUID sign-in directories;
+cleanup skips links and reparse points.
+
+These controls switch **Claude Code CLI**, not Claude Desktop or browser sessions.
+Usage monitoring still follows the provider's source settings and the
+**Allow reading Claude Code's credentials** toggle. API-key or OAuth-token
+environment overrides must be removed before using saved subscription logins.
+When credential reading is disabled, active-account status is unknown and every
+saved account remains switchable. The list does not open ambient credential or
+identity files. Explicitly selecting the already-current account is a no-op.
+
 ## Source mode
 
 CLI `--source` values on this port (see `codexbar usage --help`): `auto`, `web`, `cli`, `oauth`.

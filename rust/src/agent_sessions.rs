@@ -3,7 +3,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File};
+use std::fs::File;
 use std::future::Future;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -338,6 +338,7 @@ pub struct AgentSessionDiscovery {
     remote: RemoteSessionFetcher,
 }
 
+mod claude_desktop;
 mod focus;
 mod parsers;
 pub mod pi_family;
@@ -382,21 +383,45 @@ impl LocalAgentSessionScanner {
         let (processes, error) = match process_result {
             Ok(result) if result.timed_out => (
                 Vec::new(),
-                Some("Windows process discovery timed out; file-only sessions may still appear."),
-            ),
-            Ok(result) if result.exit_code == Some(0) => {
-                (WindowsProcessOutputParser::parse(&result.text), None)
-            }
-            Ok(_) => (
-                Vec::new(),
                 Some(
-                    "Windows process discovery failed; verify PowerShell and CIM access. File-only sessions may still appear.",
+                    "Windows process discovery timed out; file-only sessions may still appear."
+                        .to_string(),
                 ),
             ),
+            Ok(result) if result.exit_code == Some(0) => {
+                match WindowsProcessOutputParser::parse(&result.text) {
+                    Ok(processes) => (processes, None),
+                    Err(parse_error) => (
+                        Vec::new(),
+                        Some(format!(
+                            "Windows process discovery could not parse its output \
+                             ({parse_error}); file-only sessions may still appear."
+                        )),
+                    ),
+                }
+            }
+            Ok(result) => {
+                let stderr_tail = Self::error_tail(&result.stderr);
+                let hint = if stderr_tail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr_tail}")
+                };
+                (
+                    Vec::new(),
+                    Some(format!(
+                        "Windows process discovery failed with exit code {}{}; \
+                         file-only sessions may still appear.",
+                        Self::exit_code_label(result.exit_code),
+                        hint
+                    )),
+                )
+            }
             Err(_) => (
                 Vec::new(),
                 Some(
-                    "Unable to launch PowerShell for process discovery; file-only sessions may still appear.",
+                    "Unable to launch PowerShell for process discovery; file-only sessions may still appear."
+                        .to_string(),
                 ),
             ),
         };
@@ -436,6 +461,31 @@ impl LocalAgentSessionScanner {
         }
     }
 
+    /// Redacted, length-bounded tail of captured stderr for error messages.
+    fn error_tail(stderr: &str) -> String {
+        let tail = crate::logging::safe_error_message(stderr);
+        tail.lines()
+            .map(|line| {
+                if line.chars().count() > CommandRunner::MAX_LINE_CHARS {
+                    let cut: String = line.chars().take(CommandRunner::MAX_LINE_CHARS).collect();
+                    format!("{cut}\u{2026}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Human-readable exit-code label for user-facing messages.
+    fn exit_code_label(exit_code: Option<i32>) -> String {
+        exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
     fn scan_files(
         &self,
         host: &str,
@@ -452,16 +502,21 @@ impl LocalAgentSessionScanner {
         let (pi_processes, agents): (Vec<_>, Vec<_>) = agents
             .into_iter()
             .partition(|process| process.provider == Some(AgentSessionProvider::Pi));
+        let mut metadata_budget = pi_family::budget_for(&self.config);
         let mut rollouts = VecDeque::from(Self::codex_rollouts(
             codex_root,
             now.with_timezone(&Local).date_naive(),
+            &mut metadata_budget,
         ));
         let claude_count = agents
             .iter()
             .filter(|process| process.provider == Some(AgentSessionProvider::Claude))
             .count();
-        let mut claude_transcripts =
-            VecDeque::from(Self::claude_transcripts(claude_roots, claude_count));
+        let mut claude_transcripts = VecDeque::from(Self::claude_transcripts(
+            claude_roots,
+            claude_count,
+            &mut metadata_budget,
+        ));
         let mut sessions = Vec::new();
 
         for process in agents {
@@ -688,41 +743,57 @@ impl LocalAgentSessionScanner {
             .collect()
     }
 
-    fn codex_rollouts(root: &Path, today: NaiveDate) -> Vec<CodexRollout> {
-        let mut rollouts = Vec::new();
+    fn codex_rollouts(
+        root: &Path,
+        today: NaiveDate,
+        budget: &mut pi_family::DirectoryScanBudget,
+    ) -> Vec<CodexRollout> {
+        if !budget.has_time_remaining() {
+            return Vec::new();
+        }
+
+        let mut candidates = Vec::new();
         for directory in Self::codex_day_directories(root, today) {
-            let Ok(entries) = fs::read_dir(directory) else {
-                continue;
-            };
-            for entry in entries.flatten() {
+            if !budget.has_time_remaining() {
+                break;
+            }
+            let entries = budget.files(&directory);
+            let day_candidates = budget.compact_map_while_time_remaining(entries, |entry| {
                 let path = entry.path();
                 let is_rollout = path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with("rollout-"));
                 if !is_rollout || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                    continue;
+                    return None;
                 }
-                let Some(line) = CodexRolloutFirstLineParser::read_first_line(&path) else {
-                    continue;
-                };
-                let Some(metadata) = CodexRolloutFirstLineParser::parse(&line) else {
-                    continue;
-                };
-                let Some(modified_at) = entry
+                let modified_at = entry
                     .metadata()
                     .ok()
                     .and_then(|metadata| metadata.modified().ok())
-                    .map(DateTime::<Utc>::from)
-                else {
-                    continue;
-                };
-                rollouts.push(CodexRollout {
-                    path,
-                    modified_at,
-                    metadata,
-                });
+                    .map(DateTime::<Utc>::from)?;
+                Some((path, modified_at))
+            });
+            candidates.extend(day_candidates);
+        }
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
+
+        let mut rollouts = Vec::new();
+        for (path, modified_at) in candidates {
+            if !budget.has_time_remaining() {
+                break;
             }
+            let Some(line) = CodexRolloutFirstLineParser::read_first_line(&path) else {
+                continue;
+            };
+            let Some(metadata) = CodexRolloutFirstLineParser::parse(&line) else {
+                continue;
+            };
+            rollouts.push(CodexRollout {
+                path,
+                modified_at,
+                metadata,
+            });
         }
         rollouts.sort_by_key(|rollout| std::cmp::Reverse(rollout.modified_at));
         rollouts
@@ -731,50 +802,78 @@ impl LocalAgentSessionScanner {
     fn claude_transcripts(
         roots: &[PathBuf],
         live_process_count: usize,
+        budget: &mut pi_family::DirectoryScanBudget,
     ) -> Vec<ClaudeTranscriptCandidate> {
-        if live_process_count == 0 {
+        if live_process_count == 0 || !budget.has_time_remaining() {
             return Vec::new();
         }
+        let desktop_roots = claude_desktop::ClaudeDesktopProjectsLocator::roots(budget);
+        Self::claude_transcripts_from_roots(roots, desktop_roots, live_process_count, budget)
+    }
+
+    fn claude_transcripts_from_roots(
+        roots: &[PathBuf],
+        additional_roots: Vec<PathBuf>,
+        live_process_count: usize,
+        budget: &mut pi_family::DirectoryScanBudget,
+    ) -> Vec<ClaudeTranscriptCandidate> {
+        if live_process_count == 0 || !budget.has_time_remaining() {
+            return Vec::new();
+        }
+
+        let mut roots = roots.to_vec();
+        roots.extend(additional_roots);
+        roots.sort();
+        roots.dedup();
+
         let mut files = Vec::new();
         for root in roots {
-            let Ok(projects) = fs::read_dir(root) else {
-                continue;
-            };
-            for project in projects.flatten() {
-                let Ok(entries) = fs::read_dir(project.path()) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
+            let projects = budget.child_directories(&root);
+            for project in projects {
+                if !budget.has_time_remaining() {
+                    break;
+                }
+                let entries = budget.files(&project.path());
+                let candidates = budget.compact_map_while_time_remaining(entries, |entry| {
                     let path = entry.path();
                     if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                        continue;
+                        return None;
                     }
-                    let Some(modified_at) = entry
+                    let modified_at = entry
                         .metadata()
                         .ok()
                         .and_then(|metadata| metadata.modified().ok())
-                        .map(DateTime::<Utc>::from)
-                    else {
-                        continue;
-                    };
-                    files.push((path, modified_at));
-                }
+                        .map(DateTime::<Utc>::from)?;
+                    Some((path, modified_at))
+                });
+                files.extend(candidates);
+            }
+            if !budget.has_time_remaining() {
+                break;
             }
         }
         files.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| rhs.0.cmp(&lhs.0)));
-        files
-            .into_iter()
-            .take(live_process_count)
-            .filter_map(|(path, modified_at)| {
-                let file = File::open(&path).ok()?;
-                let metadata = ClaudeTranscriptMetadataParser::parse(file)?;
-                Some(ClaudeTranscriptCandidate {
-                    path,
-                    modified_at,
-                    metadata,
-                })
-            })
-            .collect()
+        let mut transcripts = Vec::new();
+        for (path, modified_at) in files.into_iter().take(live_process_count) {
+            if !budget.has_time_remaining() {
+                break;
+            }
+            let Ok(file) = File::open(&path) else {
+                continue;
+            };
+            if !budget.has_time_remaining() {
+                break;
+            }
+            let Some(metadata) = ClaudeTranscriptMetadataParser::parse(file) else {
+                continue;
+            };
+            transcripts.push(ClaudeTranscriptCandidate {
+                path,
+                modified_at,
+                metadata,
+            });
+        }
+        transcripts
     }
 }
 

@@ -33,7 +33,7 @@ Install with Windows Package Manager:
 winget install Finesssee.Win-CodexBar
 ```
 
-Or download the latest installer/portable build from [GitHub Releases](https://github.com/Finesssee/Win-CodexBar/releases).
+Or download the latest installer/portable build from [GitHub Releases](https://github.com/nesszer/Win-CodexBar/releases).
 
 - Installer: `CodexBar-<version>-Setup.exe`
 - Portable: `CodexBar-<version>-portable.exe`
@@ -43,8 +43,8 @@ Winget distribution is approved through [microsoft/winget-pkgs](https://github.c
 
 ## Code signing
 
-> **Code signing:** Free signing via SignPath.io (certificate: SignPath Foundation) is **planned, pending onboarding — not yet wired into the release pipeline**. See [docs/CODE_SIGNING.md](docs/CODE_SIGNING.md) for the signing policy.
-> Windows release installers are currently unsigned, which may cause an incorrect SmartScreen/Defender alert — verify the SHA-256 published alongside each release; see [docs/PRIVACY.md](docs/PRIVACY.md) for data handling.
+> **Code signing:** SignPath.io is wired into the GitHub Actions release path, but production signing remains fail-closed until the Release certificate 2026 is issued and the `release-signing` policy becomes valid. See [docs/CODE_SIGNING.md](docs/CODE_SIGNING.md) for the signing policy.
+> The v0.60.3 release is immutable and unsigned; verify its SHA-256 files. The first signed release will be the next normal version after SignPath onboarding.
 
 ## First Run
 
@@ -135,7 +135,7 @@ The UI and contributor reporting currently support:
 
 ```powershell
 # Prerequisites: Node.js + pnpm. Rust and MinGW are installed by the script when needed.
-git clone https://github.com/Finesssee/Win-CodexBar.git
+git clone https://github.com/nesszer/Win-CodexBar.git
 cd Win-CodexBar
 .\scripts\dev.ps1
 ```

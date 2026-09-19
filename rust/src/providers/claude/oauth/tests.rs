@@ -1,4 +1,8 @@
-use super::{ClaudeOAuthCredentials, ClaudeOAuthFetcher, OAuthUsageResponse, UsageWindow};
+use super::{
+    ClaudeOAuthCredentials, ClaudeOAuthFetcher, OAuthUsageResponse, UsageWindow,
+    credential_identity,
+};
+use base64::Engine;
 use reqwest::header::HeaderValue;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -6,6 +10,39 @@ use std::time::Duration;
 /// Serializes the tests that mutate the process-global rate-limit gate so the
 /// parallel test runner cannot interleave their `record`/`clear` calls.
 static RATE_LIMIT_GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn test_credentials(access_token: &str) -> ClaudeOAuthCredentials {
+    ClaudeOAuthCredentials {
+        access_token: access_token.to_string(),
+        refresh_token: None,
+        expires_at: None,
+        scopes: vec!["user:profile".to_string()],
+        rate_limit_tier: None,
+    }
+}
+
+#[test]
+fn credential_identity_uses_jwt_subject_when_available() {
+    let payload =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"account-123"}"#);
+    let identity = credential_identity(&test_credentials(&format!("header.{payload}.signature")));
+
+    assert_eq!(identity.as_deref(), Some("claude-account:account-123"));
+}
+
+#[test]
+fn opaque_credential_identity_is_a_non_secret_fingerprint() {
+    let token = "opaque-claude-token";
+    let identity = credential_identity(&test_credentials(token)).expect("identity");
+
+    assert_eq!(
+        identity,
+        format!(
+            "claude-credential:{}",
+            crate::core::sha256_hex(token.as_bytes())
+        )
+    );
+}
 
 #[test]
 fn keeps_sub_one_utilization_in_percent_units() {
@@ -45,6 +82,27 @@ fn preserves_existing_percentage_utilization() {
     let rate = ClaudeOAuthFetcher::to_rate_window(&window, Some(300)).expect("rate window");
 
     assert!((rate.used_percent - 23.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn missing_oauth_session_is_informational_and_keeps_weekly_lane() {
+    let response: OAuthUsageResponse = serde_json::from_str(
+        r#"{
+            "seven_day": {"utilization": 51.0, "resets_at": "2026-08-20T12:00:00Z"}
+        }"#,
+    )
+    .expect("OAuth response without a session lane should parse");
+
+    let usage =
+        ClaudeOAuthFetcher::new().build_usage_snapshot(&response, &test_credentials("token"));
+
+    assert!(usage.primary.is_informational);
+    assert_eq!(usage.primary.window_minutes, Some(300));
+    assert_eq!(
+        usage.primary.reset_description.as_deref(),
+        Some("No active 5h session")
+    );
+    assert_eq!(usage.secondary.expect("weekly lane").used_percent, 51.0);
 }
 
 #[test]
@@ -482,6 +540,24 @@ fn transient_refresh_failure_gets_5min_backoff() {
         super::active_refresh_backoff(&source, now + Duration::from_secs(301), None),
         None
     );
+}
+
+#[test]
+fn switching_accounts_clears_the_credential_files_transient_cooldown() {
+    let source = unique_source("switch");
+    let super::credentials_store::CredentialSource::File(path) = &source else {
+        panic!("file source")
+    };
+    let now = std::time::Instant::now();
+    super::record_refresh_backoff(
+        &source,
+        super::refresh::RefreshFailureKind::Transient,
+        now,
+        Some("old-token"),
+    );
+    assert!(super::active_refresh_backoff(&source, now, Some("new-token")).is_some());
+    super::clear_account_cache(path);
+    assert!(super::active_refresh_backoff(&source, now, Some("new-token")).is_none());
 }
 
 #[test]

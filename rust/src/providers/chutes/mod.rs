@@ -152,9 +152,16 @@ fn percent_from_object(map: &serde_json::Map<String, Value>) -> Option<f64> {
         "percent_used",
         "percentUsed",
     ] {
-        if let Some(v) = map.get(key).and_then(Value::as_f64) {
-            return Some(if v <= 1.0 { v * 100.0 } else { v });
-        }
+        let Some(v) = map.get(key).and_then(Value::as_f64) else {
+            continue;
+        };
+        // Chutes usage/quota payloads (GET /users/me/subscription_usage, and
+        // whatever `collect_windows` recurses into) carry whole percent values
+        // in 0..=100 — no documented field is a 0..=1 fraction. Rescaling
+        // 0..=1 as fractions turned a real 1% into a false 100% exhausted
+        // state (#408; same class as #247 / upstream #3216, fixed for
+        // opencodego in #407).
+        return Some(v.clamp(0.0, 100.0));
     }
     let used = first_f64(map, &["used", "usage", "current_usage", "currentUsage"]);
     let limit = first_f64(
@@ -256,7 +263,13 @@ fn epoch_to_datetime(value: f64) -> Option<DateTime<Utc>> {
     } else {
         value
     };
-    Utc.timestamp_opt(seconds as i64, 0).single()
+    // Epoch seconds; the sub-second fraction is below timestamp resolution.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "epoch seconds; sub-second fraction below timestamp resolution"
+    )]
+    let whole_seconds = seconds as i64;
+    Utc.timestamp_opt(whole_seconds, 0).single()
 }
 
 fn first_f64(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64> {
@@ -273,7 +286,14 @@ fn first_str<'a>(map: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Opti
 
 fn format_quota_amount(value: f64) -> String {
     if (value - value.round()).abs() < 0.0001 {
-        format!("{}", value.round() as i64)
+        // Guarded above: value is within 0.0001 of a whole number, so the
+        // fractional part is zero.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "whole-number guard above; fractional part is zero"
+        )]
+        let whole = value.round() as i64;
+        format!("{}", whole)
     } else {
         let mut text = format!("{value:.2}");
         while text.contains('.') && text.ends_with('0') {
@@ -347,5 +367,29 @@ mod tests {
             snapshot.primary.resets_at,
             Some(Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap())
         );
+    }
+
+    #[test]
+    fn usage_percent_one_stays_one() {
+        let snapshot = snapshot_from_usage(&serde_json::json!({
+            "quotas": [{"usage_percent": 1, "limit": 100}]
+        }));
+        assert_eq!(snapshot.primary.used_percent, 1.0);
+    }
+
+    #[test]
+    fn usage_percent_half_stays_half() {
+        let snapshot = snapshot_from_usage(&serde_json::json!({
+            "quotas": [{"usage_percent": 0.5, "limit": 100}]
+        }));
+        assert_eq!(snapshot.primary.used_percent, 0.5);
+    }
+
+    #[test]
+    fn usage_percent_hundred_stays_hundred() {
+        let snapshot = snapshot_from_usage(&serde_json::json!({
+            "quotas": [{"usage_percent": 100, "limit": 100}]
+        }));
+        assert_eq!(snapshot.primary.used_percent, 100.0);
     }
 }

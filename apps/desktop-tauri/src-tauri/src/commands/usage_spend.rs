@@ -62,17 +62,118 @@ pub struct UsageSpendSummary {
     pub contract: SpendContract,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct CachedUsageSpendSummary {
     key: String,
     summary: UsageSpendSummary,
+    refresh_owner: Option<UsageSpendRefreshOwner>,
 }
 
-static USAGE_SPEND_SUMMARY_CACHE: OnceLock<Mutex<Option<CachedUsageSpendSummary>>> =
-    OnceLock::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageSpendRefreshPhase {
+    Indexing,
+    Paused,
+}
 
-fn usage_spend_summary_cache() -> &'static Mutex<Option<CachedUsageSpendSummary>> {
-    USAGE_SPEND_SUMMARY_CACHE.get_or_init(|| Mutex::new(None))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsageSpendRefreshOwner {
+    generation: u64,
+    scope: String,
+}
+
+#[derive(Default)]
+struct UsageSpendCoordinator {
+    next_generation: u64,
+    current: Option<(UsageSpendRefreshOwner, UsageSpendRefreshPhase)>,
+    cache: Option<CachedUsageSpendSummary>,
+}
+
+impl UsageSpendCoordinator {
+    fn begin(&mut self, scope: String) -> UsageSpendRefreshOwner {
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let owner = UsageSpendRefreshOwner {
+            generation: self.next_generation,
+            scope,
+        };
+        self.current = Some((owner.clone(), UsageSpendRefreshPhase::Indexing));
+        owner
+    }
+
+    fn pause(&mut self, owner: &UsageSpendRefreshOwner) {
+        if let Some((current, phase)) = self.current.as_mut()
+            && current == owner
+            && *phase == UsageSpendRefreshPhase::Indexing
+        {
+            *phase = UsageSpendRefreshPhase::Paused;
+        }
+    }
+
+    fn is_current(&self, owner: &UsageSpendRefreshOwner) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|(current, _)| current == owner)
+    }
+
+    fn clear_if_indexing(&mut self, owner: &UsageSpendRefreshOwner) -> bool {
+        let Some((current, phase)) = self.current.as_ref() else {
+            return false;
+        };
+        if current != owner || *phase != UsageSpendRefreshPhase::Indexing {
+            return false;
+        }
+        self.current = None;
+        true
+    }
+}
+
+static USAGE_SPEND_COORDINATOR: OnceLock<Mutex<UsageSpendCoordinator>> = OnceLock::new();
+
+fn usage_spend_coordinator() -> &'static Mutex<UsageSpendCoordinator> {
+    USAGE_SPEND_COORDINATOR.get_or_init(|| Mutex::new(UsageSpendCoordinator::default()))
+}
+
+fn clear_summary_refreshing(summary: &mut UsageSpendSummary) {
+    for row in &mut summary.rows {
+        row.refreshing = false;
+        row.stale_updated_at = None;
+    }
+}
+
+fn summary_is_refreshing(summary: &UsageSpendSummary) -> bool {
+    summary.rows.iter().any(|row| row.refreshing)
+}
+
+fn mark_refresh_paused_if_codex_scan_paused(
+    coordinator: &mut UsageSpendCoordinator,
+    owner: &UsageSpendRefreshOwner,
+    refreshing: bool,
+    codex_scan_pause_reason: Option<&codexbar::core::CodexScanPauseReason>,
+) {
+    if refreshing && codex_scan_pause_reason.is_some() {
+        coordinator.pause(owner);
+    }
+}
+
+/// Retire an invalidated owner without allowing it to clear a replacement.
+fn clear_usage_spend_refresh_if_owned(owner: &UsageSpendRefreshOwner) {
+    let Ok(mut coordinator) = usage_spend_coordinator().lock() else {
+        return;
+    };
+    if !coordinator.clear_if_indexing(owner) {
+        return;
+    }
+    if let Some(existing) = coordinator.cache.as_mut()
+        && existing.refresh_owner.as_ref() == Some(owner)
+    {
+        clear_summary_refreshing(&mut existing.summary);
+        existing.refresh_owner = None;
+    }
+}
+
+struct BuiltUsageSpendSummary {
+    key: String,
+    summary: UsageSpendSummary,
+    refresh_owner: Option<UsageSpendRefreshOwner>,
 }
 
 #[tauri::command]
@@ -88,11 +189,29 @@ pub async fn get_usage_spend_summary(
 
     let selected_days = history_days.unwrap_or(30);
     let force_refresh = force_refresh.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
+    let built = tauri::async_runtime::spawn_blocking(move || {
         build_usage_spend_summary_cached(&cached, selected_days, force_refresh)
     })
     .await
-    .map_err(|e| format!("usage spend worker failed: {e}"))?
+    .map_err(|e| format!("usage spend worker failed: {e}"))??;
+    let current_cached = state
+        .lock()
+        .map_err(|e| e.to_string())
+        .map(|guard| guard.provider_cache.clone())?;
+    let current_key = usage_spend_cache_key(
+        &current_cached,
+        selected_days,
+        &codexbar::settings::Settings::load(),
+    );
+    if current_key != built.key {
+        if let Some(owner) = built.refresh_owner.as_ref() {
+            clear_usage_spend_refresh_if_owned(owner);
+        }
+        let mut summary = built.summary;
+        clear_summary_refreshing(&mut summary);
+        return Ok(summary);
+    }
+    Ok(built.summary)
 }
 
 #[tauri::command]
@@ -112,29 +231,91 @@ fn build_usage_spend_summary_cached(
     cached: &[ProviderUsageSnapshot],
     selected_days: u32,
     force_refresh: bool,
-) -> Result<UsageSpendSummary, String> {
-    let key = usage_spend_cache_key(cached, selected_days);
-    let mut guard = usage_spend_summary_cache()
+) -> Result<BuiltUsageSpendSummary, String> {
+    let settings = codexbar::settings::Settings::load();
+    let key = usage_spend_cache_key(cached, selected_days, &settings);
+    {
+        let guard = usage_spend_coordinator()
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if !force_refresh
+            && let Some(existing) = guard.cache.as_ref()
+            && existing.key == key
+        {
+            return Ok(BuiltUsageSpendSummary {
+                key: existing.key.clone(),
+                summary: existing.summary.clone(),
+                refresh_owner: existing.refresh_owner.clone(),
+            });
+        }
+    }
+    let owner = {
+        let mut coordinator = usage_spend_coordinator()
+            .lock()
+            .map_err(|error| error.to_string())?;
+        coordinator.begin(key.clone())
+    };
+    let summary = build_usage_spend_summary(cached, selected_days, &settings, force_refresh);
+    let refreshing = summary_is_refreshing(&summary);
+    let codex_scan_pause_reason =
+        codexbar::core::JsonlScanner::load_cache_status(codexbar::core::ProviderId::Codex, None)
+            .codex_scan_pause_reason;
+
+    let mut coordinator = usage_spend_coordinator()
         .lock()
         .map_err(|error| error.to_string())?;
-    if !force_refresh
-        && let Some(existing) = guard.as_ref()
-        && existing.key == key
-    {
-        return Ok(existing.summary.clone());
+    mark_refresh_paused_if_codex_scan_paused(
+        &mut coordinator,
+        &owner,
+        refreshing,
+        codex_scan_pause_reason.as_ref(),
+    );
+    if !coordinator.is_current(&owner) {
+        let mut summary = summary;
+        clear_summary_refreshing(&mut summary);
+        return Ok(BuiltUsageSpendSummary {
+            key,
+            summary,
+            refresh_owner: Some(owner),
+        });
     }
-    // Hold the cache mutex while building: callers for the same app revision
-    // coalesce behind this single scan instead of starting parallel rescans.
-    let summary = build_usage_spend_summary(cached, selected_days);
-    *guard = Some(CachedUsageSpendSummary {
-        key,
+    if !refreshing {
+        coordinator.clear_if_indexing(&owner);
+    }
+    let refresh_owner = refreshing.then(|| owner.clone());
+    coordinator.cache = Some(CachedUsageSpendSummary {
+        key: key.clone(),
         summary: summary.clone(),
+        refresh_owner: refresh_owner.clone(),
     });
-    Ok(summary)
+    Ok(BuiltUsageSpendSummary {
+        key,
+        summary,
+        refresh_owner,
+    })
 }
 
-fn usage_spend_cache_key(cached: &[ProviderUsageSnapshot], selected_days: u32) -> String {
-    let settings = codexbar::settings::Settings::load();
+fn usage_spend_cache_key(
+    cached: &[ProviderUsageSnapshot],
+    selected_days: u32,
+    settings: &codexbar::settings::Settings,
+) -> String {
+    usage_spend_cache_key_with_privacy(
+        cached,
+        selected_days,
+        settings.open_codex_usage_logs_enabled,
+        settings.hide_native_codex_cost_when_open_codex_present,
+        settings.hide_personal_info,
+    )
+}
+
+fn usage_spend_cache_key_with_privacy(
+    cached: &[ProviderUsageSnapshot],
+    selected_days: u32,
+    include_opencodex: bool,
+    hide_native: bool,
+    hide_personal_info: bool,
+) -> String {
     let mut revisions: Vec<String> = cached
         .iter()
         .map(|snapshot| {
@@ -162,11 +343,12 @@ fn usage_spend_cache_key(cached: &[ProviderUsageSnapshot], selected_days: u32) -
         .collect();
     revisions.sort();
     format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}",
         chrono::Local::now().date_naive(),
         selected_days,
-        settings.open_codex_usage_logs_enabled,
-        settings.hide_native_codex_cost_when_open_codex_present,
+        include_opencodex,
+        hide_native,
+        hide_personal_info,
         revisions.join(";")
     )
 }
@@ -174,32 +356,30 @@ fn usage_spend_cache_key(cached: &[ProviderUsageSnapshot], selected_days: u32) -
 fn build_usage_spend_summary(
     cached: &[ProviderUsageSnapshot],
     selected_days: u32,
+    settings: &codexbar::settings::Settings,
+    force_refresh: bool,
 ) -> UsageSpendSummary {
-    let settings = codexbar::settings::Settings::load();
     let include_opencodex = settings.open_codex_usage_logs_enabled;
     let hide_native = settings.hide_native_codex_cost_when_open_codex_present;
-
-    let codex_cache =
-        codexbar::core::JsonlScanner::load_cache(codexbar::core::ProviderId::Codex, None);
-    let codex_stale = !codex_cache.days.is_empty() && codex_cache.previous_report.is_some();
-    let codex_stale_updated_at = codex_stale
-        .then(|| {
-            codex_cache
-                .previous_report
-                .as_ref()
-                .and_then(|r| r.updated_at.clone())
-        })
-        .flatten();
 
     // Upstream 0.55.0 #3105: independent provider baselines load in parallel.
     // Keep each provider's 7d/30d scans serial so they can safely share that
     // provider's incremental cache, while Codex and Claude run concurrently.
+    let codex_scan_options = if force_refresh {
+        codexbar::core::CostScanOptions::app_driven()
+    } else {
+        codexbar::core::CostScanOptions::default()
+    };
     let ((codex_7_summary, codex_30_summary), (claude_7_summary, claude_30_summary)) =
         std::thread::scope(|scope| {
-            let codex = scope.spawn(|| {
+            let codex = scope.spawn(move || {
                 (
-                    CostScanner::new(7).scan_codex(),
-                    CostScanner::new(30).scan_codex(),
+                    CostScanner::new(7)
+                        .with_options(codex_scan_options)
+                        .scan_codex(),
+                    CostScanner::new(30)
+                        .with_options(codex_scan_options)
+                        .scan_codex(),
                 )
             });
             let claude = scope.spawn(|| {
@@ -214,11 +394,21 @@ fn build_usage_spend_summary(
             )
         });
 
+    let codex_stale = !codex_30_summary.history_coverage_established;
+    let codex_stale_updated_at = codex_stale
+        .then(|| {
+            codexbar::core::JsonlScanner::load_cache_status(codexbar::core::ProviderId::Codex, None)
+                .previous_report
+                .and_then(|report| report.updated_at)
+        })
+        .flatten();
+
     let codex_7_contract = build_local_spend_contract_from_summary(
         "codex",
         7,
         include_opencodex,
         hide_native,
+        settings.hide_personal_info,
         codex_7_summary.clone(),
     );
     let codex_30_contract = build_local_spend_contract_from_summary(
@@ -226,6 +416,7 @@ fn build_usage_spend_summary(
         30,
         include_opencodex,
         hide_native,
+        settings.hide_personal_info,
         codex_30_summary.clone(),
     );
 
@@ -351,13 +542,16 @@ fn build_usage_spend_summary(
                 spend
             }
             "antigravity" => {
+                use codexbar::providers::antigravity::local_sessions::LocalHistoryCoverage;
                 let seven = codexbar::providers::antigravity::local_sessions::summarize(7);
                 let thirty = codexbar::providers::antigravity::local_sessions::summarize(30);
                 let mut spend = cached_spend(cached_snapshot);
-                spend.seven_day_tokens = (seven.session_count > 0).then_some(seven.total_tokens);
-                spend.thirty_day_tokens = (thirty.session_count > 0).then_some(thirty.total_tokens);
-                if thirty.session_count > 0 {
-                    spend.source = "local Antigravity sessions".to_string();
+                spend.seven_day_tokens = matches!(seven.coverage, LocalHistoryCoverage::Complete)
+                    .then_some(seven.total_tokens);
+                spend.thirty_day_tokens = matches!(thirty.coverage, LocalHistoryCoverage::Complete)
+                    .then_some(thirty.total_tokens);
+                if matches!(thirty.coverage, LocalHistoryCoverage::Complete) {
+                    spend.source = "local Antigravity history".to_string();
                 }
                 spend
             }
@@ -405,13 +599,16 @@ fn build_usage_spend_summary(
     let selected_summary: CostSummary = match history_days {
         7 => codex_7_summary,
         30 => codex_30_summary,
-        days => CostScanner::new(days).scan_codex(),
+        days => CostScanner::new(days)
+            .with_options(codex_scan_options)
+            .scan_codex(),
     };
     let contract = build_local_spend_contract_from_summary(
         "codex",
         history_days,
         include_opencodex,
         hide_native,
+        settings.hide_personal_info,
         selected_summary,
     );
     UsageSpendSummary { rows, contract }
@@ -502,5 +699,59 @@ fn cached_spend(snapshot: Option<&ProviderUsageSnapshot>) -> SpendValues {
         },
         refreshing: false,
         stale_updated_at: None,
+    }
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::*;
+
+    #[test]
+    fn invalidated_owner_clears_orphaned_indexing_activity() {
+        let mut coordinator = UsageSpendCoordinator::default();
+        let owner = coordinator.begin("account:old".to_string());
+
+        assert!(coordinator.clear_if_indexing(&owner));
+        assert!(!coordinator.is_current(&owner));
+    }
+
+    #[test]
+    fn old_owner_cleanup_cannot_clear_a_replacement() {
+        let mut coordinator = UsageSpendCoordinator::default();
+        let old = coordinator.begin("account:old".to_string());
+        let replacement = coordinator.begin("account:new".to_string());
+
+        assert!(!coordinator.clear_if_indexing(&old));
+        assert!(coordinator.is_current(&replacement));
+    }
+
+    #[test]
+    fn settings_replacement_preserves_an_intentional_pause() {
+        let mut coordinator = UsageSpendCoordinator::default();
+        let old = coordinator.begin("settings:old".to_string());
+        let replacement = coordinator.begin("settings:new".to_string());
+        let status = codexbar::core::CachedCostReadStatus {
+            codex_scan_pause_reason: Some(codexbar::core::CodexScanPauseReason::NoProgress),
+            ..Default::default()
+        };
+        mark_refresh_paused_if_codex_scan_paused(
+            &mut coordinator,
+            &replacement,
+            true,
+            status.codex_scan_pause_reason.as_ref(),
+        );
+
+        assert!(!coordinator.clear_if_indexing(&old));
+        assert_eq!(
+            coordinator.current.as_ref().map(|(_, phase)| *phase),
+            Some(UsageSpendRefreshPhase::Paused)
+        );
+    }
+
+    #[test]
+    fn privacy_mode_is_part_of_usage_spend_cache_identity() {
+        let public = usage_spend_cache_key_with_privacy(&[], 30, false, false, false);
+        let private = usage_spend_cache_key_with_privacy(&[], 30, false, false, true);
+        assert_ne!(public, private);
     }
 }

@@ -8,6 +8,8 @@ function provider(extra = true): ProviderDetail {
     id: "copilot",
     displayName: "GitHub Copilot",
     enabled: true,
+    autoResumeAfterQuotaReset: false,
+    autoResumeSupported: false,
     email: null,
     plan: null,
     authType: null,
@@ -24,6 +26,7 @@ function provider(extra = true): ProviderDetail {
     cost: null,
     pace: null,
     lastError: null,
+    errorState: null,
     dashboardUrl: null,
     statusPageUrl: null,
     buyCreditsUrl: null,
@@ -47,6 +50,36 @@ function rateWindow(usedPercent: number) {
 }
 
 describe("MenuBarMetricSection", () => {
+  it("offers Monthly for OpenCode Go only after a tertiary window is observed", () => {
+    const base = provider(false);
+    base.id = "opencodego";
+    base.displayName = "OpenCode Go";
+    base.tertiary = null;
+    const { rerender } = render(
+      <MenuBarMetricSection
+        provider={base}
+        providerMetrics={{}}
+        disabled={false}
+        t={(key) => key}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("option", { name: "DetailWindowTertiary" })).not.toBeInTheDocument();
+
+    const observed = { ...base, tertiary: rateWindow(37) };
+    rerender(
+      <MenuBarMetricSection
+        provider={observed}
+        providerMetrics={{}}
+        disabled={false}
+        t={(key) => key}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("option", { name: "DetailWindowTertiary" })).toBeInTheDocument();
+  });
   it("offers extra usage when a provider has extra rate windows", () => {
     const onChange = vi.fn();
     render(

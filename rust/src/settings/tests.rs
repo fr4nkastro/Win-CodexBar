@@ -518,6 +518,7 @@ fn test_api_key_provider_catalog_includes_token_providers() {
         ProviderId::Groq,
         ProviderId::LLMProxy,
         ProviderId::Xai,
+        ProviderId::Meta,
     ] {
         assert!(
             providers.iter().any(|provider| provider.id == id),
@@ -955,6 +956,7 @@ fn test_provider_configs_roundtrip() {
     settings.set_openai_web_extras(ProviderId::Codex, false);
     settings.set_historical_tracking(ProviderId::Codex, true);
     settings.set_avoid_keychain_prompts(ProviderId::Claude, true);
+    settings.set_auto_resume_after_quota_reset(ProviderId::Codex, true);
 
     let json = serde_json::to_string(&settings).unwrap();
     // The legacy flat fields must NOT appear in serialized output.
@@ -982,6 +984,7 @@ fn test_provider_configs_roundtrip() {
     assert!(!loaded.openai_web_extras(ProviderId::Codex));
     assert!(loaded.historical_tracking(ProviderId::Codex));
     assert!(loaded.avoid_keychain_prompts(ProviderId::Claude));
+    assert!(loaded.auto_resume_after_quota_reset(ProviderId::Codex));
     assert_eq!(
         loaded.provider_configs.get(&ProviderId::Codex),
         settings.provider_configs.get(&ProviderId::Codex)
@@ -1038,6 +1041,8 @@ fn test_per_provider_defaults_applied() {
     assert!(settings.openai_web_extras(ProviderId::Codex));
     assert!(!settings.historical_tracking(ProviderId::Codex));
     assert!(!settings.avoid_keychain_prompts(ProviderId::Claude));
+    assert!(!settings.auto_resume_after_quota_reset(ProviderId::Codex));
+    assert!(!settings.auto_resume_after_quota_reset(ProviderId::Claude));
 }
 
 #[test]

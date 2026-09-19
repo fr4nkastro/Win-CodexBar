@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useReducer } from "react";
 import type { SettingsSnapshot, SettingsUpdate } from "../../../types/bridge";
 import { useLocale } from "../../../hooks/useLocale";
+import { providerAllowsPace } from "../../../lib/providerPace";
 import {
   getCredentialStorageStatus,
   getProviderCookieSourceOptions,
@@ -23,12 +24,14 @@ import {
 import { buildSubtitle } from "./providerDetailFormat";
 import { IdentitySection } from "./sections/IdentitySection";
 import { UsageSection } from "./sections/UsageSection";
+import { AutoResumeSection } from "./sections/AutoResumeSection";
 import { PaceSection } from "./sections/PaceSection";
 import { CostSection } from "./sections/CostSection";
 import { QuickActionsSection } from "./sections/QuickActionsSection";
 import { ChartsSection } from "./sections/charts/ChartsSection";
 import { CookieSourceSection } from "./sections/CookieSourceSection";
-import { GrokUsageSourceSection } from "./sections/GrokUsageSourceSection";
+import { UsageSourceSection } from "./sections/UsageSourceSection";
+import { shouldShowCookieSource } from "./sections/usageSourcePolicy";
 import { RegionSection } from "./sections/RegionSection";
 import { CodexUsageOptions } from "./sections/credentials/CodexUsageOptions";
 import { CodexAccountsSection } from "./sections/credentials/CodexAccountsSection";
@@ -255,11 +258,6 @@ export function ProviderDetailPane({
   const handleOpenStatusPage = () => {
     void openProviderStatusPage(detail.id).catch(setErr);
   };
-  const handleCopyError = () => {
-    if (detail.lastError && navigator.clipboard) {
-      void navigator.clipboard.writeText(detail.lastError);
-    }
-  };
   const handleBuyCredits = () => {
     if (detail.buyCreditsUrl) {
       void openProviderDashboard(detail.id).catch(setErr);
@@ -270,19 +268,25 @@ export function ProviderDetailPane({
     <div className="provider-detail">
       <IdentitySection provider={detail} subtitle={subtitle} t={t} />
 
+      {detail.id === "codex" && <CodexAccountsSection t={t} />}
+      {detail.id === "claude" && <ClaudeAccountsSection t={t} />}
+
       {detail.lastError && (
-        <ProviderIssueNotice
-          detail={detail}
-          message={detail.lastError}
-          onCopy={handleCopyError}
-          t={t}
-        />
+        <ProviderIssueNotice detail={detail} t={t} />
       )}
 
       <UsageSection
         provider={detail}
         resetTimeRelative={resetTimeRelative}
         t={t}
+      />
+      <AutoResumeSection
+        providerId={detail.id}
+        enabled={detail.autoResumeAfterQuotaReset}
+        available={detail.autoResumeSupported}
+        disabled={settingsDisabled}
+        t={t}
+        onChanged={reload}
       />
       {detail.id === "wayfinder" && (
         <WayfinderGatewaySection
@@ -310,22 +314,31 @@ export function ProviderDetailPane({
         t={t}
         onChange={onSettingsChange}
       />
-      <PaceSection pace={detail.pace} t={t} />
+      <PaceSection
+        pace={
+          providerAllowsPace(detail.id, detail.sourceLabel)
+            ? detail.pace
+            : null
+        }
+        t={t}
+      />
       <CostSection cost={detail.cost} t={t} />
 
-      <GrokUsageSourceSection
+      <UsageSourceSection
         providerId={detail.id}
         currentValue={detail.usageSource}
         t={t}
         onChanged={reload}
       />
-      <CookieSourceSection
-        providerId={detail.id}
-        currentValue={detail.cookieSource}
-        options={cookieOptions}
-        t={t}
-        onChanged={reload}
-      />
+      {shouldShowCookieSource(detail.id, detail.usageSource) && (
+        <CookieSourceSection
+          providerId={detail.id}
+          currentValue={detail.cookieSource}
+          options={cookieOptions}
+          t={t}
+          onChanged={reload}
+        />
+      )}
       <RegionSection
         providerId={detail.id}
         currentValue={detail.region}
@@ -335,8 +348,6 @@ export function ProviderDetailPane({
       />
       <CredentialsDispatcher providerId={detail.id} t={t} />
       {detail.id === "codex" && <CodexUsageOptions t={t} />}
-      {detail.id === "codex" && <CodexAccountsSection t={t} />}
-      {detail.id === "claude" && <ClaudeAccountsSection t={t} />}
       <CredentialStorageSection
         status={credentialStatus}
         busy={busy}
@@ -370,7 +381,6 @@ export function ProviderDetailPane({
         onSwitchAccount={handleSwitchAccount}
         onOpenDashboard={handleOpenDashboard}
         onOpenStatusPage={handleOpenStatusPage}
-        onCopyError={handleCopyError}
         onBuyCredits={handleBuyCredits}
         t={t}
       />

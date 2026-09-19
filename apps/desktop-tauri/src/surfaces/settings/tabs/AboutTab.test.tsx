@@ -123,10 +123,11 @@ describe("AboutTab", () => {
     fireEvent.click(await screen.findByRole("button", { name: "AboutLinkGitHub" }));
     fireEvent.click(screen.getByRole("button", { name: "AboutLinkWebsite" }));
     fireEvent.click(screen.getByRole("button", { name: "AboutLinkOriginalProject" }));
+    fireEvent.click(screen.getByRole("button", { name: "SubmitIssue" }));
 
     expect(tauriMocks.openExternalUrl).toHaveBeenNthCalledWith(
       1,
-      "https://github.com/Finesssee/Win-CodexBar",
+      "https://github.com/fr4nkastro/Win-CodexBar",
     );
     expect(tauriMocks.openExternalUrl).toHaveBeenNthCalledWith(
       2,
@@ -135,6 +136,10 @@ describe("AboutTab", () => {
     expect(tauriMocks.openExternalUrl).toHaveBeenNthCalledWith(
       3,
       "https://github.com/steipete/CodexBar",
+    );
+    expect(tauriMocks.openExternalUrl).toHaveBeenNthCalledWith(
+      4,
+      "https://github.com/fr4nkastro/Win-CodexBar/issues/new?labels=bug&template=bug_report.yml",
     );
   });
 

@@ -67,6 +67,64 @@ fn refreshed_cache() -> &'static Mutex<HashMap<CredentialSource, ClaudeOAuthCred
     REFRESHED_CREDENTIALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Forget refreshed credentials cached for the ambient login after it was
+/// replaced (account switch): the given credentials file, the default
+/// `~/.claude` file, and the unscoped OS keyring item. Other sources (the
+/// environment token, unrelated files) are untouched.
+pub(super) fn clear_ambient_cache(credential_path: &Path) {
+    let legacy = credentials_path().ok();
+    if let Ok(mut cache) = refreshed_cache().lock() {
+        cache.retain(|source, _| match source {
+            CredentialSource::File(path) => {
+                path != credential_path && Some(path) != legacy.as_ref()
+            }
+            CredentialSource::Keyring(_) => false,
+            CredentialSource::Environment => true,
+        });
+    }
+}
+
+/// Marker (under the Claude account store) holding the SHA-256 fingerprint of
+/// the keyring access token that an account switch superseded.
+const SUPERSEDED_KEYRING_MARKER: &str = "superseded-keyring-token.sha256";
+
+fn superseded_keyring_marker_path() -> PathBuf {
+    crate::claude_accounts::file_locations::app_support_directory().join(SUPERSEDED_KEYRING_MARKER)
+}
+
+fn token_fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Record the keyring token that belonged to the login an account switch just
+/// replaced. The keyring item is unscoped and is not rewritten by a switch, so
+/// without this marker the expired-file fallback in [`load_credentials`] could
+/// adopt the previous account's still-fresh token (#22).
+pub(super) fn record_superseded_keyring_token() {
+    let Ok(Some((keyring, _))) = load_from_keyring() else {
+        return;
+    };
+    let path = superseded_keyring_marker_path();
+    let written = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, token_fingerprint(&keyring.access_token)));
+    if let Err(err) = written {
+        tracing::warn!("Failed to record superseded Claude keyring token: {err}");
+    }
+}
+
+fn superseded_keyring_fingerprint() -> Option<String> {
+    std::fs::read_to_string(superseded_keyring_marker_path())
+        .ok()
+        .map(|content| content.trim().to_string())
+        .filter(|content| !content.is_empty())
+}
+
 /// Look up a cached refreshed credential for `source`, returning it only if
 /// it is fresher than `file_creds` (i.e. what was just re-read from disk).
 pub(super) fn cached_refreshed_if_fresher(
@@ -105,9 +163,24 @@ pub(super) fn load_credentials() -> Result<(ClaudeOAuthCredentials, CredentialSo
         ));
     }
 
-    // Try credentials file
+    // Try credentials file. A stale default-profile file can outlive a CLI
+    // re-authentication that has already replaced the Windows credential
+    // manager item, so give a changed, fresh keyring record a chance to
+    // replace an expired file record. Fresh file credentials retain precedence.
     let file_error = match load_from_file() {
-        Ok(creds) => return Ok((creds, CredentialSource::File(credentials_path()?))),
+        Ok(file_creds) => {
+            if file_creds.is_expired()
+                && let Ok(Some(keyring)) = load_from_keyring()
+                && let Some(replacement) = replacement_from_changed_fresh_keyring(
+                    &file_creds,
+                    keyring,
+                    superseded_keyring_fingerprint().as_deref(),
+                )
+            {
+                return Ok(replacement);
+            }
+            return Ok((file_creds, CredentialSource::File(credentials_path()?)));
+        }
         Err(err) => err,
     };
 
@@ -144,6 +217,27 @@ fn load_from_environment() -> Option<ClaudeOAuthCredentials> {
         scopes,
         rate_limit_tier: None,
     })
+}
+
+/// Adopt a changed, fresh keyring credential only when the file-backed
+/// default-profile credential is expired. The keyring item is unscoped, so
+/// this loader deliberately has no custom-profile recovery path. A keyring
+/// token whose fingerprint matches `superseded` belongs to the login an
+/// account switch replaced and is never adopted.
+fn replacement_from_changed_fresh_keyring(
+    file_creds: &ClaudeOAuthCredentials,
+    (keyring_creds, source): (ClaudeOAuthCredentials, CredentialSource),
+    superseded: Option<&str>,
+) -> Option<(ClaudeOAuthCredentials, CredentialSource)> {
+    if !file_creds.is_expired()
+        || keyring_creds.is_expired()
+        || keyring_creds.access_token == file_creds.access_token
+        || superseded == Some(token_fingerprint(&keyring_creds.access_token).as_str())
+    {
+        return None;
+    }
+
+    Some((keyring_creds, source))
 }
 
 /// Load credentials from ~/.claude/.credentials.json
@@ -286,6 +380,11 @@ fn credentials_from_oauth_data(oauth: OAuthData) -> Result<ClaudeOAuthCredential
 
     // Convert milliseconds to DateTime
     let expires_at = oauth.expires_at.map(|millis| {
+        // OAuth expiry is stored in whole seconds; sub-second precision is dropped.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "expiry is tracked at whole-second granularity"
+        )]
         let secs = (millis / 1000.0) as i64;
         DateTime::from_timestamp(secs, 0).unwrap_or_else(Utc::now)
     });
@@ -461,7 +560,7 @@ mod tests {
     use super::{
         CredentialSource, apply_refresh_to_credentials_json, cached_refreshed_if_fresher,
         credentials_path_in, load_credentials_in, parse_credentials_json,
-        persist_refreshed_credentials_in, store_refreshed,
+        persist_refreshed_credentials_in, replacement_from_changed_fresh_keyring, store_refreshed,
     };
     use crate::providers::claude::oauth::ClaudeOAuthCredentials;
 
@@ -521,6 +620,99 @@ mod tests {
                 .to_string()
                 .contains("Claude OAuth access token missing")
         );
+    }
+
+    #[test]
+    fn changed_fresh_keyring_replaces_expired_file_credentials() {
+        let expired_file = ClaudeOAuthCredentials {
+            access_token: "expired-file-token".to_string(),
+            refresh_token: Some("expired-file-refresh".to_string()),
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            scopes: vec!["user:profile".to_string()],
+            rate_limit_tier: None,
+        };
+        let keyring_source = CredentialSource::Keyring("test-user".to_string());
+        let fresh_keyring = ClaudeOAuthCredentials {
+            access_token: "fresh-keyring-token".to_string(),
+            refresh_token: Some("fresh-keyring-refresh".to_string()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            scopes: vec!["user:profile".to_string()],
+            rate_limit_tier: None,
+        };
+
+        let adopted = replacement_from_changed_fresh_keyring(
+            &expired_file,
+            (fresh_keyring, keyring_source.clone()),
+            None,
+        )
+        .expect("changed fresh keyring credentials should replace an expired file");
+        assert_eq!(adopted.0.access_token, "fresh-keyring-token");
+        assert_eq!(adopted.1, keyring_source);
+
+        let expired_keyring = ClaudeOAuthCredentials {
+            access_token: "another-keyring-token".to_string(),
+            refresh_token: None,
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+            scopes: vec!["user:profile".to_string()],
+            rate_limit_tier: None,
+        };
+        assert!(
+            replacement_from_changed_fresh_keyring(
+                &expired_file,
+                (
+                    expired_keyring,
+                    CredentialSource::Keyring("test-user".to_string())
+                ),
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    /// After an account switch the unscoped keyring still holds the previous
+    /// account's fresh token; once the switched file token expires, that
+    /// superseded token must not be adopted (#22).
+    #[test]
+    fn expired_file_never_adopts_keyring_token_superseded_by_a_switch() {
+        let expired_file = ClaudeOAuthCredentials {
+            access_token: "switched-account-token".to_string(),
+            refresh_token: Some("switched-account-refresh".to_string()),
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+            scopes: vec!["user:profile".to_string()],
+            rate_limit_tier: None,
+        };
+        let previous_account_keyring = ClaudeOAuthCredentials {
+            access_token: "previous-account-token".to_string(),
+            refresh_token: Some("previous-account-refresh".to_string()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            scopes: vec!["user:profile".to_string()],
+            rate_limit_tier: None,
+        };
+        let source = CredentialSource::Keyring("test-user".to_string());
+        let superseded = super::token_fingerprint("previous-account-token");
+
+        assert!(
+            replacement_from_changed_fresh_keyring(
+                &expired_file,
+                (previous_account_keyring.clone(), source.clone()),
+                Some(&superseded),
+            )
+            .is_none()
+        );
+
+        // A later CLI re-authentication writes a new keyring token, which is
+        // adoptable again.
+        let reauthenticated = ClaudeOAuthCredentials {
+            access_token: "reauthenticated-token".to_string(),
+            ..previous_account_keyring
+        };
+        let adopted = replacement_from_changed_fresh_keyring(
+            &expired_file,
+            (reauthenticated, source),
+            Some(&superseded),
+        )
+        .expect("a keyring token written after the switch should be adoptable");
+        assert_eq!(adopted.0.access_token, "reauthenticated-token");
     }
 
     #[test]
@@ -700,5 +892,55 @@ mod tests {
             same_source_result.map(|c| c.access_token),
             Some("file-refreshed-token".to_string())
         );
+    }
+
+    #[test]
+    fn clearing_the_ambient_cache_keeps_unrelated_sources() {
+        let unique = |tag: &str| {
+            CredentialSource::File(std::path::PathBuf::from(format!(
+                "clear_ambient_cache-{tag}-unique-marker.json"
+            )))
+        };
+        let switched = unique("switched");
+        let unrelated = unique("unrelated");
+        let keyring = CredentialSource::Keyring("clear-ambient-cache-test".to_string());
+        let creds = ClaudeOAuthCredentials {
+            access_token: "cached".to_string(),
+            refresh_token: None,
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            scopes: vec![],
+            rate_limit_tier: None,
+        };
+        for source in [&switched, &unrelated, &keyring] {
+            store_refreshed(source, &creds);
+        }
+        let CredentialSource::File(switched_path) = &switched else {
+            unreachable!()
+        };
+        super::clear_ambient_cache(switched_path);
+
+        let disk = ClaudeOAuthCredentials {
+            expires_at: None,
+            ..creds.clone()
+        };
+        assert!(cached_refreshed_if_fresher(&switched, &disk).is_none());
+        assert!(cached_refreshed_if_fresher(&keyring, &disk).is_none());
+        assert!(cached_refreshed_if_fresher(&unrelated, &disk).is_some());
+    }
+
+    /// Managed account directories are file-only: an expired managed login is
+    /// returned as-is (for the refresh lane to handle) and never replaced by
+    /// the unscoped OS keyring item, which belongs to the ambient login (#22).
+    #[test]
+    fn directory_scoped_load_never_substitutes_keyring_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(super::CREDENTIALS_FILE_NAME),
+            r#"{"claudeAiOauth":{"accessToken":"managed-expired","refreshToken":"managed-refresh","expiresAt":1000,"scopes":["user:profile"]}}"#,
+        )
+        .unwrap();
+        let loaded = super::load_credentials_in(dir.path()).unwrap();
+        assert_eq!(loaded.access_token, "managed-expired");
+        assert!(loaded.is_expired());
     }
 }

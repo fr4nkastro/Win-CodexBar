@@ -1,31 +1,53 @@
 # Code signing policy
 
-Free code signing of Win-CodexBar releases via SignPath.io, certificate by SignPath Foundation.
+Win-CodexBar uses SignPath.io and the SignPath Foundation certificate for
+Windows release signing.
 
-> **Status: SignPath Foundation approved — pipeline wiring in progress.** The release workflow (`.github/workflows/release.yml`) includes SignPath signing steps; signing activates once the secrets (`SIGNPATH_API_TOKEN`, `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, `SIGNPATH_SIGNING_POLICY_SLUG`) are added to the GitHub repo. Until then, artifacts are unsigned with SHA-256 `.sha256` sidecar files. See `.signpath/SETUP.md` for the onboarding checklist.
+> **Status:** The repository wiring is prepared, but the production policy is
+> blocked until SignPath finishes issuing the Release certificate 2026 and the
+> release-signing policy becomes valid. The release workflow fails closed while
+> that onboarding is incomplete. v0.60.3 remains the immutable unsigned release;
+> the first signed production release is the next normal version.
 
 ## Project identity
 
-- **Project name:** Win-CodexBar
-- **Homepage:** https://github.com/nesszer/Win-CodexBar
-- **Source code:** https://github.com/nesszer/Win-CodexBar
-- **Releases:** https://github.com/nesszer/Win-CodexBar/releases
-- **License:** MIT
+- Project: Win-CodexBar
+- Source: https://github.com/nesszer/Win-CodexBar
+- Releases: https://github.com/nesszer/Win-CodexBar/releases
+- License: MIT
+
+## Build and signing system
+
+CircleCI owns PR and protected-branch validation through
+.circleci/config.yml. GitHub Actions owns canonical tag releases through
+.github/workflows/release.yml so SignPath can verify the GitHub-hosted build
+and GitHub Actions artifact provenance.
+
+The release workflow builds three top-level signing inputs:
+
+- CodexBar-<version>-Setup.exe
+- CodexBar-<version>-portable.exe
+- CodexBarCLI-v<version>-windows-x64.zip
+
+The SignPath artifact configuration signs both top-level executables and
+codexbar-cli.exe nested inside the CLI ZIP. The workflow waits for the
+release-signing request to complete, verifies all three signed objects, creates
+the final six assets from signed bytes, and creates only a draft GitHub Release.
+A maintainer publishes the draft after review.
+
+The manual SignPath Test workflow uses test-signing and retains its verified
+bundle as a workflow artifact. It never publishes a release.
 
 ## Roles
 
-| Role |
-|------|
-| Author: Finesssee |
-| Reviewer: Finesssee |
-| Approver: Finesssee (@Finesssee) |
+| Role | Responsibility |
+|---|---|
+| Author | Finesssee |
+| Reviewer | Finesssee |
+| Approver | Finesssee (@Finesssee) |
 
-## Build system
-
-- CI runs on GitHub Actions (`.github/workflows/pr-check.yml`).
-- The Windows release pipeline is driven by `scripts/windows-release-build.ps1`, which builds the Tauri release binary plus the console CLI and packages them with Inno Setup into the installer (`CodexBar-<version>-Setup.exe`) and portable build, writing SHA-256 sidecar files for every artifact.
-- Release artifacts are published to [GitHub Releases](https://github.com/nesszer/Win-CodexBar/releases).
-- **Not yet wired:** release signing will be submitted to SignPath from this pipeline once SignPath onboarding completes; each release-signing request is approved manually by the approver listed above before signed binaries are published.
+Each production signing request requires the configured manual approval.
+Unsigned fallback is disabled.
 
 ## Privacy
 
@@ -33,7 +55,6 @@ See [docs/PRIVACY.md](PRIVACY.md) for the project's privacy policy.
 
 ## Notes
 
-*The notes below apply once signing is active:*
-
-- Certificates are issued in the SignPath Foundation's name; signed binaries show "SignPath Foundation" as the publisher.
-- Every release-signing request requires manual approval per release; no unattended signing is performed.
+Certificates are issued in the SignPath Foundation's name, so signed binaries
+show SignPath Foundation as the publisher. See [.signpath/SETUP.md](../.signpath/SETUP.md)
+for the onboarding and trusted-build checklist.

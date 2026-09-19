@@ -1,0 +1,59 @@
+.settings-section {
+  gap: 4px;
+  padding-bottom: 12px;
+}
+
+.settings-section + .settings-section {
+  padding-top: 12px;
+}
+
+.settings-section > .settings-section__title {
+  margin: 0;
+}
+
+.settings-section__title,
+.provider-detail-section h4 {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-primary);
+}
+
+.settings-field {
+  padding: 8px 0;
+}
+
+.settings-field__label,
+.settings-field__desc,
+.settings-section__hint {
+  line-height: 1.4;
+}
+
+.settings-section__hint {
+  margin: 6px 0 0;
+}
+
+.provider-detail-section {
+  padding: 16px 0;
+  margin-bottom: 0;
+}
+
+.credential-card {
+  padding: 12px;
+}
+
+.codex-accounts .credential-card__header {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.codex-accounts .credential-card__actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.codex-accounts .credential-card__badge {
+  align-self: flex-start;
+}

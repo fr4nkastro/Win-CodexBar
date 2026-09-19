@@ -42,7 +42,7 @@ pub fn import_browser_cookies(
     provider_id: String,
     browser_type: String,
 ) -> Result<Vec<CookieInfoBridge>, String> {
-    use codexbar::browser::cookies::{CookieError, CookieExtractor};
+    use codexbar::browser::cookies::CookieExtractor;
     use codexbar::browser::detection::BrowserDetector;
 
     // Resolve the provider to get its cookie domain.
@@ -66,10 +66,8 @@ pub fn import_browser_cookies(
         .ok_or_else(|| format!("Browser '{browser_type}' not found or not installed"))?;
 
     // Extract the cookie header.
-    let cookies = CookieExtractor::extract_for_domain(&browser, domain).map_err(|e| match e {
-        CookieError::Dpapi(msg) => format!("DPAPI error: {msg}"),
-        other => other.to_string(),
-    })?;
+    let cookies = CookieExtractor::extract_for_domain(&browser, domain)
+        .map_err(|e| e.user_message_for_browser(browser.browser_type))?;
 
     if cookies.is_empty() {
         return Err(format!(

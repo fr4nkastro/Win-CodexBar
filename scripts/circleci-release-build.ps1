@@ -1,13 +1,13 @@
 #Requires -Version 5.1
 <##
 .SYNOPSIS
-    Run the credential-free CircleCI Windows release build and artifact bundle.
+    Run the credential-free Windows release build and artifact bundle.
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][string]$Tag = $env:CIRCLE_TAG,
-    [Parameter(Mandatory)][string]$Sha = $env:CIRCLE_SHA1,
+    [Parameter(Mandatory)][string]$Tag = $env:RELEASE_TAG,
+    [Parameter(Mandatory)][string]$Sha = $env:RELEASE_SHA,
     [string]$RepoRoot = '',
     [string]$OutputDir = '',
     [string]$Repository = 'https://github.com/nesszer/Win-CodexBar.git'
@@ -83,7 +83,7 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 Clear-DirectoryContents $OutputDir
 $version = Get-ReleaseVersionFromTag $Tag
 # Use a fixed WorkRoot so the Cargo target and pnpm store caches persist
-# across runs (restored via CircleCI save_cache/restore_cache).  The
+# across hosted release runs. The
 # source checkout inside WorkRoot is cleaned before each build.
 $tempRoot = if ($env:USERPROFILE) {
     Join-Path $env:USERPROFILE 'cb'
@@ -111,7 +111,7 @@ try {
         '-Sha', $Sha,
         '-Repository', $Repository
     ) (Join-Path $OutputDir 'emit-release-manifest.log')
-    Write-Host "Credential-free release build passed for $Tag ($Sha)."
+    Write-Host "Credential-free Windows release build passed for $Tag ($Sha)."
 } finally {
     # Preserve the cache/ subdirectory (Cargo target + pnpm store) for
     # the next run; clean only source/ and assets/ which are rebuilt fresh.

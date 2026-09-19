@@ -1,139 +1,90 @@
 version: 2.1
 
+
 orbs:
   win: circleci/windows@5.0
 
 jobs:
-  release-build:
-    executor:
-      name: win/default
-      size: large
-    environment:
-      CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
-      CARGO_TERM_COLOR: never
-      CARGO_TERM_PROGRESS_WHEN: never
-      NO_COLOR: '1'
-    steps:
-      - checkout
-      - run:
-          name: Assert build job has no GitHub write credential
-          shell: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
-          command: |
-            if (-not [string]::IsNullOrWhiteSpace($env:GH_TOKEN)) { throw 'GH_TOKEN must be absent from release-build.' }
-      - run:
-          name: Validate canonical release tag, SHA, versions, and main ancestry
-          shell: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
-          command: |
-            $ErrorActionPreference = 'Stop'
-            if (-not [string]::IsNullOrWhiteSpace($env:GH_TOKEN)) { throw 'GH_TOKEN must be absent from the credential-free release-build job.' }
-            $root = (Get-Location).Path
-            & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\release-preflight.ps1') -Tag $env:CIRCLE_TAG -Sha $env:CIRCLE_SHA1 -RepoRoot $root
-            if ($LASTEXITCODE -ne 0) { throw "release-preflight.ps1 failed with exit code $LASTEXITCODE" }
-      - run:
-          name: Provision and assert pinned release prerequisites
-          shell: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
-          command: |
-            $ErrorActionPreference = 'Stop'
-            $root = (Get-Location).Path
-            & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\install-release-prerequisites.ps1') -RepoRoot $root
-            if ($LASTEXITCODE -ne 0) { throw "install-release-prerequisites.ps1 failed with exit code $LASTEXITCODE" }
-      - restore_cache:
-          name: Restore Cargo registry cache
-          keys:
-            - cargo-registry-{{ checksum "Cargo.lock" }}
-      - restore_cache:
-          name: Restore Cargo target and pnpm store cache
-          keys:
-            - release-cache-{{ checksum "Cargo.lock" }}-{{ checksum "rust/Cargo.toml" }}-{{ checksum "apps/desktop-tauri/src-tauri/Cargo.toml" }}
-            - release-cache-{{ checksum "Cargo.lock" }}-
-      - run:
-          name: Build, smoke-install, and emit verified assets
-          no_output_timeout: 90m
-          shell: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
-          command: |
-            $ErrorActionPreference = 'Stop'
-            $root = (Get-Location).Path
-            $output = Join-Path $root 'release-output'
-            & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\circleci-release-build.ps1') -Tag $env:CIRCLE_TAG -Sha $env:CIRCLE_SHA1 -RepoRoot $root -OutputDir $output
-            if ($LASTEXITCODE -ne 0) { throw "circleci-release-build.ps1 failed with exit code $LASTEXITCODE" }
-      - save_cache:
-          name: Save Cargo registry cache
-          key: cargo-registry-{{ checksum "Cargo.lock" }}
-          paths:
-            - ~/.cargo/registry
-      - save_cache:
-          name: Save Cargo target and pnpm store cache
-          key: release-cache-{{ checksum "Cargo.lock" }}-{{ checksum "rust/Cargo.toml" }}-{{ checksum "apps/desktop-tauri/src-tauri/Cargo.toml" }}
-          paths:
-            - ~/cb/release/cache
-      - persist_to_workspace:
-          root: .
-          paths:
-            - release-output
-            - scripts/publish-github-release.ps1
-            - scripts/release-pipeline-common.ps1
-      - store_artifacts:
-          path: release-output
-          destination: release-output
-
-  release-publish:
+  pr-check:
     executor:
       name: win/default
       size: medium
+    environment:
+      CARGO_TERM_COLOR: always
+      # Stable relative target dir so the target cache below is portable and
+      # every cargo invocation in local-check.ps1 shares one cache.
+      CARGO_TARGET_DIR: target
+      # Compile-time pipeline values are exported as environment variables,
+      # never passed as command-line arguments: an empty-string argument does
+      # not survive the Windows argv handoff to a child powershell.exe -File
+      # invocation (MissingArgument). gates.ps1 reads CBX_PR_URL /
+      # CBX_PR_BASE_SHA, plus CI_BUDGET_MODE / CIRCLE_BRANCH / CIRCLE_SHA1,
+      # from the environment with [AllowEmptyString] defaults.
+      CBX_PR_URL: << pipeline.event.context.github.pr_url >>
+      CBX_PR_BASE_SHA: << pipeline.event.github.pull_request.base.sha >>
     steps:
-      - attach_workspace:
-          at: .
+      - checkout
       - run:
-          name: Install gh, verify manifest, and publish release assets
+          name: Budget, trigger, and docs-only gates
           shell: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
           command: |
             $ErrorActionPreference = 'Stop'
-            $gh = Get-Command gh -ErrorAction SilentlyContinue
-            if (-not $gh) {
-              $ghDir = Join-Path $env:LOCALAPPDATA 'gh'
-              New-Item -ItemType Directory -Force -Path $ghDir | Out-Null
-              $zipPath = Join-Path ([IO.Path]::GetTempPath()) 'gh.zip'
-              $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/cli/cli/releases/latest' -Headers @{ 'User-Agent' = 'circleci' }
-              $asset = $release.assets | Where-Object { $_.name -match 'windows_amd64\.zip$' } | Select-Object -First 1
-              if (-not $asset) { throw 'Could not find GitHub CLI Windows amd64 zip' }
-              Write-Host "Downloading $($asset.name)"
-              Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
-              Expand-Archive -LiteralPath $zipPath -DestinationPath $ghDir -Force
-              $ghExe = Get-ChildItem -Path $ghDir -Recurse -Filter 'gh.exe' | Select-Object -First 1
-              if (-not $ghExe) { throw 'gh.exe not found after extraction' }
-              $env:Path = "$($ghExe.DirectoryName);$env:Path"
-              Write-Host "Installed gh at $($ghExe.FullName)"
-            }
-            $env:GH_TOKEN = if ($env:GH_TOKEN) { $env:GH_TOKEN } elseif ($env:gh_token) { $env:gh_token } else { '' }; if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) { throw 'GH_TOKEN is required only in the restricted publisher context.' }
-            $root = (Get-Location).Path
-            $manifestPath = Join-Path $root 'release-output\release-manifest.json'
-            if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "Missing persisted release manifest: $manifestPath" }
-            $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-            if ($manifest.repository -ne 'nesszer/Win-CodexBar') { throw "Manifest repository is not canonical nesszer/Win-CodexBar." }
-            if ($manifest.tag -ne $env:CIRCLE_TAG) { throw "Manifest tag does not match CIRCLE_TAG." }
-            if (-not $env:CIRCLE_SHA1 -or $env:CIRCLE_SHA1 -notmatch '^[0-9a-fA-F]{40}$' -or [string]$manifest.commit -cne ($env:CIRCLE_SHA1).ToLowerInvariant()) { throw 'Manifest commit must equal lowercase CIRCLE_SHA1.' }
-            $env:RELEASE_SHA = [string]$manifest.commit
-            $publisher = Join-Path $root 'scripts\publish-github-release.ps1'
-            if (-not (Test-Path -LiteralPath $publisher -PathType Leaf)) { throw "Missing persisted publisher helper: $publisher" }
-            & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $publisher -AssetsDir (Join-Path $root 'release-output') -Tag $env:CIRCLE_TAG
-            if ($LASTEXITCODE -ne 0) { throw "publish-github-release.ps1 failed with exit code $LASTEXITCODE" }
+            & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path (Get-Location).Path 'scripts\circleci-pr-gates.ps1')
+            if ($LASTEXITCODE -ne 0) { throw "circleci-pr-gates.ps1 failed with exit code $LASTEXITCODE" }
+      - restore_cache:
+          name: Restore Cargo registry and git cache
+          keys:
+            - pr-check-cargo-{{ checksum "Cargo.lock" }}
+            - pr-check-cargo-
+      - restore_cache:
+          name: Restore pnpm store cache
+          keys:
+            - pr-check-pnpm-{{ checksum "apps/desktop-tauri/pnpm-lock.yaml" }}
+            - pr-check-pnpm-
+      - restore_cache:
+          name: Restore Cargo target cache (exact or older same-Rust fallback)
+          keys:
+            - pr-check-target-v1-{{ checksum "scripts/circleci-pinned-rust.txt" }}-{{ checksum "Cargo.lock" }}-{{ checksum "Cargo.toml" }}-{{ checksum "rust/Cargo.toml" }}-{{ checksum "apps/desktop-tauri/src-tauri/Cargo.toml" }}
+            - pr-check-target-v1-{{ checksum "scripts/circleci-pinned-rust.txt" }}-{{ checksum "Cargo.lock" }}-
+      - run:
+          name: Provision pinned toolchain and run local-check ci slice
+          shell: powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+          no_output_timeout: 60m
+          command: |
+            $ErrorActionPreference = 'Stop'
+            $pinnedRust = (Get-Content -Raw -LiteralPath 'scripts\circleci-pinned-rust.txt').Trim()
+            & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path (Get-Location).Path 'scripts\run-circleci-pr-check.ps1') `
+              -RustVersion $pinnedRust `
+              -NodeVersion '24.18.0' `
+              -NodeMajor 24
+            if ($LASTEXITCODE -ne 0) { throw "run-circleci-pr-check.ps1 failed with exit code $LASTEXITCODE" }
+      - save_cache:
+          name: Save Cargo registry and git cache
+          key: pr-check-cargo-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+      - save_cache:
+          name: Save pnpm store cache
+          key: pr-check-pnpm-{{ checksum "apps/desktop-tauri/pnpm-lock.yaml" }}
+          paths:
+            - ~/AppData/Local/pnpm/store
+      - save_cache:
+          name: Save Cargo target cache
+          key: pr-check-target-v1-{{ checksum "scripts/circleci-pinned-rust.txt" }}-{{ checksum "Cargo.lock" }}-{{ checksum "Cargo.toml" }}-{{ checksum "rust/Cargo.toml" }}-{{ checksum "apps/desktop-tauri/src-tauri/Cargo.toml" }}
+          paths:
+            - target
+
 
 workflows:
-  release:
+  pr-check:
+    # Semantic CI boundary: release-integration micro PRs target port/upstream-*.
+    # A micro-named head aimed directly at main still receives full hosted CI.
+    # Guard the PR-only value behind event.name so push pipelines compile safely.
+    when: pipeline.event.name == "push" or (pipeline.event.name == "pull_request" and not (pipeline.event.github.pull_request.base.ref starts-with "port/upstream-"))
     jobs:
-      - release-build:
-          filters: &release-tag-filter
+      - pr-check:
+          filters:
             tags:
-              only: /^v[0-9]+\.[0-9]+\.[0-9]+$/
-            branches:
-              ignore: /.*/
-      - release-approval:
-          type: approval
-          requires:
-            - release-build
-          filters: *release-tag-filter
-      - release-publish:
-          context: gh-release-publisher
-          requires:
-            - release-approval
-          filters: *release-tag-filter
+              ignore:
+                - /^v[0-9]+\.[0-9]+\.[0-9]+$/

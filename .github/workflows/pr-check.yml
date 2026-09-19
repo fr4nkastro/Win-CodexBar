@@ -1,24 +1,14 @@
-name: PR check
+name: PR check (Blacksmith backup)
 
-# Blacksmith CI only: PR validation. Release assets stay in CircleCI.
+# Manual-only reserve CI. CircleCI is the primary hosted PR gate (ADR 0005).
+# Keep Blacksmith off automatic push/PR triggers so its Windows allowance is
+# reserved for explicit second-opinion/fallback runs when CircleCI is degraded
+# or a high-risk Windows-native change merits independent confirmation.
 on:
-  push:
-    branches: [main, master]
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
-      - 'CONTEXT.md'
-      - '.github/CI.md'
-  pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
-      - 'CONTEXT.md'
-      - '.github/CI.md'
   workflow_dispatch:
 
 concurrency:
-  group: pr-check-${{ github.ref }}
+  group: blacksmith-pr-check-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -26,9 +16,13 @@ env:
 
 jobs:
   pr-check:
-    name: Local check
+    name: Local check (Blacksmith reserve)
     if: vars.CI_BUDGET_MODE != 'off'
+    # Reserve reliability over theoretical savings: this repo has a proven
+    # Blacksmith 4-vCPU Windows path; a 2-vCPU dispatch queued instead of
+    # provisioning during the 2026-09-05 audit. Keep reserve CI dependable.
     runs-on: blacksmith-4vcpu-windows-2025
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
@@ -48,35 +42,22 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Read the exact pnpm version from the product package.json instead of
+      # drifting on a floating major. Blacksmith transparently accelerates the
+      # supported Actions cache path used by setup-node.
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 11
+          package_json_file: apps/desktop-tauri/package.json
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 24.18.0
           cache: pnpm
           cache-dependency-path: apps/desktop-tauri/pnpm-lock.yaml
 
-      - name: Install frontend deps
-        run: pnpm --dir apps/desktop-tauri install --frozen-lockfile
-
-      - name: Rust format check
-        run: cargo fmt --all --check
-
-      - name: Rust clippy (workspace)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Rust tests (workspace)
-        run: cargo test --workspace
-
-      - name: Frontend tests
-        run: pnpm --dir apps/desktop-tauri test
-
-      - name: Frontend type check / build
-        run: pnpm --dir apps/desktop-tauri run build
-
-      - name: Interaction guard script tests
-        run: node --test .github/scripts/interaction-guard.test.mjs
+      # Same canonical slice as CircleCI. The backup intentionally does not run
+      # installer/release packaging, keeping manual diagnostic runs bounded.
+      - name: Run local-check ci slice
+        run: powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File scripts/local-check.ps1 -Slice ci

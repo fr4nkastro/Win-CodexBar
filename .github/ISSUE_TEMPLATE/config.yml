@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Configuration docs
+    url: https://github.com/fr4nkastro/Win-CodexBar/blob/main/docs/CONFIGURATION.md
+    about: Configuration questions are best answered by the docs first.
+  - name: Cookies and browser docs
+    url: https://github.com/fr4nkastro/Win-CodexBar/blob/main/docs/COOKIES.md
+    about: Browser cookie import questions are covered in the cookies docs.

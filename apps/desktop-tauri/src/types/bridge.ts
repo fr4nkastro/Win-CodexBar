@@ -222,6 +222,10 @@ export interface SettingsSnapshot {
   trayScalePercent: number;
   powertoysStatusPipeEnabled: boolean;
   claudeAvoidKeychainPrompts: boolean;
+  /** Opt-in external claude-swap (`cswap`) account import (Claude only). */
+  claudeSwapEnabled?: boolean;
+  /** Path to the cswap executable (Claude only, empty when unset). */
+  claudeSwapExecutablePath?: string;
   codexSparkUsageVisible: boolean;
   disableKeychainAccess: boolean;
   wayfinderGatewayUrl?: string;
@@ -323,6 +327,8 @@ export interface SettingsUpdate {
   claudeAvoidKeychainPrompts?: boolean;
   claudeAllowReadingClaudeCodeCredentials?: boolean;
   claudeAllowManagingClaudeCodeAccounts?: boolean;
+  claudeSwapEnabled?: boolean;
+  claudeSwapExecutablePath?: string;
   codexSparkUsageVisible?: boolean;
   disableKeychainAccess?: boolean;
   /** Map of provider CLI name → metric preference label. */
@@ -557,8 +563,14 @@ export interface CostSnapshotBridge {
   formattedUsed: string;
   formattedLimit: string | null;
   balance?: number | null;
+  /** Successful balance observation time; independent from the usage-cap age. */
+  balanceUpdatedAt?: string | null;
+  /** Stable provider account scope for reconciling paired observations. */
+  accountId?: string | null;
   formattedBalance?: string | null;
   daily?: CostDailyPoint[];
+  /** Provider-metered spend that is itself a primary usage signal. */
+  alwaysVisible?: boolean;
 }
 
 export interface PaceSnapshot {
@@ -578,6 +590,20 @@ export interface SessionEquivalentForecastSnapshot {
   weeklyResetsAt: string;
   weeklyUsedPercent: number;
 }
+
+export interface SubscriptionMetadataSnapshot {
+  startsAt: string | null;
+  expiresAt: string | null;
+  renewsAt: string | null;
+}
+
+/** Backend-classified provider availability state (camelCase serde on the bridge). */
+export type ProviderStateKind =
+  | "ready"
+  | "needsAuthentication"
+  | "expiredSession"
+  | "localRuntimeOffline"
+  | "unknown";
 
 export interface ProviderUsageSnapshot {
   providerId: string;
@@ -600,7 +626,10 @@ export interface ProviderUsageSnapshot {
   cost: CostSnapshotBridge | null;
   planName: string | null;
   accountEmail: string | null;
+  subscription?: SubscriptionMetadataSnapshot | null;
   sourceLabel: string;
+  /** Backend proof of a live successful Claude CLI quota fetch; only true is proof. */
+  hasSuccessfulClaudeCliQuota?: boolean;
   updatedAt: string;
   error: string | null;
   /**
@@ -610,6 +639,7 @@ export interface ProviderUsageSnapshot {
    * while this is true.
    */
   transient?: boolean;
+  errorState: ProviderStateKind;
   pace: PaceSnapshot | null;
   accountOrganization: string | null;
   trayStatusLabel: string | null;
@@ -727,7 +757,7 @@ export interface AppInfoBridge {
 
 export interface DailyCostPoint {
   date: string;
-  value: number;
+  value: number | null;
 }
 
 /** Exact local token totals per day (upstream 0.50.0 #2930). */
@@ -852,6 +882,9 @@ export interface ProviderDetail {
   id: string;
   displayName: string;
   enabled: boolean;
+  autoResumeAfterQuotaReset: boolean;
+  /** Whether the active credential lane can be correlated to a local CLI session. */
+  autoResumeSupported: boolean;
 
   // Identity
   email: string | null;
@@ -876,6 +909,7 @@ export interface ProviderDetail {
   pace: PaceSnapshot | null;
 
   lastError: string | null;
+  errorState: ProviderStateKind | null;
 
   dashboardUrl: string | null;
   statusPageUrl: string | null;
@@ -943,10 +977,14 @@ export interface CodexAccountUsageSnapshot {
   primaryWindow: CodexUsageWindow | null;
   secondaryWindow: CodexUsageWindow | null;
   credits: CodexCreditsBalance | null;
+  /** Persisted account-scoped extra-usage cost, when available. */
+  cost?: CostSnapshotBridge | null;
+  subscription?: SubscriptionMetadataSnapshot | null;
   updatedAt: string;
 }
 
 export interface CodexSwitchResult {
+  switchId: string;
   materializedAccount: CodexAccount | null;
   backupPath: string | null;
   ambientAccount: CodexAccount | null;
@@ -957,6 +995,10 @@ export interface CodexSwitchResult {
 
 export interface CodexAccountsStateBridge {
   accounts: CodexAccount[];
+  /** Canonical privacy-safe account labels, keyed by stable account id. */
+  displayNames?: Record<string, string>;
+  /** Canonical opaque account ordinals, keyed by stable account id. */
+  accountOrdinals: Record<string, number>;
   snapshots: Record<string, CodexAccountUsageSnapshot>;
   activeAccountId?: string | null;
 }
@@ -1004,4 +1046,6 @@ export interface ClaudeAccountsStateBridge {
   accounts: ClaudeAccount[];
   snapshots: Record<string, ClaudeAccountUsageSnapshot>;
   activeAccountId?: string | null;
+  /** True while an Add-account sign-in runs; Cancel is offered. */
+  loginInProgress?: boolean;
 }

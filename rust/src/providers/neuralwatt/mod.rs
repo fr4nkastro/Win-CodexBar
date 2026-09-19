@@ -52,7 +52,10 @@ struct Subscription {
     kwh_included: Option<f64>,
     kwh_used: Option<f64>,
     kwh_remaining: Option<f64>,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "field mirrors the NeuralWatt API payload; deserialized for round-trip fidelity but not read yet"
+    )]
     in_overage: Option<bool>,
 }
 
@@ -217,7 +220,9 @@ fn subscription_window(sub: &Subscription) -> Option<RateWindow> {
         parse_iso(sub.current_period_end.as_deref()),
     ) {
         if end > start {
-            let mins = ((end - start).num_minutes()).max(1) as u32;
+            // Billing-window minutes are clamped to u32 range, so the cast cannot truncate.
+            #[expect(clippy::cast_possible_truncation, reason = "clamped to u32 range")]
+            let mins = ((end - start).num_minutes()).clamp(1, u32::MAX as i64) as u32;
             w.window_minutes = Some(mins);
         }
         w.resets_at = Some(end);
@@ -233,6 +238,22 @@ fn prepaid_remaining(bal: &Balance) -> Option<f64> {
     let total = valid_pos(bal.total_credits_usd)?;
     let used = valid_nn(bal.credits_used_usd)?;
     Some((total - used).max(0.0))
+}
+
+fn prepaid_cost(bal: &Balance) -> Option<CostSnapshot> {
+    let remaining = prepaid_remaining(bal)?;
+    let used = valid_nn(bal.credits_used_usd)
+        .or_else(|| {
+            let total = valid_pos(bal.total_credits_usd)?;
+            Some((total - remaining).max(0.0))
+        })
+        .unwrap_or(0.0);
+    let mut cost =
+        CostSnapshot::new(used, "USD", "Neuralwatt prepaid balance").with_balance(remaining);
+    if let Some(total) = valid_pos(bal.total_credits_usd) {
+        cost = cost.with_limit(total);
+    }
+    Some(cost)
 }
 
 fn snapshot_from_quota(
@@ -307,11 +328,7 @@ fn snapshot_from_quota(
         }
     }
 
-    let cost = body
-        .balance
-        .as_ref()
-        .and_then(prepaid_remaining)
-        .map(|remaining| CostSnapshot::new(remaining, "USD", "Neuralwatt prepaid balance"));
+    let cost = body.balance.as_ref().and_then(prepaid_cost);
 
     let _month = body.usage.as_ref().and_then(|u| u.current_month.as_ref());
     Ok((snap, cost))
@@ -353,6 +370,9 @@ mod tests {
         assert!(snap.login_method.as_deref().unwrap().contains("Starter"));
         assert_eq!(snap.extra_rate_windows.len(), 1);
         assert!((snap.extra_rate_windows[0].window.used_percent - 20.0).abs() < 0.01);
-        assert!((cost.unwrap().used - 8.5).abs() < 0.001);
+        let cost = cost.unwrap();
+        assert!((cost.used - 11.5).abs() < 0.001);
+        assert_eq!(cost.limit, Some(20.0));
+        assert_eq!(cost.balance, Some(8.5));
     }
 }

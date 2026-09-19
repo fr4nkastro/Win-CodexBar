@@ -6,7 +6,10 @@
 mod token_refresher;
 
 // Re-exports for OAuth token refresh
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "imports needed for future VertexAI provider wiring"
+)]
 pub use token_refresher::{RefreshError, VertexAIOAuthCredentials, VertexAITokenRefresher};
 
 use async_trait::async_trait;
@@ -164,15 +167,11 @@ impl VertexAIProvider {
             return Err(ProviderError::AuthRequired);
         }
 
-        let json: serde_json::Value = resp
-            .json()
+        let body = resp
+            .bytes()
             .await
             .map_err(|e| ProviderError::Parse(e.to_string()))?;
-
-        json.get("access_token")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| ProviderError::Parse("No access_token in response".to_string()))
+        parse_access_token_response(&body)
     }
 
     /// Fetch usage via Vertex AI API
@@ -290,6 +289,20 @@ impl VertexAIProvider {
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct TokenRefreshResponse {
+    access_token: Option<String>,
+}
+
+fn parse_access_token_response(body: &[u8]) -> Result<String, ProviderError> {
+    let response: TokenRefreshResponse =
+        serde_json::from_slice(body).map_err(|e| ProviderError::Parse(e.to_string()))?;
+    response
+        .access_token
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| ProviderError::Parse("No access_token in response".to_string()))
+}
+
 impl Default for VertexAIProvider {
     fn default() -> Self {
         Self::new()
@@ -339,5 +352,48 @@ impl Provider for VertexAIProvider {
 
     fn supports_cli(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_token_response_accepts_usable_token() {
+        let token = parse_access_token_response(br#"{"access_token":"new-token"}"#)
+            .expect("valid token response");
+        assert_eq!(token, "new-token");
+    }
+
+    #[test]
+    fn access_token_response_rejects_missing_token() {
+        let result = parse_access_token_response(br#"{"expires_in":600}"#);
+        assert!(matches!(
+            result,
+            Err(ProviderError::Parse(message)) if message == "No access_token in response"
+        ));
+    }
+
+    #[test]
+    fn access_token_response_rejects_empty_or_whitespace_token() {
+        for body in [
+            br#"{"access_token":""}"#.as_slice(),
+            br#"{"access_token":" \t\n "}"#.as_slice(),
+        ] {
+            let result = parse_access_token_response(body);
+            assert!(matches!(
+                result,
+                Err(ProviderError::Parse(message)) if message == "No access_token in response"
+            ));
+        }
+    }
+
+    #[test]
+    fn access_token_response_rejects_malformed_json() {
+        assert!(matches!(
+            parse_access_token_response(b"not-json"),
+            Err(ProviderError::Parse(message)) if !message.is_empty()
+        ));
     }
 }

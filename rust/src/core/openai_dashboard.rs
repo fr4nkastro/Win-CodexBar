@@ -2,7 +2,13 @@
 //!
 //! Data structures for OpenAI/Codex dashboard usage breakdown and credits tracking.
 
-#![allow(dead_code)]
+// Serde data model mirroring the OpenAI dashboard payload plus its cache
+// store; several fields and helpers have no consumer yet but must survive
+// (de)serialization round-trips.
+#![allow(
+    dead_code,
+    reason = "dashboard snapshot fields mirror the upstream OpenAI payload; not all are consumed yet"
+)]
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,7 +16,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::core::RateWindow;
+use crate::core::{RateWindow, SubscriptionMetadata};
 
 /// OpenAI dashboard snapshot with usage and credits data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +41,9 @@ pub struct OpenAIDashboardSnapshot {
     pub credits_remaining: Option<f64>,
     /// Account plan name
     pub account_plan: Option<String>,
+    /// Subscription lifecycle dates reported by the authenticated dashboard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<SubscriptionMetadata>,
     /// When this snapshot was taken
     pub updated_at: DateTime<Utc>,
 }
@@ -57,6 +66,7 @@ impl OpenAIDashboardSnapshot {
             secondary_limit: None,
             credits_remaining: None,
             account_plan: None,
+            subscription: None,
             updated_at,
         }
     }
@@ -141,6 +151,12 @@ impl OpenAIDashboardSnapshot {
     /// Set account plan
     pub fn with_account_plan(mut self, plan: impl Into<String>) -> Self {
         self.account_plan = Some(plan.into());
+        self
+    }
+
+    /// Set explicitly observed subscription lifecycle dates.
+    pub fn with_subscription(mut self, subscription: Option<SubscriptionMetadata>) -> Self {
+        self.subscription = subscription;
         self
     }
 }
@@ -247,10 +263,14 @@ impl OpenAIDashboardCacheStore {
     pub fn save(cache: &OpenAIDashboardCache) {
         if let Some(url) = Self::cache_path() {
             if let Some(parent) = url.parent() {
-                let _ = fs::create_dir_all(parent);
+                // Cache write is best-effort: failing to create the cache
+                // dir just means no dashboard cache this run.
+                let _created = fs::create_dir_all(parent);
             }
             if let Ok(data) = serde_json::to_string_pretty(cache) {
-                let _ = fs::write(&url, data);
+                // Same best-effort contract: a failed serialize/write leaves
+                // the previous cache intact.
+                let _written = fs::write(&url, data);
             }
         }
     }
@@ -258,7 +278,8 @@ impl OpenAIDashboardCacheStore {
     /// Clear cached data
     pub fn clear() {
         if let Some(url) = Self::cache_path() {
-            let _ = fs::remove_file(url);
+            // Cache invalidation is idempotent; a missing file is fine.
+            let _removed = fs::remove_file(url);
         }
     }
 

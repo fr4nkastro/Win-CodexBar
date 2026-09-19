@@ -64,7 +64,7 @@ export function UsageBreakdownChart({
 
   const rowHeight = 14;
   const rowGap = 2;
-  const labelWidth = 52;
+  const labelWidth = 68;
   const totalWidth = 280;
   const barAreaWidth = totalWidth - labelWidth;
   const svgHeight = recent.length * (rowHeight + rowGap);
@@ -108,7 +108,7 @@ export function UsageBreakdownChart({
                   className="chart__row-label"
                   fill="var(--provider-row-text-secondary, #888)"
                 >
-                  {day.day.slice(-5)}
+                  {day.day}
                 </text>
                 {sorted.map((svc) => {
                   const w =

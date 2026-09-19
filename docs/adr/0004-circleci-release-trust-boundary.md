@@ -1,93 +1,74 @@
-# ADR 0004: CircleCI release-only pipeline and dual-CI trust boundary
+# ADR 0004: GitHub Actions release and CircleCI validation boundary
 
-Date: 2026-08-14
-Status: Accepted; supersedes the release-local portion of ADR 0001
+Date: 2026-09-16
+Status: Accepted; supersedes the release portion of the previous ADR 0004
 
 ## Context
 
-ADR 0001 kept all release packaging and GitHub publication on an operator's
-Windows server while Blacksmith GitHub Actions handled PR checks. We still need
-Blacksmith to remain the primary PR/push CI, but a repeatable hosted Windows
-release build is safer than an ad-hoc workstation. Release credentials must not
-be exposed to build tooling or ordinary CI paths.
+Win-CodexBar needs reproducible hosted Windows validation and a release path
+whose build provenance can be verified by SignPath. SignPath's GitHub trusted
+build integration requires the build, the uploaded signing artifact, and the
+jobs leading to signing to be observed as GitHub Actions work on GitHub-hosted
+runners. CircleCI is retained for ordinary PR and protected-branch validation,
+but it cannot be the producer of the SignPath release artifact.
+
+Release credentials must remain unavailable to validation and build steps that
+do not need GitHub release write access. v0.60.3 was released before this
+change and is immutable.
 
 ## Decision
 
-Add `.circleci/config.yml` for the canonical `nesszer/Win-CodexBar` project.
-CircleCI is a release-only pipeline with exact `vX.Y.Z` tag filters and an
-explicit branch-ignore filter. `scripts/release-preflight.ps1` is a second
-boundary: it validates the canonical remote, full immutable tag SHA, protected
-`main` ancestry, and all project version files.
+CircleCI's .circleci/config.yml contains the pr-check validation workflow only.
+Its canonical local-check CI slice remains the primary hosted Windows gate.
+CircleCI has no tag release jobs, approval job, or release publisher.
 
-The `release-build` job uses hosted Windows without a GitHub write credential.
-It provisions/asserts pinned-enough prerequisites, uses a fixed WorkRoot
-(`~/cb/release`) with persistent caches (Cargo registry, Cargo target, and
-pnpm store), runs release-doctor, and invokes `windows-release-build.ps1` with
-the immutable SHA and `-SmokeInstall`. The WorkRoot's `cache/` subdirectory
-survives between runs while `source/` and `assets/` are cleaned fresh. It emits
-four expected assets, a manifest, and logs into a persisted workspace. The
-builder has no publication path.
+GitHub Actions owns the canonical tag release in
+.github/workflows/release.yml. The workflow accepts only canonical vX.Y.Z tags,
+checks out the exact tag SHA, runs release preflight, and builds on a
+GitHub-hosted Windows runner. It creates a signing input with exactly the
+installer, portable executable, and CLI ZIP, uploads that input as a GitHub
+Actions artifact, and submits it to the pinned SignPath configuration and
+release-signing policy.
 
-A required CircleCI approval separates build from `release-publish`. Only that
-job receives the project-restricted `github-release-publisher` context with a
-fine-grained `GH_TOKEN` scoped to repository Contents read/write. No Workflows
-permission is needed. `publish-github-release.ps1` creates or uses a draft
-release, compares existing assets by SHA-256, uploads only missing assets, fails
-on a digest mismatch, and never clobbers or finalizes a release.
+The workflow waits for SignPath, verifies Authenticode on the two top-level
+executables and codexbar-cli.exe at the root of the nested CLI ZIP, computes
+sidecars from signed bytes, and validates the exact six-asset final bundle.
+Only the verified bundle is passed to a separate publisher job with contents
+write permission. The publisher creates or updates a draft release and never
+replaces a divergent asset or finalizes a release.
+
+The manual SignPath Test workflow uses test-signing, builds a reviewed source
+ref with a matching version label, and retains its verified output as an
+Actions artifact. It never writes a GitHub Release.
 
 ## Trust boundaries
 
-- **Blacksmith Actions:** primary PR/push validation; unchanged permissions and
-  runner responsibilities.
-- **CircleCI build:** untrusted/reproducible packaging boundary; no GitHub write
-  secret, no release API calls, immutable source, fixed WorkRoot with
-  persistent build caches (see "Compiled-output caching" below).
-- **Human approval:** reviews persisted manifest/logs before publication.
-- **CircleCI publisher context:** sole release write capability; draft-only,
-  hash-safe, idempotent publisher.
-- **GitHub administrators:** protect `main` and the `v*` tag namespace and
-  manually finalize or roll back releases.
+- CircleCI validation has no GitHub release-write credential.
+- The GitHub signing job has read-only repository permission plus artifact
+  read access; it receives only the SignPath API token needed for submission.
+- The GitHub publisher job is the only job with contents write permission.
+- SignPath trusted-build and origin verification cover the GitHub workflow and
+  its artifact lineage.
+- Repository administrators protect main and the canonical vX.Y.Z tag
+  namespace and manually publish or roll back draft releases.
 
 ## Consequences
 
-- Release builds consume CircleCI hosted Windows credits only for protected
-  semver tags; branch and PR builds remain on Blacksmith.
-- A partial upload can be retried safely: exact assets are skipped and a
-  different digest is a hard failure rather than an overwrite.
-- Final release publication remains a deliberate GitHub action.
-- CircleCI project/context creation, token storage, tag rulesets, and billing
-  alerts remain manual administrator setup.
+- There is one release build lineage and one signing artifact lineage.
+- CircleCI Windows credits continue to cover PR and protected-branch checks.
+- GitHub-hosted Windows is used for release builds because SignPath requires
+  that trusted provenance.
+- A signing, verification, or publication mismatch fails closed. Re-running
+  the publisher is safe for exact matching assets, while a different digest
+  is a hard failure.
+- The first production-signed release is the next normal version after
+  SignPath certificate and policy onboarding is complete.
 
 ## Compiled-output caching
 
-The initial design avoided persistent compiled-output caches for OSS fork
-safety: a random GUID-based WorkRoot was created and deleted per run, ensuring
-no state carried between builds. This is now **superseded** — the pipeline
-enables Cargo registry, Cargo target, and pnpm store caching via CircleCI
-`save_cache`/`restore_cache` and a fixed WorkRoot (`~/cb/release`).
-
-### What is cached
-
-1. **Cargo registry** (`~/.cargo/registry`) — downloaded crate sources, keyed
-   on `Cargo.lock` checksum.
-2. **Cargo target** (`~/cb/release/cache/cargo-target` +
-   `cargo-target-cli`) — compiled build artifacts, keyed on `Cargo.lock` +
-   both `Cargo.toml` checksums, with a partial-match fallback key.
-3. **pnpm store** (`~/cb/release/cache/pnpm-store`) — content-addressable
-   node_modules store, cached alongside the cargo target under the same key.
-
-### Why it is safe
-
-- **Tag-only pipeline:** the workflow filters accept only `vX.Y.Z` semver tags
-  and ignore all branches. A fork cannot trigger the pipeline because pushes
-  to a fork do not create tags in the canonical repo.
-- **Protected tags:** the `v*` tag namespace is governed by a GitHub ruleset
-  that restricts tag creation to administrators.
-- **Preflight validation:** `release-preflight.ps1` validates the canonical
-  remote (`git origin`), immutable tag-to-SHA identity, and `main` ancestry
-  before any build step runs.
-- **Cache-key sensitivity:** the cache key includes `Cargo.lock` and both
-  `Cargo.toml` checksums, so a different dependency set or version bump
-  produces a cache miss rather than a stale-artifact build.
-- **No poisoning surface:** cache poisoning from a fork is not possible
-  because forks cannot trigger the tag-only pipeline or create protected tags.
+CircleCI may continue to cache Cargo registry data, Cargo targets, and the
+pnpm store for its validation job. The GitHub Actions release job may use its
+own GitHub-hosted cache strategy, but the final release assets are always
+built fresh from the frozen tag SHA and then signed. A cached output is never
+accepted as the final signed artifact without the full post-sign verification
+and manifest generation steps.

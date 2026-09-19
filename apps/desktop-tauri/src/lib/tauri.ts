@@ -389,6 +389,16 @@ export function setProviderUsageSource(providerId: string, source: string): Prom
   return invoke<void>("set_provider_usage_source", { providerId, source });
 }
 
+export function setProviderAutoResumeAfterQuotaReset(
+  providerId: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke<void>("set_provider_auto_resume_after_quota_reset", {
+    providerId,
+    enabled,
+  });
+}
+
 export function setProviderCookieSource(providerId: string, source: string): Promise<void> {
   return invoke<void>("set_provider_cookie_source", { providerId, source });
 }
@@ -495,6 +505,10 @@ export function codexAccountAdd(): Promise<CodexAccount> {
   return invoke<CodexAccount>("codex_account_add");
 }
 
+export function codexAccountReauthenticate(): Promise<CodexAccount> {
+  return invoke<CodexAccount>("codex_account_reauthenticate");
+}
+
 export function codexAccountRemove(id: string): Promise<void> {
   return invoke<void>("codex_account_remove", { id });
 }
@@ -518,14 +532,10 @@ export function codexAccountSnapshots(): Promise<
 }
 
 export function codexAccountRestartDesktop(
-  sessionRoot?: string | null,
-  backupDestination?: string | null,
-  restoreSource?: string | null,
+  switchId: string,
 ): Promise<void> {
   return invoke<void>("codex_account_restart_desktop", {
-    sessionRoot,
-    backupDestination,
-    restoreSource,
+    switchId,
   });
 }
 
@@ -541,6 +551,14 @@ export function claudeAccountsList(): Promise<ClaudeAccount[]> {
 
 export function claudeAccountAdd(): Promise<ClaudeAccount> {
   return invoke<ClaudeAccount>("claude_account_add");
+}
+
+/**
+ * Cancel the in-flight Add-account sign-in. Resolves `true` when one was
+ * running (its pending `claudeAccountAdd` then rejects), `false` otherwise.
+ */
+export function claudeAccountCancelLogin(): Promise<boolean> {
+  return invoke<boolean>("claude_account_cancel_login");
 }
 
 export function claudeAccountRemove(id: string): Promise<void> {
@@ -567,4 +585,8 @@ export function claudeAccountSnapshots(): Promise<
 
 export function getClaudeAccountsState(): Promise<ClaudeAccountsStateBridge> {
   return invoke<ClaudeAccountsStateBridge>("get_claude_accounts_state");
+}
+
+export function getSafeDiagnostics(): Promise<string> {
+  return invoke<string>("get_safe_diagnostics");
 }

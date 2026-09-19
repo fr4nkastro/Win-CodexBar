@@ -71,7 +71,10 @@ pub struct ClaudeAccount {
 }
 
 impl ClaudeAccount {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the persisted account record field-for-field"
+    )]
     pub fn new(
         id: Uuid,
         nickname: Option<String>,
@@ -476,7 +479,10 @@ mod tests {
 
     // ── email-tolerant matching (#12) ──────────────────────────────────
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test fixture mirrors the account record"
+    )]
     fn acct(id: &str, dir: &str, org_id: Option<&str>, email: Option<&str>) -> ClaudeAccount {
         ClaudeAccount::new(
             Uuid::parse_str(id).unwrap(),

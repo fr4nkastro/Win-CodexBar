@@ -25,7 +25,7 @@ const LOCAL_USAGE_TTL: Duration = Duration::from_secs(30);
 #[serde(rename_all = "camelCase")]
 pub struct DailyCostPoint {
     pub date: String,
-    pub value: f64,
+    pub value: Option<f64>,
 }
 
 /// A single (date, tokens) point for the Tokens chart mode (upstream 0.50.0
@@ -381,7 +381,10 @@ fn record_local_usage_fetch_failure(provider_id: &str, failure: CostFetchFailure
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "chart command helper reserved for future dashboard integration"
+)]
 pub(crate) enum CostFetchFailure {
     Failed,
     TimedOut,
@@ -491,7 +494,7 @@ fn load_openai_dashboard_chart_data(
         .iter()
         .map(|d| DailyCostPoint {
             date: d.day.clone(),
-            value: d.total_credits_used,
+            value: Some(d.total_credits_used),
         })
         .collect();
 
@@ -513,6 +516,14 @@ fn load_openai_dashboard_chart_data(
         .collect();
 
     (credits_history, usage_breakdown)
+}
+
+#[cfg(test)]
+pub(crate) fn load_openai_dashboard_chart_data_for_test(
+    provider_id: &str,
+    account_email: Option<&str>,
+) -> (Vec<DailyCostPoint>, Vec<DailyUsageBreakdown>) {
+    load_openai_dashboard_chart_data(provider_id, account_email)
 }
 
 #[cfg(test)]

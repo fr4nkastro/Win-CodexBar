@@ -224,8 +224,9 @@ impl PiFamilySessionScanner {
                 .map(|cwd| standardized_cwd_string(cwd));
 
             let mut record: Option<PiFamilySessionRecord> = None;
-            if let (Some(started_at), Some(standardized), Some(cwd)) =
-                (process.started_at, standardized_cwd.as_ref(), process_cwd)
+            if budget.has_time_remaining()
+                && let (Some(started_at), Some(standardized), Some(cwd)) =
+                    (process.started_at, standardized_cwd.as_ref(), process_cwd)
             {
                 let cwd_value = cwd.clone();
                 let cwd_path = PathBuf::from(&cwd_value);
@@ -239,7 +240,10 @@ impl PiFamilySessionScanner {
                     if !budget.has_time_remaining() {
                         break;
                     }
-                    let canonical_root = canonicalize_for_scan(&root.path);
+                    let Some(canonical_root) = budget.canonicalize_if_time_remaining(&root.path)
+                    else {
+                        break;
+                    };
                     let root_key = format!(
                         "{:?}:{:?}:{}",
                         dialect,
@@ -250,6 +254,11 @@ impl PiFamilySessionScanner {
                         records_in_root(&canonical_root, now, dialect, root.layout, budget)
                     });
                     if let Some(candidate) = root_records.iter().find(|candidate| {
+                        // CWD normalization is filesystem-backed on Windows;
+                        // do not start it for queued candidates after expiry.
+                        if !budget.has_time_remaining() {
+                            return false;
+                        }
                         candidate.modified_at >= started_at
                             && candidate
                                 .cwd
@@ -258,9 +267,9 @@ impl PiFamilySessionScanner {
                                 .is_some_and(|record_cwd| {
                                     standardized_cwd_string(record_cwd) == *standardized
                                 })
-                            && !used_record_paths.contains(&canonicalize_for_scan(&candidate.path))
+                            && !used_record_paths.contains(&candidate.path)
                     }) {
-                        used_record_paths.insert(canonicalize_for_scan(&candidate.path));
+                        used_record_paths.insert(candidate.path.clone());
                         record = Some(candidate.clone());
                         break;
                     }

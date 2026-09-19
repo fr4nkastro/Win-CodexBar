@@ -1,149 +1,89 @@
 # CI — Win-CodexBar
 
-Win-CodexBar has two deliberately separate hosted CI responsibilities:
+Win-CodexBar separates continuous validation from release signing.
 
-- **Blacksmith GitHub Actions** remains the primary PR/push validation path.
-- **CircleCI** is a release-only Windows path. It can start only for a
-  canonical protected semver tag (`vX.Y.Z`), never for a branch or PR.
+- CircleCI Windows is the primary PR and protected-branch validation path.
+  Its pr-check job runs scripts/local-check.ps1 -Slice ci.
+- GitHub Actions Windows is the sole canonical tag-release producer. Its
+  release workflow builds, signs through SignPath, verifies the signed files,
+  and creates a draft GitHub Release.
+- Blacksmith Windows remains a manual reserve workflow in
+  .github/workflows/pr-check.yml.
+- interaction-guard.yml is a lightweight GitHub-hosted policy guard.
 
-The CircleCI pipeline does not replace or weaken the Blacksmith checks. Its
-build job has no GitHub write credential; only the post-approval publisher
-receives the restricted `GH_TOKEN` context.
+## CircleCI validation
 
-## Blacksmith GitHub Actions
+.circleci/config.yml contains the pr-check workflow only. Canonical release
+tags are ignored by that workflow so CircleCI cannot create a competing
+release build or publisher. The validation job has no GitHub release-write
+credential.
 
-### PR check — `.github/workflows/pr-check.yml`
+The hosted PR check delegates to scripts/local-check.ps1 -Slice ci:
 
-Runs on `pull_request`, on `push` to `main`/`master`, and on
-`workflow_dispatch`. Runner: `blacksmith-4vcpu-windows-2025`
-(Windows Server 2025; VS Build Tools available per Blacksmith docs).
-
-Exact commands run, in order:
-
-```powershell
+~~~powershell
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+pnpm --dir apps/desktop-tauri install --frozen-lockfile
+pnpm --dir apps/desktop-tauri run lint
+pnpm --dir apps/desktop-tauri run test:anti-slop
 pnpm --dir apps/desktop-tauri test
 pnpm --dir apps/desktop-tauri run build
-```
+node --test .github/scripts/interaction-guard.test.mjs
+~~~
 
-This is the **local-check slice** from `scripts/local-check.ps1` only. It does
-not run release packaging, installer smoke, or publication.
+CircleCI's GitHub App trigger and auto-cancel settings live outside the
+repository. Keep PR, default-branch, and budget rules there; do not add a
+second tag trigger.
 
-`concurrency.cancel-in-progress` is on, keyed by ref, so superseded pushes
-cancel the in-flight run.
+## GitHub Actions release path
 
-### Interaction guard — `.github/workflows/interaction-guard.yml`
+.github/workflows/release.yml runs only for canonical vX.Y.Z tag pushes on a
+GitHub-hosted Windows runner. It:
 
-The interaction guard remains on `blacksmith-2vcpu-ubuntu-2404` with its
-existing `contents: read`, `issues: write`, and `pull-requests: write`
-permissions. It is unrelated to release publication.
+1. freezes the tag commit SHA and runs release preflight;
+2. requires the SignPath credentials before building;
+3. builds the three release artifacts;
+4. uploads exactly the installer, portable executable, and CLI ZIP to GitHub
+   Actions for SignPath;
+5. waits for release-signing to complete;
+6. verifies Authenticode on both executables and the CLI inside the ZIP;
+7. emits the final six assets and manifest from signed bytes; and
+8. creates or updates a draft release with the hash-safe publisher.
 
-## GitHub Actions budget mode
+A signing failure stops the workflow. It cannot publish unsigned assets. The
+manual signpath-test.yml workflow uses test-signing, retains its final bundle
+as an Actions artifact, and never publishes a release.
 
-Both GitHub workflows carry `if: vars.CI_BUDGET_MODE != 'off'`, so they run
-when the variable is unset (`normal`), `normal`, or `thin`, and skip only when
-it is `off`. This gate does not disable CircleCI releases.
+The production workflow requires SIGNPATH_API_TOKEN as its only SignPath
+repository secret. The organization ID, project slug, release-signing and
+test-signing policy names, and codexbar-installer artifact configuration are
+reviewed workflow values. Set the nonsecret Actions variable
+SIGNPATH_RELEASE_CERT_THUMBPRINT after the production certificate is issued;
+the finalizer rejects any signed file whose thumbprint differs.
 
-Set `CI_BUDGET_MODE` in **Settings → Secrets and variables → Actions →
-Variables**. Do not hard-code it in a workflow.
+GitHub Actions must have actions: read and contents: write for the production
+workflow. The test workflow has contents: read and actions: read. SignPath
+origin verification also requires the GitHub.com trusted build system to be
+linked to the project and the SignPath GitHub App to have repository access.
 
-| Mode   | PR check | Interaction guard | Circle release |
-|--------|----------|-------------------|----------------|
-| normal | runs     | runs              | tag-triggered  |
-| thin   | runs     | runs              | tag-triggered  |
-| off    | skip     | skip              | tag-triggered  |
+## Budget and safety boundary
 
-The Blacksmith Pool minutes intent remains roughly **60% Win-CodexBar**,
-**30% linear-cli**, and **10% buffer**. CircleCI credits are separate and must
-be budgeted in CircleCI.
+CircleCI remains the recurring Windows validation cost. The tag release path is
+in GitHub Actions because SignPath verifies GitHub-hosted build provenance.
+There is no parallel CircleCI tag build.
 
-## CircleCI release pipeline
+Keep the existing CircleCI budget gates, cache reuse, and auto-cancel settings.
+Use the manual Blacksmith workflow only when an independent Windows result is
+needed. Protect main and the canonical vX.Y.Z tag namespace.
 
-Configuration: `.circleci/config.yml`, project **`nesszer/Win-CodexBar`**.
-Both jobs use CircleCI's hosted Windows executor (`circleci/windows@5.0`).
+v0.60.3 is an immutable unsigned release from before the SignPath cutover.
+Do not replace its assets. The first signed release is the next normal version
+after SignPath production onboarding is complete.
 
-1. `release-build` runs only when the workflow tag filter matches exactly
-   `^v[0-9]+\.[0-9]+\.[0-9]+$`; branch filters explicitly ignore every branch.
-   The preflight rejects PR/branch environment markers as a second boundary.
-2. The credential-free build validates the canonical remote, full tag SHA,
-   tag-to-SHA identity, protected `main` ancestry, and every project version
-   file. It provisions/asserts Node 24.x via the `OpenJS.NodeJS.LTS` winget
-   package, pnpm 11.24.0, the Rust MSVC target, Git, and Inno Setup 6.
-3. It uses a new temporary `WorkRoot`, runs `release-doctor.ps1`, then runs
-   `windows-release-build.ps1` with the immutable SHA and `-SmokeInstall`.
-   It never uploads. Four assets, `release-manifest.json`, and build logs are
-   persisted to the workspace and stored as CircleCI artifacts.
-4. `release-approval` is a required manual CircleCI approval job.
-5. `release-publish` attaches the workspace and is the only job with context
-   `github-release-publisher`. Its `GH_TOKEN` is used by
-   `scripts/publish-github-release.ps1` to create or update a **draft** release.
-   Exact SHA-256 matches are skipped, mismatches fail, and missing assets are
-   uploaded without clobbering. The script never publishes/finalizes a release.
+## Local checks
 
-### CircleCI project and context setup
-
-These steps require repository/CircleCI administrator access and are not
-automated by this repository:
-
-1. Add the canonical GitHub project `nesszer/Win-CodexBar` to the CircleCI
-   organization and enable `.circleci/config.yml`.
-2. Create a restricted context named `github-release-publisher`, scoped only to
-   this project (and the release job if organization policy supports expression
-   restrictions). Add `GH_TOKEN` as a secret; never add it as a project
-   variable or to the build job.
-3. Use a fine-grained GitHub token for only this repository with **Contents:
-   read and write** (release asset API access). Do not grant **Workflows**
-   permission; no workflow file is changed by the publisher.
-4. Protect the `v*` tag namespace with a GitHub ruleset/tag protection policy
-   that permits only authorized release maintainers to create canonical
-   `vX.Y.Z` tags. Protect `main` and require the normal Blacksmith checks.
-5. Configure CircleCI notifications and a spending/credit alert appropriate to
-   the organization. Do not approve a release until the build artifacts and
-   manifest have been reviewed.
-
-The GitHub token is intentionally not available to checkout, preflight,
-prerequisite provisioning, release-doctor, build, smoke, or artifact steps.
-CircleCI project setup and GitHub tag/context/ruleset changes are the current
-manual setup scope.
-
-## Cost, retry, and rollback behavior
-
-Blacksmith Windows minutes remain the recurring PR cost and are still billed
-according to the existing Blacksmith plan (Windows has historically billed at
-2x on its free tier). CircleCI release builds add Windows executor credits only
-for protected semver tags, plus the short approval/publish job. Do not use
-CircleCI for branch validation or ad-hoc release testing.
-
-Reruns are safe: the build is tied to the immutable SHA from the tag and
-produces a fresh temporary WorkRoot. If publication stops after some uploads,
-rerun the publisher after approval; matching assets are skipped and a same-name
-different-hash asset fails rather than being replaced. A final/non-draft release
-is never modified by the publisher. Rollback or deletion of a draft/final
-release is a deliberate GitHub administrator action, followed by a new tag/SHA
-release if replacement is required.
-
-The current smoke scope is `scripts/windows-smoke-install.ps1`: install the
-generated Inno Setup installer, verify the expected application/version, then
-uninstall it. It does not prove every tray/UI/provider path; those remain
-separate Windows/CUA validation work.
-
-## Local release checks
-
-Run the same pure checks and parser-level validation locally:
-
-```powershell
+~~~powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release-pipeline.tests.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install-release-prerequisites.ps1 -AssertOnly
-```
-
-The hosted release flow is:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release-preflight.ps1 -Tag vX.Y.Z -Sha <full-40-char-sha>
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\circleci-release-build.ps1 -Tag vX.Y.Z -Sha <full-40-char-sha>
-```
-
-Do not pass an upload switch to `windows-release-build.ps1`; publication is
-owned exclusively by the approval-gated, hash-safe publisher.
+~~~

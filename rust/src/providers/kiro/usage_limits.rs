@@ -6,7 +6,8 @@ use serde::Deserialize;
 
 use crate::core::{ProviderError, RateWindow, UsageSnapshot};
 
-const ENDPOINT: &str = "https://codewhisperer.us-east-1.amazonaws.com/";
+const US_EAST_ENDPOINT: &str = "https://codewhisperer.us-east-1.amazonaws.com/";
+const FRANKFURT_ENDPOINT: &str = "https://q.eu-central-1.amazonaws.com/";
 const TARGET: &str = "AmazonCodeWhispererService.GetUsageLimits";
 const TOKEN_KEY: &str = "kirocli:odic:token";
 const PROFILE_KEY: &str = "api.codewhisperer.profile";
@@ -62,12 +63,15 @@ struct OverageConfiguration {
 
 pub(super) async fn fetch_usage_limits() -> Result<KiroUsageLimits, ProviderError> {
     let identity = read_identity(&state_database_path())?;
+    let endpoint = endpoint_for_profile_arn(&identity.profile_arn).ok_or_else(|| {
+        ProviderError::Other("Kiro profile ARN is unsupported for usage enrichment".into())
+    })?;
     let client = crate::core::credentialed_http_client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|error| ProviderError::Other(error.to_string()))?;
     let response = client
-        .post(ENDPOINT)
+        .post(endpoint)
         .header("Content-Type", "application/x-amz-json-1.0")
         .header("X-Amz-Target", TARGET)
         .header("Authorization", format!("Bearer {}", identity.access_token))
@@ -97,6 +101,8 @@ pub(super) fn apply_usage_limits(
         usage.primary.used_percent =
             (limits.plan_used / limits.plan_limit * 100.0).clamp(0.0, 100.0);
         usage.primary.resets_at = Some(limits.resets_at);
+        usage.primary.reset_description = None;
+        usage.primary.is_informational = false;
     }
 
     if limits.overage_enabled == Some(false) {
@@ -268,7 +274,7 @@ fn read_identity(path: &Path) -> Result<KiroIdentity, ProviderError> {
     let access_token =
         json_string(token_json.as_deref(), "access_token").ok_or(ProviderError::AuthRequired)?;
     let profile_arn =
-        json_string(profile_json.as_deref(), "arn").ok_or(ProviderError::AuthRequired)?;
+        json_string_exact(profile_json.as_deref(), "arn").ok_or(ProviderError::AuthRequired)?;
     Ok(KiroIdentity {
         access_token,
         profile_arn,
@@ -283,6 +289,40 @@ fn json_string(json: Option<&str>, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn json_string_exact(json: Option<&str>, key: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json?)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn endpoint_for_profile_arn(profile_arn: &str) -> Option<&'static str> {
+    if profile_arn
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return None;
+    }
+    let fields: Vec<_> = profile_arn.splitn(6, ':').collect();
+    if fields.len() != 6
+        || fields[0] != "arn"
+        || fields[1] != "aws"
+        || fields[2] != "codewhisperer"
+        || !fields[5]
+            .strip_prefix("profile/")
+            .is_some_and(|name| !name.is_empty())
+    {
+        return None;
+    }
+    match fields[3] {
+        "us-east-1" => Some(US_EAST_ENDPOINT),
+        "eu-central-1" => Some(FRANKFURT_ENDPOINT),
+        _ => None,
+    }
 }
 
 fn usable(value: f64, field: &str) -> Result<f64, ProviderError> {
@@ -305,7 +345,13 @@ fn reset_date(value: f64) -> Option<DateTime<Utc>> {
     if !value.is_finite() || !(1_000_000_000.0..=4_102_444_800.0).contains(&value) {
         return None;
     }
-    Utc.timestamp_opt(value as i64, 0).single()
+    // Range-checked above to valid Unix seconds.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "value is range-checked above to valid Unix seconds"
+    )]
+    let seconds = value as i64;
+    Utc.timestamp_opt(seconds, 0).single()
 }
 
 #[cfg(test)]
@@ -407,5 +453,37 @@ mod tests {
         let limits = parse_usage_limits(&data).unwrap();
         let usage = apply_usage_limits(UsageSnapshot::new(RateWindow::new(42.0)), &limits);
         assert!((usage.primary.used_percent - 42.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn profile_endpoint_follows_supported_region() {
+        assert_eq!(
+            endpoint_for_profile_arn("arn:aws:codewhisperer:us-east-1:123:profile/test"),
+            Some(US_EAST_ENDPOINT)
+        );
+        assert_eq!(
+            endpoint_for_profile_arn("arn:aws:codewhisperer:eu-central-1:123:profile/test"),
+            Some(FRANKFURT_ENDPOINT)
+        );
+    }
+
+    #[test]
+    fn unsupported_profile_arns_have_no_enrichment_endpoint() {
+        for profile_arn in [
+            "",
+            "not-an-arn",
+            "arn:aws-cn:codewhisperer:eu-central-1:123:profile/test",
+            "arn:aws:s3:eu-central-1:123:profile/test",
+            "arn:aws:codewhisperer:ap-southeast-1:123:profile/test",
+            "arn:aws:codewhisperer:eu-central-1:123:profile/",
+            "arn:aws:codewhisperer:eu-central-1:123:other/test",
+            "arn:aws:codewhisperer:eu-central-1:123:profile/test ",
+        ] {
+            assert_eq!(
+                endpoint_for_profile_arn(profile_arn),
+                None,
+                "{profile_arn:?}"
+            );
+        }
     }
 }

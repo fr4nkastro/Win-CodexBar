@@ -101,6 +101,10 @@ fn window_minutes(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> O
     let (start, end) = (start?, end?);
     let minutes = (end - start).num_minutes();
     if minutes > 0 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "guarded by `minutes > 0`; a window longer than ~8 million years is impossible"
+        )]
         Some(minutes as u32)
     } else {
         None
@@ -127,6 +131,12 @@ fn resets_at(
     } else {
         remains as f64
     };
+    // Display/rounding conversion of an epoch value; sub-second precision is
+    // intentionally dropped.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "epoch seconds truncated to whole seconds by design"
+    )]
     Some(now + Duration::seconds(seconds as i64))
 }
 
@@ -215,7 +225,12 @@ fn window_type_from_duration(start: Option<DateTime<Utc>>, end: Option<DateTime<
     } else if (4.0..=6.0).contains(&duration_hours) {
         "5 hours".to_string()
     } else if (1.0..23.0).contains(&duration_hours) {
-        format!("{} hours", duration_hours as i64)
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "label only; duration already filtered into the 1..23 hours bucket"
+        )]
+        let label = format!("{} hours", duration_hours as i64);
+        label
     } else {
         "Custom".to_string()
     }
@@ -287,7 +302,10 @@ fn reset_description(
 /// Build a `RemainsRow` from the raw interval/weekly fields (upstream
 /// `makeServiceUsage`). Returns `None` when the row is a placeholder that
 /// should be skipped.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "signature mirrors the flat upstream makeServiceUsage payload fields one-to-one"
+)]
 fn make_remains_row(
     service_type: &str,
     window_type_override: Option<&str>,
@@ -706,7 +724,10 @@ fn percent_string_to_f64(value: Option<&Value>) -> Option<f64> {
 /// Returns `None` for the status-3 "no quota for this lane" placeholder
 /// (e.g. the `video` model on a text-only Token Plan) or when the used
 /// percentage is missing.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one argument per remains_percent lane field"
+)]
 fn make_remains_percent_row(
     service_type: &str,
     used_percent: Option<f64>,
@@ -732,9 +753,7 @@ fn make_remains_percent_row(
     };
 
     let mut time_range = time_range_string(start_dt, end_dt);
-    if is_weekly
-        && let Some(weekly_range) = weekly_time_range_string(start_dt, end_dt)
-    {
+    if is_weekly && let Some(weekly_range) = weekly_time_range_string(start_dt, end_dt) {
         time_range = weekly_range;
     }
 
@@ -795,7 +814,11 @@ pub(super) fn parse_remains_percent(
         .and_then(|v| v.as_array());
     let entries = match model_remains {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return Err(ProviderError::Parse("Missing token plan remains data.".into())),
+        _ => {
+            return Err(ProviderError::Parse(
+                "Missing token plan remains data.".into(),
+            ));
+        }
     };
 
     let data_obj = json.get("data").unwrap_or(json);
@@ -845,11 +868,7 @@ pub(super) fn parse_remains_percent(
             )),
             value_i64(get_field(entry, "weekly_start_time", "weeklyStartTime")),
             value_i64(get_field(entry, "weekly_end_time", "weeklyEndTime")),
-            value_i64(get_field(
-                entry,
-                "weekly_remains_time",
-                "weeklyRemainsTime",
-            )),
+            value_i64(get_field(entry, "weekly_remains_time", "weeklyRemainsTime")),
             now,
             true,
         ) {
@@ -859,7 +878,9 @@ pub(super) fn parse_remains_percent(
     }
 
     if rows.is_empty() {
-        return Err(ProviderError::Parse("Missing token plan remains data.".into()));
+        return Err(ProviderError::Parse(
+            "Missing token plan remains data.".into(),
+        ));
     }
     Ok(MiniMaxCodingPlanSnapshot::Remains { plan_name, rows })
 }

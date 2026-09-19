@@ -6,7 +6,10 @@
 //! - Manual cookies
 //! - Other user preferences
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "settings types mirror the full config schema; some fields are not yet consumed"
+)]
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -573,12 +576,15 @@ impl Default for Settings {
 impl Settings {
     /// Get the settings file path
     pub fn settings_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|p| p.join("CodexBar").join("settings.json"))
+        crate::logging::config_root().map(|p| p.join("settings.json"))
     }
 
     /// Load settings from disk
     pub fn load() -> Self {
-        #[allow(unused_mut)]
+        #[allow(
+            unused_mut,
+            reason = "mutability is needed for conditional initialization paths that the compiler cannot prove"
+        )]
         let mut settings = match Self::settings_path() {
             Some(path) if path.exists() => match crate::secure_file::read_string(&path) {
                 Ok(content) => {
@@ -601,7 +607,7 @@ impl Settings {
 
     /// Marker written after the one-shot "pin tray by default" migration (issue #237).
     fn promote_tray_default_marker_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|p| p.join("CodexBar").join(".tray-pin-default-v1"))
+        crate::logging::config_root().map(|p| p.join(".tray-pin-default-v1"))
     }
 
     /// Old builds defaulted `promote_tray_icon` to false and persisted that on any
@@ -626,7 +632,8 @@ impl Settings {
             }
         }
         if !already_migrated && let Some(parent) = marker.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            // Best-effort marker dir creation; the write below reports failure.
+            let _created_dir = std::fs::create_dir_all(parent);
             if let Err(error) = std::fs::write(&marker, b"1") {
                 tracing::warn!("Failed to write promote_tray_icon migration marker: {error}");
             }
@@ -690,7 +697,8 @@ impl Settings {
             let command = Self::start_at_login_command(&exe_path);
             run_key.set_value("CodexBar", &command)?;
         } else {
-            let _ = run_key.delete_value("CodexBar");
+            // Best-effort removal; a missing value means the desired state already.
+            let _removed_value = run_key.delete_value("CodexBar");
         }
 
         Ok(())
@@ -1028,6 +1036,19 @@ impl Settings {
         self.provider_config_mut(id).avoid_keychain_prompts = value;
     }
 
+    /// Whether the desktop shell may reopen a captured CLI session after its
+    /// provider quota becomes available again. This is intentionally opt-in.
+    pub fn auto_resume_after_quota_reset(&self, id: ProviderId) -> bool {
+        self.provider_configs
+            .get(&id)
+            .map(|config| config.auto_resume_after_quota_reset)
+            .unwrap_or(false)
+    }
+
+    pub fn set_auto_resume_after_quota_reset(&mut self, id: ProviderId, value: bool) {
+        self.provider_config_mut(id).auto_resume_after_quota_reset = value;
+    }
+
     // ── Legacy field-name aliases ────────────────────────────────────
     //
     // Keep the names of the old flat per-provider fields available as
@@ -1213,6 +1234,38 @@ impl Settings {
     }
     pub fn set_claude_avoid_keychain_prompts(&mut self, v: bool) {
         self.set_avoid_keychain_prompts(ProviderId::Claude, v)
+    }
+
+    /// Claude-only: whether the external claude-swap (`cswap`) adapter is
+    /// enabled. Disabled by default.
+    pub fn claude_swap_enabled(&self) -> bool {
+        self.provider_configs
+            .get(&ProviderId::Claude)
+            .map(|config| config.claude_swap_enabled)
+            .unwrap_or(false)
+    }
+
+    pub fn set_claude_swap_enabled(&mut self, value: bool) {
+        self.provider_config_mut(ProviderId::Claude)
+            .claude_swap_enabled = value;
+    }
+
+    /// Claude-only: configured claude-swap executable path, or `""` when unset.
+    pub fn claude_swap_executable_path(&self) -> &str {
+        self.provider_configs
+            .get(&ProviderId::Claude)
+            .and_then(|config| config.claude_swap_executable_path.as_deref())
+            .unwrap_or("")
+    }
+
+    pub fn set_claude_swap_executable_path(&mut self, value: impl Into<String>) {
+        let trimmed = value.into().trim().to_string();
+        let config = self.provider_config_mut(ProviderId::Claude);
+        config.claude_swap_executable_path = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
     }
 
     // ── Per-provider accent color override (#2972) ──────────────────

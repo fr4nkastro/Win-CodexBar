@@ -9,6 +9,8 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+mod token_math;
+
 use crate::core::{
     CostSnapshot, FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId,
     ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
@@ -99,6 +101,57 @@ pub struct MistralProvider {
     client: Client,
 }
 
+#[derive(Debug, Default)]
+struct TokenCounts {
+    input: i64,
+    output: i64,
+    cached: i64,
+}
+
+#[derive(Clone, Copy)]
+enum TokenKind {
+    Input,
+    Output,
+    Cached,
+}
+
+#[derive(Clone, Copy)]
+enum AggregationMode {
+    CostOnly,
+    CostAndTokens,
+}
+
+enum ModelAggregation {
+    Cost(f64),
+    CostAndTokens { tokens: TokenCounts, cost: f64 },
+}
+
+impl TokenCounts {
+    fn add_lane(&mut self, units: i64, kind: TokenKind) -> Result<(), ProviderError> {
+        let lane = match kind {
+            TokenKind::Input => &mut self.input,
+            TokenKind::Output => &mut self.output,
+            TokenKind::Cached => &mut self.cached,
+        };
+        *lane = lane.checked_add(units).ok_or_else(|| {
+            ProviderError::Parse("Mistral token count exceeds supported range".into())
+        })?;
+        Ok(())
+    }
+
+    fn add(&mut self, other: &Self) -> Result<(), ProviderError> {
+        self.add_lane(other.input, TokenKind::Input)?;
+        self.add_lane(other.output, TokenKind::Output)?;
+        self.add_lane(other.cached, TokenKind::Cached)
+    }
+
+    fn total(&self) -> Result<i64, ProviderError> {
+        token_math::checked_total(self.input, self.cached, self.output).ok_or_else(|| {
+            ProviderError::Parse("Mistral token count exceeds supported range".into())
+        })
+    }
+}
+
 impl MistralProvider {
     pub fn new() -> Self {
         Self {
@@ -170,26 +223,28 @@ impl MistralProvider {
         let billing: BillingResponse = serde_json::from_str(&body)
             .map_err(|e| ProviderError::Parse(format!("Failed to parse Mistral usage: {e}")))?;
 
-        let summary = Self::summarize_billing(billing);
+        let summary = Self::summarize_billing(billing)?;
         Ok(Self::build_result(summary))
     }
 
-    fn summarize_billing(billing: BillingResponse) -> MistralUsageSummary {
+    fn summarize_billing(billing: BillingResponse) -> Result<MistralUsageSummary, ProviderError> {
         let prices = Self::build_price_index(billing.prices.unwrap_or_default());
         let mut total_cost = 0.0;
-        let mut total_input_tokens = 0;
-        let mut total_output_tokens = 0;
-        let mut total_cached_tokens = 0;
+        let mut total_tokens = TokenCounts::default();
         let mut model_count = 0;
 
         if let Some(models) = billing.completion.and_then(|c| c.models) {
             model_count += models.len();
             for data in models.values() {
-                let (input, output, cached, cost) = Self::aggregate_model(data, &prices);
-                total_input_tokens += input;
-                total_output_tokens += output;
-                total_cached_tokens += cached;
-                total_cost += cost;
+                match Self::aggregate_model(data, &prices, AggregationMode::CostAndTokens)? {
+                    ModelAggregation::CostAndTokens { tokens, cost } => {
+                        total_tokens.add(&tokens)?;
+                        Self::accumulate_finite_cost(cost, &mut total_cost);
+                    }
+                    ModelAggregation::Cost(_) => {
+                        unreachable!("token mode returned cost-only result")
+                    }
+                }
             }
         }
 
@@ -199,7 +254,10 @@ impl MistralProvider {
         {
             if let Some(models) = category.models {
                 for data in models.values() {
-                    total_cost += Self::aggregate_model(data, &prices).3;
+                    Self::accumulate_finite_cost(
+                        Self::aggregate_cost(data, &prices)?,
+                        &mut total_cost,
+                    );
                 }
             }
         }
@@ -208,7 +266,10 @@ impl MistralProvider {
             for category in [libraries.pages, libraries.tokens].into_iter().flatten() {
                 if let Some(models) = category.models {
                     for data in models.values() {
-                        total_cost += Self::aggregate_model(data, &prices).3;
+                        Self::accumulate_finite_cost(
+                            Self::aggregate_cost(data, &prices)?,
+                            &mut total_cost,
+                        );
                     }
                 }
             }
@@ -220,23 +281,28 @@ impl MistralProvider {
                 .flatten()
             {
                 for data in models.values() {
-                    total_cost += Self::aggregate_model(data, &prices).3;
+                    Self::accumulate_finite_cost(
+                        Self::aggregate_cost(data, &prices)?,
+                        &mut total_cost,
+                    );
                 }
             }
         }
 
         let _ = billing.start_date;
 
-        MistralUsageSummary {
+        total_tokens.total()?;
+
+        Ok(MistralUsageSummary {
             total_cost,
             currency: billing.currency.unwrap_or_else(|| "EUR".to_string()),
             currency_symbol: billing.currency_symbol.unwrap_or_else(|| "€".to_string()),
-            total_input_tokens,
-            total_output_tokens,
-            total_cached_tokens,
+            total_input_tokens: total_tokens.input,
+            total_output_tokens: total_tokens.output,
+            total_cached_tokens: total_tokens.cached,
             model_count,
             end_date: billing.end_date.as_deref().and_then(Self::parse_date),
-        }
+        })
     }
 
     fn build_result(summary: MistralUsageSummary) -> ProviderFetchResult {
@@ -293,36 +359,52 @@ impl MistralProvider {
     fn aggregate_model(
         data: &ModelUsageData,
         prices: &HashMap<String, f64>,
-    ) -> (i64, i64, i64, f64) {
-        let (input, input_cost) = Self::aggregate_entries(data.input.as_deref(), prices);
-        let (output, output_cost) = Self::aggregate_entries(data.output.as_deref(), prices);
-        let (cached, cached_cost) = Self::aggregate_entries(data.cached.as_deref(), prices);
-        (
-            input,
-            output,
-            cached,
-            input_cost + output_cost + cached_cost,
-        )
-    }
-
-    fn aggregate_entries(
-        entries: Option<&[UsageEntry]>,
-        prices: &HashMap<String, f64>,
-    ) -> (i64, f64) {
-        let mut tokens = 0;
+        mode: AggregationMode,
+    ) -> Result<ModelAggregation, ProviderError> {
+        let mut tokens = TokenCounts::default();
         let mut cost = 0.0;
-        for entry in entries.unwrap_or_default() {
-            let paid = entry.value_paid.or(entry.value).unwrap_or(0);
-            tokens += paid;
-            if let (Some(metric), Some(group)) = (&entry.billing_metric, &entry.billing_group) {
-                let entry_cost =
-                    (paid as f64) * prices.get(&format!("{metric}::{group}")).unwrap_or(&0.0);
-                if entry_cost.is_finite() {
-                    cost += entry_cost;
+        for (kind, entries) in [
+            (TokenKind::Input, data.input.as_deref()),
+            (TokenKind::Output, data.output.as_deref()),
+            (TokenKind::Cached, data.cached.as_deref()),
+        ] {
+            for entry in entries.unwrap_or_default() {
+                let units = entry.value_paid.or(entry.value).unwrap_or(0);
+                if matches!(mode, AggregationMode::CostAndTokens) {
+                    tokens.add_lane(units, kind)?;
+                }
+                if let (Some(metric), Some(group)) = (&entry.billing_metric, &entry.billing_group) {
+                    let entry_cost =
+                        (units as f64) * prices.get(&format!("{metric}::{group}")).unwrap_or(&0.0);
+                    Self::accumulate_finite_cost(entry_cost, &mut cost);
                 }
             }
         }
-        (tokens, cost)
+        Ok(match mode {
+            AggregationMode::CostOnly => ModelAggregation::Cost(cost),
+            AggregationMode::CostAndTokens => ModelAggregation::CostAndTokens { tokens, cost },
+        })
+    }
+
+    fn aggregate_cost(
+        data: &ModelUsageData,
+        prices: &HashMap<String, f64>,
+    ) -> Result<f64, ProviderError> {
+        match Self::aggregate_model(data, prices, AggregationMode::CostOnly)? {
+            ModelAggregation::Cost(cost) => Ok(cost),
+            ModelAggregation::CostAndTokens { .. } => {
+                unreachable!("cost mode returned token-bearing result")
+            }
+        }
+    }
+
+    fn accumulate_finite_cost(cost: f64, total: &mut f64) {
+        if cost.is_finite() {
+            let updated = *total + cost;
+            if updated.is_finite() {
+                *total = updated;
+            }
+        }
     }
 
     fn parse_date(value: &str) -> Option<DateTime<Utc>> {
@@ -416,7 +498,7 @@ mod tests {
         }))
         .unwrap();
 
-        let summary = MistralProvider::summarize_billing(billing);
+        let summary = MistralProvider::summarize_billing(billing).unwrap();
         assert!((summary.total_cost - 0.005).abs() < 0.000001);
         assert_eq!(summary.model_count, 1);
 
@@ -462,8 +544,48 @@ mod tests {
         }))
         .unwrap();
 
-        let summary = MistralProvider::summarize_billing(billing);
+        let summary = MistralProvider::summarize_billing(billing).unwrap();
 
         assert_eq!(summary.total_cost, 0.0);
+    }
+
+    #[test]
+    fn preserves_signed_lanes_when_the_checked_total_cancels() {
+        let billing: BillingResponse = serde_json::from_value(serde_json::json!({
+            "completion": {
+                "models": {
+                    "fixture": {
+                        "input": [{"value": i64::MAX}],
+                        "cached": [{"value": -1}],
+                        "output": [{"value": 1}]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let summary = MistralProvider::summarize_billing(billing).unwrap();
+        assert_eq!(summary.total_input_tokens, i64::MAX);
+        assert_eq!(summary.total_cached_tokens, -1);
+        assert_eq!(summary.total_output_tokens, 1);
+    }
+
+    #[test]
+    fn rejects_same_lane_token_overflow_during_aggregation() {
+        let billing: BillingResponse = serde_json::from_value(serde_json::json!({
+            "completion": {
+                "models": {
+                    "fixture": {
+                        "input": [{"value": i64::MAX}, {"value": 1}]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            MistralProvider::summarize_billing(billing),
+            Err(ProviderError::Parse(message)) if message.contains("token count")
+        ));
     }
 }

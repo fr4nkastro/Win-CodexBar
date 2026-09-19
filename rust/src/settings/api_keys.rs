@@ -207,6 +207,19 @@ pub fn get_api_key_providers() -> Vec<ProviderConfigInfo> {
             dashboard_url: Some("https://ollama.com/settings"),
         },
         ProviderConfigInfo {
+            id: ProviderId::MiniMax,
+            name: "MiniMax",
+            requires_api_key: false,
+            api_key_env_var: Some("MINIMAX_API_KEY"),
+            api_key_help: Some(
+                "Optional: a MiniMax API key reads real coding-plan quota via the console's remains API, bypassing the client-rendered usage/plan pages that browser cookies alone cannot scrape.",
+            ),
+            config_file_path: None,
+            dashboard_url: Some(
+                "https://platform.minimax.io/user-center/basic-information/interface-key",
+            ),
+        },
+        ProviderConfigInfo {
             id: ProviderId::AzureOpenAI,
             name: "Azure OpenAI",
             requires_api_key: true,
@@ -262,7 +275,7 @@ pub fn get_api_key_providers() -> Vec<ProviderConfigInfo> {
             name: "Kilo",
             requires_api_key: true,
             api_key_env_var: Some("KILO_API_KEY"),
-            api_key_help: Some("Get your API key from Kilo, or sign in with Kilo CLI."),
+            api_key_help: Some("Get your API key from Kilo, or run `kilo auth login`."),
             config_file_path: Some("~/.local/share/kilo/auth.json"),
             dashboard_url: Some("https://app.kilo.ai/usage"),
         },
@@ -554,6 +567,15 @@ pub fn get_api_key_providers() -> Vec<ProviderConfigInfo> {
             ),
             config_file_path: Some("%USERPROFILE%\\.factory\\.env"),
             dashboard_url: Some("https://app.factory.ai/settings/api-keys"),
+        },
+        ProviderConfigInfo {
+            id: ProviderId::Meta,
+            name: "Meta",
+            requires_api_key: true,
+            api_key_env_var: Some("MODEL_API_KEY / META_API_KEY"),
+            api_key_help: Some("Create key in Meta Model API dashboard"),
+            config_file_path: None,
+            dashboard_url: Some("https://dev.meta.ai/docs"),
         },
     ]
 }

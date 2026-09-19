@@ -1,6 +1,7 @@
 //! Claude provider implementation
 
 mod admin_api;
+pub mod claude_swap;
 mod cli_reset;
 mod oauth;
 mod scoped_weekly;
@@ -19,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use crate::cli::tty_runner::{TtyCommandOptions, TtyCommandRunner};
 use crate::core::{
-    FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
-    RateWindow, SourceMode, UsageSnapshot,
+    FetchContext, LastGoodFailurePolicy, Provider, ProviderError, ProviderFetchResult, ProviderId,
+    ProviderMetadata, RateWindow, SourceMode, UsageSnapshot,
 };
 
 use admin_api::ClaudeAdminApiFetcher;
@@ -48,6 +49,15 @@ struct CachedCliResult {
 static CLI_RESULT_CACHE: LazyLock<Mutex<Option<CachedCliResult>>> =
     LazyLock::new(|| Mutex::new(None));
 
+/// Drop cached CLI results, refreshed OAuth tokens, and refresh backoff for
+/// `credential_path` after its login was replaced (account switch).
+pub(crate) fn clear_account_caches(credential_path: &std::path::Path) {
+    if let Ok(mut cache) = CLI_RESULT_CACHE.lock() {
+        *cache = None;
+    }
+    oauth::clear_account_cache(credential_path);
+}
+
 /// Store a successful CLI fetch result in the 15-minute cache.
 fn cache_cli_result(result: ProviderFetchResult) {
     if let Ok(mut guard) = CLI_RESULT_CACHE.lock() {
@@ -67,7 +77,13 @@ fn cached_cli_result() -> Option<ProviderFetchResult> {
     guard
         .as_ref()
         .filter(|entry| entry.cached_at.elapsed() <= CLI_RESULT_CACHE_TTL)
-        .map(|entry| entry.result.clone())
+        .map(|entry| {
+            let mut result = entry.result.clone();
+            // A retained payload is useful for display, but cannot prove that
+            // the current fetch reached Claude CLI successfully.
+            result.has_successful_claude_cli_quota = false;
+            result
+        })
 }
 
 /// Whether the OAuth source failed with a revocation (not just expiry).
@@ -100,6 +116,13 @@ pub(crate) fn persist_credentials_in(
     oauth::persist_refreshed_credentials_in(dir, credentials)
 }
 
+/// Recovery guidance for a Claude web request blocked by a Cloudflare challenge.
+pub const CLOUDFLARE_CHALLENGE_MESSAGE: &str = concat!(
+    "claude.ai is behind a Cloudflare challenge, often caused by VPN or datacenter networks. ",
+    "Re-authenticating will not help. Switch Claude Usage source to OAuth in Settings ",
+    "(Usage credits balance will be unavailable), or try a different network."
+);
+
 /// Whether the user explicitly consented to reading (and refreshing) Claude
 /// Code's own credentials. Upstream #2634/#2745: without consent the
 /// file/keyring sources stay closed and refreshed tokens are never rotated
@@ -107,6 +130,12 @@ pub(crate) fn persist_credentials_in(
 /// reduced-fidelity CLI usage.
 pub(crate) fn claude_code_consent() -> bool {
     crate::settings::Settings::load().claude_allow_reading_claude_code_credentials
+}
+
+/// Return the identity of the credential that can authorize a Claude CLI
+/// resume. The OAuth module applies the same consent boundary as its fetcher.
+pub fn auto_resume_identity() -> Option<String> {
+    oauth::auto_resume_identity()
 }
 
 /// Claude provider implementation
@@ -207,7 +236,8 @@ fn cleanup_probe_session_jsonl(probe_dir: &std::path::Path) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            let _ = std::fs::remove_file(&path);
+            // Best-effort cleanup: a locked or missing probe file just stays.
+            let _removed = std::fs::remove_file(&path);
         }
     }
 }
@@ -218,6 +248,8 @@ fn claude_probe_launch_args(session_id: &str) -> Vec<String> {
         "user".to_string(),
         "--allowed-tools".to_string(),
         String::new(),
+        "--settings".to_string(),
+        r#"{"remoteControlAtStartup":false}"#.to_string(),
         "--session-id".to_string(),
         session_id.to_string(),
     ]
@@ -274,7 +306,7 @@ async fn run_claude_trust_preflight(
 }
 
 fn resolve_claude_cli_path() -> Result<std::path::PathBuf, ProviderError> {
-    which_claude().ok_or_else(|| {
+    locate_claude_binary().ok_or_else(|| {
         ProviderError::NotInstalled(
             "Claude CLI not found. Install from https://docs.claude.ai/claude-code".to_string(),
         )
@@ -313,7 +345,7 @@ fn claude_cli_auth_error(lowered: &str) -> Option<ProviderError> {
         return Some(ProviderError::AuthRequired);
     }
     if lowered.contains("token expired") || lowered.contains("token_expired") {
-        return Some(ProviderError::OAuth(
+        return Some(ProviderError::OAuthExpired(
             "Token expired. Run `claude login` to refresh.".to_string(),
         ));
     }
@@ -372,6 +404,9 @@ async fn run_claude_pty_probe(
     probe: ClaudePtyProbeOptions,
 ) -> Result<String, ProviderError> {
     tokio::task::spawn_blocking(move || {
+        // Keep ownership in the worker: cancelling the async refresh does not
+        // stop spawn_blocking or its CLI process from rotating credentials.
+        let _account_operation = crate::claude_accounts::CREDENTIAL_OPERATION.blocking_lock();
         cleanup_probe_session_jsonl(&working_directory);
         let session_id = load_or_create_probe_session_id(&working_directory);
         let env = claude_passive_probe_env(TtyCommandRunner::enriched_environment());
@@ -403,8 +438,51 @@ async fn run_claude_pty_probe(
     })
 }
 
+fn last_good_failure_policy_for_error(error: &str) -> LastGoodFailurePolicy {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("credentials not found")
+        || (lower.contains("run") && lower.contains("claude") && lower.contains("authenticate"))
+        || (lower.contains("not installed") && lower.contains("claude"))
+        || (lower.contains("subscription") && lower.contains("unavailable"))
+    {
+        return LastGoodFailurePolicy::Replace;
+    }
+    if lower.contains(&CLOUDFLARE_CHALLENGE_MESSAGE.to_ascii_lowercase()) {
+        return LastGoodFailurePolicy::PreserveOnceThenSurface;
+    }
+    if lower.contains("parse error")
+        || lower.contains("empty output")
+        || lower.contains("missing current session")
+        || lower.contains("treated /usage as a normal prompt")
+        || lower.contains("local activity stats")
+        || lower.contains("could not parse")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("ratelimited")
+        || error.eq_ignore_ascii_case("timeout")
+        || lower.contains("timed out")
+    {
+        return LastGoodFailurePolicy::Preserve;
+    }
+    if lower.contains("unauthorized")
+        || lower.contains("authentication required")
+        || lower.contains("auth required")
+    {
+        return LastGoodFailurePolicy::PreserveOnce;
+    }
+    LastGoodFailurePolicy::Replace
+}
+
 #[async_trait]
 impl Provider for ClaudeProvider {
+    fn manual_cookie_precedes_token_account(&self) -> bool {
+        true
+    }
+
+    fn automatic_metric_prioritizes_exhausted_window(&self) -> bool {
+        false
+    }
+
     fn id(&self) -> ProviderId {
         ProviderId::Claude
     }
@@ -453,8 +531,30 @@ impl Provider for ClaudeProvider {
         true
     }
 
+    fn owns_browser_cookie_resolution(&self) -> bool {
+        true
+    }
+
+    fn last_good_failure_policy(&self, error: &str) -> LastGoodFailurePolicy {
+        last_good_failure_policy_for_error(error)
+    }
+
     fn detect_version(&self) -> Option<String> {
         detect_claude_version()
+    }
+    /// Claude's CLI-presence probe (`resolve_claude_cli_path`) raises
+    /// `NotInstalled` when the `claude` binary itself is missing — an
+    /// installation gap, not a credential problem — so it surfaces as an
+    /// offline local runtime (matching the pre-backend classifier's
+    /// treatment of CLI-presence failures). Message-scoped so any future
+    /// credential-flavored `NotInstalled` keeps the default mapping.
+    fn error_state_kind(&self, error: &ProviderError) -> crate::core::ProviderStateKind {
+        match error {
+            ProviderError::NotInstalled(msg) if msg.contains("CLI not found") => {
+                crate::core::ProviderStateKind::LocalRuntimeOffline
+            }
+            _ => error.state_kind(),
+        }
     }
 }
 
@@ -586,7 +686,11 @@ impl ClaudeProvider {
             return Err(error);
         }
 
-        self.parse_cli_output(&combined)
+        let mut result = self.parse_cli_output(&combined)?;
+        if let Some(identity) = auto_resume_identity() {
+            result = result.with_account_identity(identity);
+        }
+        Ok(mark_live_claude_cli_result(result))
     }
 
     /// Parse Claude CLI /usage output
@@ -712,6 +816,18 @@ impl ClaudeProvider {
     }
 }
 
+fn has_real_claude_quota_window(usage: &UsageSnapshot) -> bool {
+    let is_real = |window: &RateWindow| !window.is_informational && window.used_percent.is_finite();
+    is_real(&usage.primary) || usage.secondary.as_ref().is_some_and(is_real)
+}
+
+fn mark_live_claude_cli_result(mut result: ProviderFetchResult) -> ProviderFetchResult {
+    if has_real_claude_quota_window(&result.usage) {
+        result.has_successful_claude_cli_quota = true;
+    }
+    result
+}
+
 fn record_auto_source(
     failures: &mut Vec<(&'static str, ProviderError)>,
     source: &'static str,
@@ -748,8 +864,15 @@ fn should_fallback_from_claude_cli_error(error: &ProviderError) -> bool {
     }
 }
 
-/// Try to find the claude CLI binary
-fn which_claude() -> Option<std::path::PathBuf> {
+/// Locate the Claude CLI for shell integrations that need to reopen a session.
+pub fn locate_claude_binary() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("CLAUDE_BINARY")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return Some(path);
+    }
+
     #[cfg(windows)]
     {
         let candidates = [
@@ -833,7 +956,7 @@ fn find_windows_claude_in_path() -> Option<std::path::PathBuf> {
 
 /// Detect the version of the claude CLI
 fn detect_claude_version() -> Option<String> {
-    let claude_path = which_claude()?;
+    let claude_path = locate_claude_binary()?;
 
     #[cfg(windows)]
     const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -1091,13 +1214,18 @@ mod tests {
         assert_eq!(first, second);
         assert!(uuid::Uuid::parse_str(&first).is_ok());
         let args = claude_probe_launch_args(&first);
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--session-id" && w[1] == first)
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--allowed-tools" && w[1].is_empty())
+        assert_eq!(
+            args,
+            vec![
+                "--setting-sources".to_string(),
+                "user".to_string(),
+                "--allowed-tools".to_string(),
+                String::new(),
+                "--settings".to_string(),
+                r#"{"remoteControlAtStartup":false}"#.to_string(),
+                "--session-id".to_string(),
+                first,
+            ]
         );
     }
 
@@ -1535,10 +1663,45 @@ Active days: 2/10              Longest streak: 1 day
 
     #[test]
     fn cli_result_cache_round_trips() {
-        let result = ProviderFetchResult::new(UsageSnapshot::new(RateWindow::new(42.0)), "cli");
+        let mut result = ProviderFetchResult::new(UsageSnapshot::new(RateWindow::new(42.0)), "cli");
+        result.has_successful_claude_cli_quota = true;
         cache_cli_result(result.clone());
         let cached = cached_cli_result().expect("cached result within TTL");
         assert!((cached.usage.primary.used_percent - 42.0).abs() < 0.01);
         assert_eq!(cached.source_label, "cli");
+        assert!(!cached.has_successful_claude_cli_quota);
+    }
+
+    #[test]
+    fn cli_quota_without_credential_identity_cannot_prove_account_action() {
+        let provider = ClaudeProvider::new();
+        let result = provider
+            .parse_cli_output("Current session\n25% used\nCurrent week (all models)\n40% used")
+            .expect("CLI quota should parse");
+        let result = mark_live_claude_cli_result(result);
+
+        assert!(result.usage.account_email.is_none());
+        assert!(result.has_successful_claude_cli_quota);
+    }
+
+    #[test]
+    fn non_cli_fetch_result_does_not_prove_account_action() {
+        let result = ProviderFetchResult::new(UsageSnapshot::new(RateWindow::new(42.0)), "oauth");
+
+        assert!(!result.has_successful_claude_cli_quota);
+    }
+    #[test]
+    fn cli_presence_maps_to_local_runtime_offline() {
+        assert_eq!(
+            ClaudeProvider::new().error_state_kind(&ProviderError::NotInstalled(
+                "Claude CLI not found. Install from https://docs.claude.ai/claude-code".to_string(),
+            )),
+            crate::core::ProviderStateKind::LocalRuntimeOffline
+        );
+        // Other error kinds keep their default classification.
+        assert_eq!(
+            ClaudeProvider::new().error_state_kind(&ProviderError::AuthRequired),
+            crate::core::ProviderStateKind::NeedsAuthentication
+        );
     }
 }

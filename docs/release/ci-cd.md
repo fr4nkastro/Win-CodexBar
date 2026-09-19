@@ -2,92 +2,110 @@
 
 ## Responsibilities
 
-**Blacksmith GitHub Actions** (`.github/workflows/pr-check.yml`) remains the
-primary PR/push validation path. It runs the existing format, clippy, Rust
-test, frontend test, and frontend build checks on hosted Blacksmith Windows.
+CircleCI is the primary hosted Windows validation system. Its
+pr-check workflow runs the canonical scripts/local-check.ps1 -Slice ci contract
+for pull requests and protected branch pushes. CircleCI does not build or
+publish release tags.
 
-**CircleCI** (`.circleci/config.yml`) is release-only. The workflow is filtered
-to the canonical `nesszer/Win-CodexBar` project and exact protected tags
-`vX.Y.Z`; branch and pull-request pipelines cannot enter it. The CircleCI
-Windows build is credential-free. Only its explicit approval-gated publisher
-gets the restricted `GH_TOKEN` context.
+GitHub Actions is the sole canonical release producer. The tag workflow in
+.github/workflows/release.yml runs on a GitHub-hosted Windows runner, because
+SignPath's GitHub trusted-build integration verifies that the build and the
+uploaded signing artifact came from GitHub Actions.
 
-## CircleCI release flow
+The manual .github/workflows/signpath-test.yml workflow exercises the same
+three-file signing bundle with the fixed test-signing policy. It retains the
+verified result as a workflow artifact and never creates or modifies a GitHub
+Release.
 
-1. A maintainer creates a protected canonical tag such as `v0.48.0` on `main`.
-   CircleCI's workflow filter and `scripts/release-preflight.ps1` both reject
-   branches, PRs, non-semver tags, non-canonical remotes, tag/SHA mismatch,
-   and commits whose tag is not reachable from protected `origin/main`.
-2. The build job provisions/asserts Node 24.x via the `OpenJS.NodeJS.LTS`
-   winget package, pnpm 11.24.0, the Windows MSVC Rust target, Git, and Inno
-   Setup 6. It validates every committed project version against the tag.
-3. The build invokes `scripts/release-doctor.ps1 -SkipGitHub`, then
-   `scripts/windows-release-build.ps1 -Ref <full-SHA> -SmokeInstall` with a
-   fresh temporary `WorkRoot`. It never receives `GH_TOKEN` and never uploads.
-4. The job emits exactly these four publishable assets:
-   `CodexBar-X.Y.Z-Setup.exe`, its `.sha256` sidecar,
-   `CodexBar-X.Y.Z-portable.exe`, and its `.sha256` sidecar. It also emits
-   `release-manifest.json` (tag, commit, version, sizes, and hashes) and logs,
-   then persists/stores the bundle as CircleCI workspace/artifacts.
-5. A human must approve the `release-approval` job after reviewing the
-   manifest and artifact logs.
-6. The `release-publish` job receives `GH_TOKEN` only from the restricted
-   `github-release-publisher` context. `scripts/publish-github-release.ps1`
-   creates a draft release if absent, or uses an existing draft. It compares
-   every same-name asset by SHA-256, skips exact matches, fails on mismatch,
-   and uploads only missing assets. It never clobbers and never changes a
-   draft to a final release.
-7. A maintainer publishes the draft manually in GitHub after any final release
-   notes/review. Winget follows only after the immutable installer URL and
-   digest are stable.
+## Production release flow
+
+A maintainer creates a protected canonical tag such as v0.60.4 on main. The
+tag workflow then performs this sequence:
+
+1. Check out the exact tag and freeze its full 40-character commit SHA.
+2. Run scripts/release-preflight.ps1 to validate the canonical repository,
+   tag/SHA identity, main ancestry, and every committed version file.
+3. Fail immediately if the required SignPath credentials are absent.
+4. Build fresh unsigned artifacts with the existing Windows release builder.
+5. Create a signing input containing exactly these top-level files:
+   - CodexBar-X.Y.Z-Setup.exe
+   - CodexBar-X.Y.Z-portable.exe
+   - CodexBarCLI-vX.Y.Z-windows-x64.zip
+6. Upload that directory as a GitHub Actions artifact and submit it to the
+   pinned codexbar-installer configuration and release-signing policy.
+7. Wait for SignPath to finish. Denial, timeout, approval failure, origin
+   verification failure, missing output, or any malformed output fails the job.
+8. Verify Authenticode on both top-level executables and on codexbar-cli.exe
+   inside the returned CLI ZIP.
+9. Build a new final bundle only from the verified SignPath files, compute all
+   three SHA-256 sidecars after signing, and regenerate release-manifest.json.
+10. Validate the exact six publishable assets, hashes, byte counts, and sidecars.
+11. Run scripts/publish-github-release.ps1, which creates or updates a draft
+    release without replacing divergent assets. A maintainer publishes the
+    draft manually after review.
+
+The unsigned build tree, SignPath output, and final bundle are separate. There
+is no unsigned fallback after a signing failure.
+
+The final public asset set is:
+
+- CodexBar-X.Y.Z-Setup.exe and its .sha256 sidecar
+- CodexBar-X.Y.Z-portable.exe and its .sha256 sidecar
+- CodexBarCLI-vX.Y.Z-windows-x64.zip and its .sha256 sidecar
+
+release-manifest.json is retained for verification but is not a publishable
+release asset.
+
+## SignPath onboarding boundary
+
+The repository wiring can be reviewed before production signing is enabled.
+Do not create a production tag until the SignPath project has a valid
+release-signing policy, an issued production certificate, the GitHub.com
+trusted build system linked to the project, the SignPath GitHub App installed
+with repository access, and the repository secrets configured.
+
+The production policy is intentionally fail-closed. v0.60.3 remains the
+immutable unsigned release created before this cutover. The first signed
+production release is the next normal version, such as v0.60.4.
+
+After the manual test-signing run, inspect the origin value reported by
+SignPath before narrowing the policy's allowed branch names. Do not guess the
+branch value from the tag name.
 
 ## Local checks
 
-Run the focused, dependency-free helper tests and prerequisite assertions:
+Run the dependency-free release checks:
 
-```powershell
+~~~powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release-pipeline.tests.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install-release-prerequisites.ps1 -AssertOnly
-```
+~~~
 
-The build/preflight commands used by CircleCI can be exercised with a full SHA:
+The build and preflight helpers accept explicit tag and SHA values:
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release-preflight.ps1 -Tag vX.Y.Z -Sha <full-40-char-sha>
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\circleci-release-build.ps1 -Tag vX.Y.Z -Sha <full-40-char-sha>
-```
+~~~powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\release-preflight.ps1 -Tag vX.Y.Z -Sha <full-40-character-sha>
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\circleci-release-build.ps1 -Tag vX.Y.Z -Sha <full-40-character-sha>
+~~~
 
-The smoke test covers install, expected version validation, and uninstall of
-the generated Inno Setup installer on the real Windows runner. It does not
-cover all tray, WebView2, provider, or CUA/UI behavior.
+The second script retains its historical filename for compatibility; the
+release workflow passes all identity values explicitly and does not depend on
+CircleCI environment variables.
 
-## Setup that requires administrators
+## Administrator setup
 
-The repository cannot create external settings. Configure the CircleCI project
-for `nesszer/Win-CodexBar`, enable `.circleci/config.yml`, and create a
-project-restricted context named `github-release-publisher`. Store `GH_TOKEN`
-there only, using a fine-grained GitHub token scoped to this repository with
-Contents read/write for release APIs. Do not grant Workflows permission.
+Configure SIGNPATH_API_TOKEN as the only SignPath GitHub Actions repository
+secret. The workflow pins the reviewed organization ID, project slug,
+release-signing/test-signing policies, and codexbar-installer configuration in
+source. After SignPath issues the certificates, set the nonsecret Actions
+variable SIGNPATH_RELEASE_CERT_THUMBPRINT; production verification requires
+it and compares all three signed executables against it.
+- GITHUB_TOKEN is provided by GitHub Actions
 
-Protect `main`, require the existing Blacksmith checks, and protect the `v*`
-tag namespace so only authorized maintainers can create canonical `vX.Y.Z` tags.
-Configure CircleCI credit/spend alerts and notifications as appropriate for
-the organization. These project, context, token, ruleset, and billing changes
-are intentionally manual.
+The workflow pins release-signing, test-signing, and codexbar-installer in
+reviewed source. The policy slug is not selected by a mutable secret.
 
-## Cost, retry, and rollback
-
-Blacksmith billing remains the recurring PR cost. CircleCI Windows credits are
-incurred only for a protected release tag and its short approval/publish path;
-there is no CircleCI branch or PR build. Windows executor rates depend on the
-CircleCI plan, so set an organization credit alert before enabling releases.
-
-Rerunning a failed build creates a new temporary WorkRoot and remains pinned to
-the tag's full SHA. If a publish job partially uploads, rerun it after approval:
-matching assets are skipped and missing assets are added. A same-name digest
-mismatch fails without replacement. If a final release already exists, the
-publisher refuses to touch it. Rollback is a deliberate GitHub administrator
-action; replacement artifacts require a new reviewed tag/SHA, not an overwrite.
-
-There is no upload switch on `windows-release-build.ps1`; all publication goes
-through the approval-gated no-clobber publisher.
+Keep CircleCI credentials and release contexts disabled for tag publication.
+CircleCI only needs its existing validation configuration and CI budget
+settings. Protect main and the canonical vX.Y.Z tag namespace so only
+authorized maintainers can create release tags.

@@ -6,12 +6,39 @@ import type {
   CodexAccountUsageSnapshot,
 } from "../types/bridge";
 import { useLocale } from "../hooks/useLocale";
-import { maskEmail } from "./MenuCard";
+import { useFormattedResetTime } from "../hooks/useFormattedResetTime";
+import { buildCodexAccountDisplayNames } from "./codexAccountDisplay";
 import {
   codexAccountSwitch,
   getCodexAccountsState,
   refreshProviders,
 } from "../lib/tauri";
+
+interface PrivateCodexAccountLabel {
+  label: string;
+  tooltip: string;
+}
+
+/**
+ * Project a tray account label while keeping the privacy setting scoped to
+ * this switcher surface. The shared display-name builder remains unchanged so
+ * settings and other account-facing surfaces keep their existing behavior.
+ */
+function buildPrivateCodexAccountLabel(
+  account: CodexAccount,
+  displayName: string,
+  ordinal: number,
+  hidePersonalInfo: boolean,
+  accountWord: string,
+): PrivateCodexAccountLabel {
+  if (hidePersonalInfo) {
+    const label = `${accountWord} ${ordinal}`;
+    return { label, tooltip: label };
+  }
+
+  const label = displayName || account.nickname || "Workspace";
+  return { label, tooltip: label };
+}
 
 /**
  * Multi-account lane surface for the Codex tray menu card (ADR 0003,
@@ -22,13 +49,23 @@ import {
  * Switch action. Switching updates the ambient identity and triggers a
  * provider refresh so the tray icon/menu reflect the now-active account.
  */
-export default function CodexAccountsMenu({ hideEmail }: { hideEmail: boolean }) {
+export default function CodexAccountsMenu({
+  hideEmail,
+  resetTimeRelative,
+  onLayoutChange,
+}: {
+  hideEmail: boolean;
+  resetTimeRelative: boolean;
+  onLayoutChange?: () => void;
+}) {
   const { t } = useLocale();
   const [accounts, setAccounts] = useState<CodexAccount[]>([]);
   const [snapshots, setSnapshots] = useState<
     Record<string, CodexAccountUsageSnapshot>
   >({});
   const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
+  const [displayNames, setDisplayNames] = useState<Record<string, string>>({});
+  const [accountOrdinals, setAccountOrdinals] = useState<Record<string, number>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -38,6 +75,8 @@ export default function CodexAccountsMenu({ hideEmail }: { hideEmail: boolean })
     try {
       const next: CodexAccountsStateBridge = await getCodexAccountsState();
       setAccounts(next.accounts);
+      setDisplayNames(next.displayNames ?? {});
+      setAccountOrdinals(next.accountOrdinals);
       setSnapshots(next.snapshots);
       setActiveAccountId(next.activeAccountId ?? null);
     } catch (err: unknown) {
@@ -50,6 +89,10 @@ export default function CodexAccountsMenu({ hideEmail }: { hideEmail: boolean })
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    onLayoutChange?.();
+  }, [accounts.length, error, onLayoutChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -81,8 +124,13 @@ export default function CodexAccountsMenu({ hideEmail }: { hideEmail: boolean })
     return null;
   }
 
+  const accountDisplayNames = buildCodexAccountDisplayNames(
+    accounts,
+    displayNames,
+  );
+
   return (
-    <details className="codex-menu-accounts">
+    <details className="codex-menu-accounts" onToggle={onLayoutChange}>
       <summary className="codex-menu-accounts__summary">
         <span className="codex-menu-accounts__title">{t("CodexAccountsTitle")}</span>
         <span className="codex-menu-accounts__count">{accounts.length}</span>
@@ -94,63 +142,25 @@ export default function CodexAccountsMenu({ hideEmail }: { hideEmail: boolean })
       )}
       <ul className="codex-menu-accounts__list">
         {accounts.map((account) => {
-          const snapshot = snapshots[account.id];
-          // Prefer the primary (session) window, but accounts whose backend
-          // only returns a weekly window have primaryWindow: null — fall back
-          // to the next filled window in canonical order (primary →
-          // secondary; the account-snapshot bridge carries no tertiary or
-          // extra rate windows) so the usage bar still renders.
-          const usageWindow =
-            snapshot?.primaryWindow ?? snapshot?.secondaryWindow ?? null;
-          const pct = usageWindow
-            ? Math.round(usageWindow.usedPercent)
-            : null;
-          const label =
-            account.nickname ??
-            account.emailHint ??
-            account.authSubject ??
-            shrink(account.id);
-          const shown = hideEmail ? maskEmail(label) : label;
-          const isAmbient = account.source === "ambient";
-          const isActive = account.id === activeAccountId;
+          const privateLabel = buildPrivateCodexAccountLabel(
+            account,
+            accountDisplayNames[account.id] ?? "",
+            accountOrdinals[account.id],
+            hideEmail,
+            t("Account"),
+          );
           return (
-            <li key={account.id}>
-              <div
-                className={`codex-menu-accounts__row${isActive ? " codex-menu-accounts__row--active" : ""}`}
-              >
-                <div className="codex-menu-accounts__meta">
-                  <span className="codex-menu-accounts__email" title={label}>
-                    {shown}
-                    {isActive && (
-                      <span className="codex-menu-accounts__badge">
-                        {t("CodexAccountsActive")}
-                      </span>
-                    )}
-                    {isAmbient && (
-                      <span className="codex-menu-accounts__badge">
-                        {t("CodexAccountsSourceAmbient")}
-                      </span>
-                    )}
-                  </span>
-                  {pct !== null && (
-                    <span className="codex-menu-accounts__bar" aria-hidden>
-                      <span
-                        className="codex-menu-accounts__bar-fill"
-                        style={{ width: `${Math.max(2, Math.min(100, pct))}%` }}
-                      />
-                    </span>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  className="codex-menu-accounts__switch"
-                  disabled={busy || isActive}
-                  onClick={() => void handleSwitch(account.id)}
-                >
-                  {t("CodexAccountsSwitchButton")}
-                </button>
-              </div>
-            </li>
+            <CodexAccountRow
+              key={account.id}
+              account={account}
+              snapshot={snapshots[account.id]}
+              displayName={privateLabel.label}
+              tooltip={privateLabel.tooltip}
+              resetTimeRelative={resetTimeRelative}
+              isActive={account.id === activeAccountId}
+              busy={busy}
+              onSwitch={handleSwitch}
+            />
           );
         })}
       </ul>
@@ -158,6 +168,105 @@ export default function CodexAccountsMenu({ hideEmail }: { hideEmail: boolean })
   );
 }
 
-function shrink(id: string): string {
-  return id.length <= 12 ? id : `${id.slice(0, 8)}…`;
+function CodexAccountRow({
+  account,
+  snapshot,
+  displayName,
+  tooltip,
+  resetTimeRelative,
+  isActive,
+  busy,
+  onSwitch,
+}: {
+  account: CodexAccount;
+  snapshot: CodexAccountUsageSnapshot | undefined;
+  displayName: string;
+  tooltip: string;
+  resetTimeRelative: boolean;
+  /** The single account matching the live `~/.codex/auth.json` identity. */
+  isActive: boolean;
+  busy: boolean;
+  onSwitch: (id: string) => Promise<void>;
+}) {
+  const { t } = useLocale();
+  // Prefer the primary (normally five-hour) window. Accounts whose backend
+  // only returns a weekly window have primaryWindow: null, so keep the
+  // existing secondary-window fallback for their bar and reset detail.
+  const usageWindow =
+    snapshot?.primaryWindow ?? snapshot?.secondaryWindow ?? null;
+  const pct = usageWindow ? Math.round(usageWindow.usedPercent) : null;
+  const resetText = useFormattedResetTime(
+    usageWindow?.resetAt ?? null,
+    null,
+    resetTimeRelative,
+  );
+  const resetLabel = resetText
+    ? resetTimeRelative
+      ? resetText
+      : `${t("MetricResetsIn")} ${resetText}`
+    : null;
+  const windowLabel = formatWindowLabel(usageWindow?.limitWindowSeconds);
+  const isAmbient = account.source === "ambient";
+
+  return (
+    <li>
+      <div
+        className={`codex-menu-accounts__row${isActive ? " codex-menu-accounts__row--active" : ""}`}
+      >
+        <div className="codex-menu-accounts__meta">
+          <span className="codex-menu-accounts__email" title={tooltip}>
+            {displayName}
+            {isActive && (
+              <span className="codex-menu-accounts__badge">
+                {t("CodexAccountsActive")}
+              </span>
+            )}
+            {isAmbient && (
+              <span className="codex-menu-accounts__badge">
+                {t("CodexAccountsSourceAmbient")}
+              </span>
+            )}
+          </span>
+          {(pct !== null || resetLabel) && (
+            <span className="codex-menu-accounts__usage">
+              {windowLabel && <span>{windowLabel}</span>}
+              {pct !== null && (
+                <span>{pct}% {t("PanelUsedSuffix")}</span>
+              )}
+              {resetLabel && <span>{resetLabel}</span>}
+            </span>
+          )}
+          {pct !== null && (
+            <span className="codex-menu-accounts__bar" aria-hidden>
+              <span
+                className="codex-menu-accounts__bar-fill"
+                style={{ width: `${Math.max(2, Math.min(100, pct))}%` }}
+              />
+            </span>
+          )}
+        </div>
+        <button
+          type="button"
+          className="codex-menu-accounts__switch"
+          disabled={busy || isActive}
+          onClick={() => void onSwitch(account.id)}
+        >
+          {t("CodexAccountsSwitchButton")}
+        </button>
+      </div>
+    </li>
+  );
+}
+
+function formatWindowLabel(
+  limitWindowSeconds: number | null | undefined,
+): string | null {
+  if (!limitWindowSeconds || limitWindowSeconds <= 0) return null;
+  if (limitWindowSeconds % 86_400 === 0) {
+    return `${limitWindowSeconds / 86_400}d`;
+  }
+  if (limitWindowSeconds % 3_600 === 0) {
+    return `${limitWindowSeconds / 3_600}h`;
+  }
+  return null;
 }

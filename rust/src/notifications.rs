@@ -2,7 +2,10 @@
 //!
 //! Provides Windows toast notifications for usage alerts
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "notification helpers are reserved for future alert integration"
+)]
 
 use crate::core::ProviderId;
 use crate::core::{RateWindow, UsagePace};
@@ -310,6 +313,26 @@ impl NotificationManager {
         }
     }
 
+    /// Observe a session lane across all session consumers. Informational
+    /// placeholders represent missing data and must not clear or re-arm
+    /// threshold, transition, or hook state in the caller.
+    pub fn check_session_lane(
+        &mut self,
+        provider: ProviderId,
+        account: &str,
+        used_percent: f64,
+        is_informational: bool,
+        settings: &Settings,
+    ) -> bool {
+        if is_informational {
+            return false;
+        }
+
+        self.check_and_notify(provider, account, "session", used_percent, settings);
+        self.check_session_transition(provider, account, used_percent, settings);
+        true
+    }
+
     /// Send a notification for a status issue
     pub fn notify_status_issue(
         &mut self,
@@ -579,6 +602,12 @@ impl NotificationManager {
 }
 
 fn format_duration(seconds: f64) -> String {
+    // Display-only duration label; the value is ceiled to whole minutes and
+    // clamped to at least 1, so only astronomically large inputs could truncate.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "whole-minutes display label; ceil/max bound the value to realistic durations"
+    )]
     let total_minutes = (seconds / 60.0).ceil().max(1.0) as i64;
     let days = total_minutes / 1440;
     let hours = (total_minutes % 1440) / 60;
@@ -867,6 +896,49 @@ mod tests {
         assert!(!manager.sent_notifications.contains(&weekly_key));
         manager.check_and_notify(ProviderId::Claude, account, "weekly", 76.0, &settings);
         assert!(manager.sent_notifications.contains(&weekly_key));
+    }
+
+    #[test]
+    fn missing_session_lane_preserves_warning_history_and_weekly_eligibility() {
+        let settings = Settings {
+            high_usage_threshold: 50.0,
+            ..Settings::default()
+        };
+        let mut manager = NotificationManager::new();
+        let account = "";
+
+        let session_high = (
+            ProviderId::Claude,
+            account.to_string(),
+            "session".to_string(),
+            NotificationType::HighUsage,
+        );
+        let weekly_high = (
+            ProviderId::Claude,
+            account.to_string(),
+            "weekly".to_string(),
+            NotificationType::HighUsage,
+        );
+
+        assert!(manager.check_session_lane(ProviderId::Claude, account, 51.0, false, &settings,));
+        assert!(manager.sent_notifications.contains(&session_high));
+
+        assert!(!manager.check_session_lane(ProviderId::Claude, account, 0.0, true, &settings,));
+        manager.check_and_notify(ProviderId::Claude, account, "weekly", 76.0, &settings);
+        assert!(manager.sent_notifications.contains(&weekly_high));
+
+        assert!(manager.check_session_lane(ProviderId::Claude, account, 52.0, false, &settings,));
+        assert!(manager.check_session_lane(ProviderId::Claude, account, 81.0, false, &settings,));
+        assert_eq!(
+            manager
+                .sent_notifications
+                .iter()
+                .filter(|key| **key == session_high)
+                .count(),
+            1,
+            "missing session data must not re-arm the session warning"
+        );
+        assert!(manager.sent_notifications.contains(&weekly_high));
     }
 
     #[test]
