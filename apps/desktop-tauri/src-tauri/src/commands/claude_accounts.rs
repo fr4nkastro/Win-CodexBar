@@ -8,7 +8,7 @@ use codexbar::claude_accounts::{
     ClaudeAccount, ClaudeAccountManager, ClaudeAccountManagerError, ClaudeAccountSource,
     ClaudeAccountStore, ClaudeAccountUsageSnapshot, ClaudeSnapshotStore, ClaudeSwitchResult,
     RemovedAccountIdentity, active_account_id, credentials_merge, file_locations,
-    group_lanes_by_identity, reconcile_stored_accounts, usage,
+    group_lanes_by_identity, reconcile_stored_accounts, require_cli_closed, usage,
 };
 use codexbar::core::{ProviderFetchResult, RateWindow};
 use codexbar::providers::claude::ClaudeOAuthFetcher;
@@ -317,6 +317,9 @@ fn switch_claude_account_gated(consent: bool, id: &str) -> Result<ClaudeSwitchRe
         .find(|account| account.id.to_string() == id)
         .ok_or_else(|| "Claude account not found.".to_string())?
         .clone();
+    // A running Claude Code CLI keeps the old login in memory and may rotate
+    // it back over the switched credentials; refuse instead of racing it.
+    require_cli_closed().map_err(|e| e.to_string())?;
 
     manager
         .switch_active_account(&target, &accounts)
@@ -350,8 +353,13 @@ pub async fn claude_account_add(app: tauri::AppHandle) -> Result<ClaudeAccount, 
 }
 
 #[tauri::command]
-pub fn claude_account_remove(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    remove_claude_account_gated(claude_accounts_consent(), &id)?;
+pub async fn claude_account_remove(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let consent = claude_accounts_consent();
+    // Blocking worker: removal waits on the process-wide credential lock,
+    // which an OAuth refresh may hold across a network call.
+    tauri::async_runtime::spawn_blocking(move || remove_claude_account_gated(consent, &id))
+        .await
+        .map_err(|e| e.to_string())??;
     events::emit_settings_changed(&app);
     events::emit_claude_accounts_updated(&app);
     Ok(())

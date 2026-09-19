@@ -15,6 +15,7 @@ pub mod credentials_merge;
 pub mod file_locations;
 pub mod identity;
 pub mod lanes;
+mod login_failure;
 pub mod login_runner;
 pub mod models;
 pub mod stores;
@@ -32,7 +33,11 @@ pub use identity::{
     stable_discovered_id,
 };
 pub use lanes::{LaneGroup, group_lanes_by_identity};
-pub use login_runner::{ClaudeLoginOutcome, ClaudeLoginResult, ManagedLoginProcess};
+pub use login_failure::SIGN_IN_CANCELLED_MESSAGE;
+pub use login_runner::{
+    CLI_RUNNING_MESSAGE, ClaudeLoginOutcome, ClaudeLoginResult, ManagedLoginProcess,
+    redact_diagnostic, require_cli_closed,
+};
 pub use models::{
     ClaudeAccount, ClaudeAccountSource, ClaudeAccountUsageSnapshot, RemovedAccountIdentity,
     UsageWindowSnapshot, utc_now,
@@ -40,7 +45,11 @@ pub use models::{
 pub use stores::{ClaudeAccountStore, ClaudeSnapshotStore};
 
 /// Process-wide lock serializing every operation that reads-then-writes a
-/// Claude OAuth login: the ambient OAuth fetch + token refresh and CLI probes
-/// in `providers::claude` (both of which may rotate the refresh token).
-/// Moved here from upstream's saved-accounts backend (#22).
+/// Claude OAuth login: account switch/removal here, and the ambient OAuth
+/// fetch + token refresh and CLI probes in `providers::claude` (both of which
+/// may rotate the refresh token). Ported from upstream's saved-accounts
+/// `CREDENTIAL_OPERATION` (#22) so both code paths share one lock.
+///
+/// Per-account usage reads of managed directories never refresh, so they do
+/// not take it.
 pub static CREDENTIAL_OPERATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

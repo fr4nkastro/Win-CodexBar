@@ -49,7 +49,9 @@ struct CachedCliResult {
 static CLI_RESULT_CACHE: LazyLock<Mutex<Option<CachedCliResult>>> =
     LazyLock::new(|| Mutex::new(None));
 
-fn clear_account_caches(credential_path: &std::path::Path) {
+/// Drop cached CLI results, refreshed OAuth tokens, and refresh backoff for
+/// `credential_path` after its login was replaced (account switch).
+pub(crate) fn clear_account_caches(credential_path: &std::path::Path) {
     if let Ok(mut cache) = CLI_RESULT_CACHE.lock() {
         *cache = None;
     }

@@ -67,9 +67,20 @@ fn refreshed_cache() -> &'static Mutex<HashMap<CredentialSource, ClaudeOAuthCred
     REFRESHED_CREDENTIALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(super) fn clear_cache() {
+/// Forget refreshed credentials cached for the ambient login after it was
+/// replaced (account switch): the given credentials file, the default
+/// `~/.claude` file, and the unscoped OS keyring item. Other sources (the
+/// environment token, unrelated files) are untouched.
+pub(super) fn clear_ambient_cache(credential_path: &Path) {
+    let legacy = credentials_path().ok();
     if let Ok(mut cache) = refreshed_cache().lock() {
-        cache.clear();
+        cache.retain(|source, _| match source {
+            CredentialSource::File(path) => {
+                path != credential_path && Some(path) != legacy.as_ref()
+            }
+            CredentialSource::Keyring(_) => false,
+            CredentialSource::Environment => true,
+        });
     }
 }
 
@@ -785,5 +796,55 @@ mod tests {
             same_source_result.map(|c| c.access_token),
             Some("file-refreshed-token".to_string())
         );
+    }
+
+    #[test]
+    fn clearing_the_ambient_cache_keeps_unrelated_sources() {
+        let unique = |tag: &str| {
+            CredentialSource::File(std::path::PathBuf::from(format!(
+                "clear_ambient_cache-{tag}-unique-marker.json"
+            )))
+        };
+        let switched = unique("switched");
+        let unrelated = unique("unrelated");
+        let keyring = CredentialSource::Keyring("clear-ambient-cache-test".to_string());
+        let creds = ClaudeOAuthCredentials {
+            access_token: "cached".to_string(),
+            refresh_token: None,
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            scopes: vec![],
+            rate_limit_tier: None,
+        };
+        for source in [&switched, &unrelated, &keyring] {
+            store_refreshed(source, &creds);
+        }
+        let CredentialSource::File(switched_path) = &switched else {
+            unreachable!()
+        };
+        super::clear_ambient_cache(switched_path);
+
+        let disk = ClaudeOAuthCredentials {
+            expires_at: None,
+            ..creds.clone()
+        };
+        assert!(cached_refreshed_if_fresher(&switched, &disk).is_none());
+        assert!(cached_refreshed_if_fresher(&keyring, &disk).is_none());
+        assert!(cached_refreshed_if_fresher(&unrelated, &disk).is_some());
+    }
+
+    /// Managed account directories are file-only: an expired managed login is
+    /// returned as-is (for the refresh lane to handle) and never replaced by
+    /// the unscoped OS keyring item, which belongs to the ambient login (#22).
+    #[test]
+    fn directory_scoped_load_never_substitutes_keyring_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(super::CREDENTIALS_FILE_NAME),
+            r#"{"claudeAiOauth":{"accessToken":"managed-expired","refreshToken":"managed-refresh","expiresAt":1000,"scopes":["user:profile"]}}"#,
+        )
+        .unwrap();
+        let loaded = super::load_credentials_in(dir.path()).unwrap();
+        assert_eq!(loaded.access_token, "managed-expired");
+        assert!(loaded.is_expired());
     }
 }

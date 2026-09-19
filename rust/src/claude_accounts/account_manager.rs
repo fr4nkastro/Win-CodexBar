@@ -8,11 +8,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 use thiserror::Error;
 use uuid::Uuid;
@@ -27,11 +24,9 @@ use super::identity::{
     load_identity_from_files, load_identity_from_path, parse_auth_status_json,
     stable_discovered_id,
 };
-use super::login_runner::{ClaudeLoginOutcome, ClaudeLoginRunner, ManagedLoginProcess};
+use super::login_failure::{LoginFailure, ambient_config_is_wsl_backed};
+use super::login_runner::{ClaudeLoginRunner, ManagedLoginProcess, isolate_account_subprocess_env};
 use super::models::{ClaudeAccount, ClaudeAccountSource, normalize_identifier, utc_now};
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 /// Friendly account manager error.
 #[derive(Debug, Error)]
@@ -93,7 +88,13 @@ impl ClaudeAccountManager {
         if !account.source.owns_files() {
             return Ok(());
         }
+        with_credential_operation(|| self.remove_managed_files_locked(account))
+    }
 
+    fn remove_managed_files_locked(
+        &self,
+        account: &ClaudeAccount,
+    ) -> Result<(), ClaudeAccountManagerError> {
         // Delete EVERY managed directory whose identity matches this account,
         // not only its recorded `claude_config_dir` (#14 bug 1: a leftover
         // duplicate directory resurrected a removed account). Structurally
@@ -198,7 +199,18 @@ impl ClaudeAccountManager {
 
     /// Switch the ambient identity to `target`, materializing the previous
     /// ambient account as managed first, then merging only `claudeAiOauth`.
+    ///
+    /// Holds the process-wide credential lock for the whole switch so it can
+    /// never interleave with an OAuth refresh of the ambient login.
     pub fn switch_active_account(
+        &self,
+        target: &ClaudeAccount,
+        existing: &[ClaudeAccount],
+    ) -> Result<ClaudeSwitchResult, ClaudeAccountManagerError> {
+        with_credential_operation(|| self.switch_active_account_locked(target, existing))
+    }
+
+    fn switch_active_account_locked(
         &self,
         target: &ClaudeAccount,
         existing: &[ClaudeAccount],
@@ -287,6 +299,12 @@ impl ClaudeAccountManager {
                  identity left unchanged"
             );
         }
+
+        // The ambient login changed: drop cached refreshed tokens and any
+        // refresh backoff recorded against the previous account.
+        crate::providers::claude::clear_account_caches(&credentials_merge::credentials_file_path(
+            &ambient_dir,
+        ));
 
         Ok(ClaudeSwitchResult {
             materialized_account,
@@ -451,40 +469,12 @@ impl ClaudeAccountManager {
         handle: Option<&ManagedLoginProcess>,
     ) -> Result<ClaudeAccount, ClaudeAccountManagerError> {
         let result = ClaudeLoginRunner::run(dir, Duration::from_secs(180), handle);
-
-        match &result.outcome {
-            ClaudeLoginOutcome::Cancelled => {
-                return Err(ClaudeAccountManagerError::Message(
-                    "Account setup cancelled.".to_string(),
-                ));
-            }
-            ClaudeLoginOutcome::MissingBinary => {
-                return Err(ClaudeAccountManagerError::Message(
-                    "The `claude` command could not be found.".to_string(),
-                ));
-            }
-            ClaudeLoginOutcome::TimedOut(_) => {
-                return Err(ClaudeAccountManagerError::Message(
-                    "The Claude sign-in flow timed out.".to_string(),
-                ));
-            }
-            ClaudeLoginOutcome::LaunchFailed(output) => {
-                return Err(ClaudeAccountManagerError::Message(format!(
-                    "Failed to start the Claude sign-in flow: {output}"
-                )));
-            }
-            ClaudeLoginOutcome::Failed(output) => {
-                return Err(ClaudeAccountManagerError::Message(format!(
-                    "The Claude sign-in flow did not complete.\n{output}"
-                )));
-            }
-            ClaudeLoginOutcome::Success(_) => {}
+        if let Some(failure) = LoginFailure::from_outcome(&result.outcome) {
+            return Err(login_failure_error(&failure));
         }
 
         if !credentials_merge::credentials_file_path(dir).exists() {
-            return Err(ClaudeAccountManagerError::Message(
-                "Sign-in completed, but no credentials were written for this account.".to_string(),
-            ));
+            return Err(login_failure_error(&LoginFailure::CredentialsMissing));
         }
 
         // Identity comes from the just-provisioned directory's own
@@ -501,9 +491,7 @@ impl ClaudeAccountManager {
             })
             .unwrap_or_default();
         if identity.email.is_none() && identity.org_id.is_none() {
-            return Err(ClaudeAccountManagerError::Message(
-                "Sign-in completed, but the account identity could not be read.".to_string(),
-            ));
+            return Err(login_failure_error(&LoginFailure::IdentityUnreadable));
         }
 
         let now = utc_now();
@@ -535,9 +523,9 @@ impl ClaudeAccountManager {
         let mut command = Command::new(binary);
         command
             .args(["auth", "status", "--json"])
-            .env("CLAUDE_CONFIG_DIR", dir);
-        #[cfg(windows)]
-        command.creation_flags(CREATE_NO_WINDOW);
+            .current_dir(dir)
+            .stdin(Stdio::null());
+        isolate_account_subprocess_env(&mut command, dir);
 
         let output = command.output()?;
         if !output.status.success() {
@@ -737,6 +725,25 @@ pub enum WriteTargetError {
 /// Exact normalized `org_id` equality. No email fallback, no directory
 /// component (identities carry no path). Mirror of
 /// `ClaudeAccount::matches_strict` at the identity level.
+/// Build the user-facing error for a failed sign-in. The WSL probe runs only
+/// after a failure, so Add account is never blocked preemptively (#480).
+fn login_failure_error(failure: &LoginFailure) -> ClaudeAccountManagerError {
+    let wsl_backed = !matches!(failure, LoginFailure::Cancelled) && ambient_config_is_wsl_backed();
+    ClaudeAccountManagerError::Message(failure.message(wsl_backed))
+}
+
+/// Run `operation` while holding the process-wide Claude credential lock
+/// ([`super::CREDENTIAL_OPERATION`]), so an account switch or removal can
+/// never interleave with an OAuth token refresh or a CLI probe that may
+/// rotate the same refresh token.
+///
+/// Blocks the calling thread: call it from a blocking worker, never from
+/// inside an async task.
+pub(crate) fn with_credential_operation<T>(operation: impl FnOnce() -> T) -> T {
+    let _credentials = super::CREDENTIAL_OPERATION.blocking_lock();
+    operation()
+}
+
 fn identity_matches_strict(a: &ClaudeIdentity, b: &ClaudeIdentity) -> bool {
     matches!(
         (
@@ -2308,5 +2315,79 @@ mod tests {
         let mut root = credentials_merge::read_root(dir).unwrap();
         root["claudeAiOauth"]["expiresAt"] = serde_json::json!(expires_at);
         credentials_merge::write_root(dir, &root).unwrap();
+    }
+
+    // ── #22: credential lock and redacted sign-in failures ──────────────
+
+    #[test]
+    fn credential_operations_wait_for_an_in_flight_refresh() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Stands in for `ClaudeOAuthFetcher::fetch` holding the lock across a
+        // token refresh.
+        let refresh = super::super::CREDENTIAL_OPERATION.blocking_lock();
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_worker = Arc::clone(&ran);
+        let worker = std::thread::spawn(move || {
+            with_credential_operation(|| ran_in_worker.store(true, Ordering::SeqCst));
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a switch/remove must not run while a refresh holds the lock"
+        );
+        drop(refresh);
+        worker.join().unwrap();
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_account_errors_never_echo_cli_output_or_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        with_app_support_directory(dir.path().join("app"));
+        with_ambient_claude_config_dir(dir.path().join("ambient"));
+
+        let script = dir.path().join("fake-claude");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+             echo '{\"claudeAiOauth\":{\"accessToken\":\"sk-ant-oat01-leaked\",\"refreshToken\":\"rt-leaked\"}}'\n\
+             echo 'Authorization: Bearer leaked-bearer' >&2\n\
+             exit 7\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        super::super::login_runner::with_claude_binary_override(Some(script));
+
+        let error = ClaudeAccountManager::new()
+            .add_managed_account(None)
+            .unwrap_err()
+            .to_string();
+
+        super::super::login_runner::clear_claude_binary_override();
+        clear_app_support_directory_override();
+        clear_ambient_claude_config_dir_override();
+
+        assert!(error.contains("exit code 7"), "{error}");
+        for secret in [
+            "sk-ant-",
+            "rt-leaked",
+            "leaked-bearer",
+            "accessToken",
+            "claudeAiOauth",
+        ] {
+            assert!(!error.contains(secret), "{secret} leaked: {error}");
+        }
+        assert!(
+            fs::read_dir(dir.path().join("app").join("managed-configs"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "a failed sign-in must not leave a managed directory behind"
+        );
     }
 }
