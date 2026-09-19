@@ -23,6 +23,7 @@ pub(crate) use credentials_store::{load_credentials_in, persist_refreshed_creden
 
 pub(super) fn clear_account_cache(credential_path: &std::path::Path) {
     credentials_store::clear_ambient_cache(credential_path);
+    credentials_store::record_superseded_keyring_token();
     clear_refresh_backoff(&credentials_store::CredentialSource::File(
         credential_path.to_path_buf(),
     ));
