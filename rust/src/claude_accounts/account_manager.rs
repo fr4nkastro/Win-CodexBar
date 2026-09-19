@@ -74,7 +74,7 @@ impl ClaudeAccountManager {
         match self.authenticate_account(&dir, handle) {
             Ok(account) => Ok(account),
             Err(error) => {
-                let _ = fs::remove_dir_all(&dir);
+                let _removed_dir = fs::remove_dir_all(&dir);
                 Err(error)
             }
         }
@@ -302,10 +302,10 @@ impl ClaudeAccountManager {
         let creds_path = credentials_merge::credentials_file_path(ambient_dir);
         match backup {
             Some(backup) => {
-                let _ = fs::copy(backup, &creds_path);
+                let _restored = fs::copy(backup, &creds_path);
             }
             None => {
-                let _ = fs::remove_file(&creds_path);
+                let _removed = fs::remove_file(&creds_path);
             }
         }
     }
@@ -845,6 +845,10 @@ fn read_claude_ai_oauth_i64_field(dir: &Path, field: &str) -> Option<i64> {
         return Some(number);
     }
     if let Some(number) = value.as_f64() {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "epoch timestamps written as JSON floats are whole numbers well within i64"
+        )]
         return Some(number as i64);
     }
     value

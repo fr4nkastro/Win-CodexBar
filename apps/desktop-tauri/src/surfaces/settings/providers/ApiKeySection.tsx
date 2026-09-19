@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   getApiKeyProviders,
   getApiKeys,
+  openProviderDashboard,
   removeApiKey,
   setApiKey,
 } from "../../../lib/tauri";
@@ -181,14 +182,17 @@ export function ApiKeySection({ providerId }: Props) {
           )}
 
           {info.dashboardUrl && !editing && (
-            <a
+            <button
+              type="button"
               className="credential-card__link"
-              href={info.dashboardUrl}
-              target="_blank"
-              rel="noopener noreferrer"
+              onClick={() =>
+                void openProviderDashboard(providerId).catch((err: unknown) =>
+                  setError(err instanceof Error ? err.message : String(err)),
+                )
+              }
             >
               {t("OpenProviderDashboard").replace("{}", info.displayName)} ↗
-            </a>
+            </button>
           )}
 
           {editing && (

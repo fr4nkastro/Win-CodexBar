@@ -3,10 +3,11 @@
 //! Uses the grok.com billing gRPC-web endpoint via either browser cookies or
 //! `~/.grok/auth.json` produced by `grok login`.
 
+mod billing;
 pub mod local_sessions;
 
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -18,6 +19,8 @@ use crate::core::{
     FetchContext, Provider, ProviderError, ProviderFetchResult, ProviderId, ProviderMetadata,
     RateWindow, SourceMode, UsageSnapshot,
 };
+
+use self::billing::GrokBillingSnapshot;
 
 const BILLING_ENDPOINT: &str = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig";
 const CLI_SETTINGS_ENDPOINT: &str = "https://cli-chat-proxy.grok.com/v1/settings";
@@ -33,7 +36,7 @@ impl GrokProvider {
             metadata: ProviderMetadata {
                 id: ProviderId::Grok,
                 display_name: "Grok",
-                session_label: "Monthly",
+                session_label: "Credits",
                 weekly_label: "On-demand",
                 supports_opus: false,
                 supports_credits: false,
@@ -127,21 +130,10 @@ impl GrokProvider {
         let billing = self
             .fetch_billing(None, Some(cookie_header.to_string()))
             .await?;
-        // Upstream 0.52 (#2991): the browser billing response does not carry
-        // the paid SuperGrok tier. If the local Grok principal is available,
-        // use its settings endpoint only as identity enrichment, never as a
-        // replacement for the validated browser usage result.
-        let plan = match Self::load_credentials(GrokAuthKind::Cli) {
-            Ok(credentials) => self.fetch_cli_subscription_tier(&credentials).await,
-            Err(_) => None,
-        };
-        Ok(result_from_billing(
-            billing,
-            "grok-browser",
-            None,
-            None,
-            plan,
-        ))
+        // v0.56.0: a browser session is its own principal. Never enrich a
+        // successful cookie billing result from ambient auth.json metadata,
+        // which may belong to a different account or change during the fetch.
+        Ok(result_from_cookie_billing(billing))
     }
 
     /// Cookie refresh path (upstream #2458):
@@ -162,7 +154,9 @@ impl GrokProvider {
 
         let cookie_header = crate::providers::browser_cookie_header(&["grok.com"])?;
         let result = self.fetch_with_cookie(&cookie_header).await?;
-        let _ = CookieHeaderCache::store(ProviderId::Grok, &cookie_header, "browser");
+        // Best-effort cache write: failing to persist the cookie only costs a
+        // re-read from the browser on the next fetch.
+        let _cached = CookieHeaderCache::store(ProviderId::Grok, &cookie_header, "browser");
         Ok(result)
     }
 
@@ -203,8 +197,8 @@ impl GrokProvider {
                 "Grok web billing returned status {status}"
             )));
         }
-        validate_grpc_headers(&headers)?;
-        parse_grpc_web_response(&bytes)
+        billing::validate_grpc_headers(&headers)?;
+        billing::parse_grpc_web_response(&bytes)
     }
 
     fn detect_cli_version() -> Option<String> {
@@ -428,12 +422,27 @@ fn text_field(value: &Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct GrokBillingSnapshot {
-    used_percent: Option<f64>,
-    resets_at: Option<DateTime<Utc>>,
+/// Classify Grok from the full billing-cycle duration, not time remaining.
+/// This preserves the upstream #2431/#2566 invariant that a monthly plan near
+/// its reset must not become a weekly plan.
+fn primary_label_for_cycle_minutes(minutes: u32) -> Option<&'static str> {
+    const DAY_MINUTES: u32 = 24 * 60;
+    if minutes <= 60 {
+        return None;
+    }
+    let days = (minutes + DAY_MINUTES / 2) / DAY_MINUTES;
+    if (4..=12).contains(&days) {
+        Some("Weekly")
+    } else if (20..=45).contains(&days) {
+        Some("Monthly")
+    } else {
+        None
+    }
 }
 
+fn result_from_cookie_billing(billing: GrokBillingSnapshot) -> ProviderFetchResult {
+    result_from_billing(billing, "grok-browser", None, None, None)
+}
 fn result_from_billing(
     billing: GrokBillingSnapshot,
     source_label: &str,
@@ -441,38 +450,37 @@ fn result_from_billing(
     team_id: Option<String>,
     login_method: Option<String>,
 ) -> ProviderFetchResult {
-    // Upstream #2431 / #2566: do not infer windowMinutes from time-until-reset.
-    // A monthly quota near its reset would otherwise be misclassified as weekly.
-    let primary = match billing.used_percent {
-        Some(used_percent) => RateWindow::with_details(used_percent, None, billing.resets_at, None),
+    // Dynamic cadence is provider-owned and comes only from a complete billing
+    // cycle. A reset timestamp alone is insufficient because monthly quotas can
+    // have only a few days remaining.
+    let primary_label = billing
+        .window_minutes
+        .and_then(primary_label_for_cycle_minutes);
+    let published_percent = billing.used_percent.filter(|_| {
+        billing.used_percent_is_wire_published || billing.used_percent_is_implicit_zero
+    });
+    let primary = match published_percent {
+        Some(used_percent) => RateWindow::with_details(
+            used_percent,
+            billing.window_minutes,
+            billing.resets_at,
+            None,
+        ),
         None => {
             let mut window = RateWindow::informational("Usage unavailable");
             window.resets_at = billing.resets_at;
+            window.window_minutes = billing.window_minutes;
             window
         }
     };
     let mut usage = UsageSnapshot::new(primary);
+    if let Some(label) = primary_label {
+        usage = usage.with_primary_label(label);
+    }
     usage.account_email = email;
     usage.account_organization = team_id;
     usage.login_method = login_method;
     ProviderFetchResult::new(usage, source_label)
-}
-
-fn validate_grpc_headers(headers: &reqwest::header::HeaderMap) -> Result<(), ProviderError> {
-    if let Some(status) = headers
-        .get("grpc-status")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u16>().ok())
-        && status != 0
-    {
-        if status == 16 {
-            return Err(ProviderError::AuthRequired);
-        }
-        return Err(ProviderError::Other(format!(
-            "Grok RPC failed with status {status}"
-        )));
-    }
-    Ok(())
 }
 
 /// Whether a cookie-path error should invalidate the cached browser session.
@@ -502,325 +510,6 @@ fn cookie_refresh_action(
     }
 }
 
-fn parse_grpc_web_response(data: &[u8]) -> Result<GrokBillingSnapshot, ProviderError> {
-    let frames = grpc_web_data_frames(data);
-    if frames.is_empty() {
-        return Err(ProviderError::Parse(
-            "Grok web billing returned no payload".to_string(),
-        ));
-    }
-    let mut scan = ProtoScan::default();
-    for frame in frames {
-        scan.scan_message(&frame, &mut Vec::new(), 0);
-    }
-    let used_percent = scan
-        .fixed32
-        .iter()
-        .filter(|field| {
-            field.path.last() == Some(&1)
-                && field.value.is_finite()
-                && field.value >= 0.0
-                && field.value <= 100.0
-        })
-        .min_by(|a, b| {
-            a.path
-                .len()
-                .cmp(&b.path.len())
-                .then_with(|| a.order.cmp(&b.order))
-        })
-        .map(|field| field.value as f64);
-
-    let resets_at = scan
-        .varints
-        .iter()
-        .filter_map(|field| {
-            (1_700_000_000..=2_100_000_000)
-                .contains(&field.value)
-                .then(|| Utc.timestamp_opt(field.value as i64, 0).single())
-                .flatten()
-        })
-        .filter(|dt| *dt > Utc::now())
-        .min();
-    Ok(GrokBillingSnapshot {
-        used_percent,
-        resets_at,
-    })
-}
-
-fn grpc_web_data_frames(data: &[u8]) -> Vec<Vec<u8>> {
-    let mut frames = Vec::new();
-    let mut index = 0;
-    while index + 5 <= data.len() {
-        let flags = data[index];
-        let len = ((data[index + 1] as usize) << 24)
-            | ((data[index + 2] as usize) << 16)
-            | ((data[index + 3] as usize) << 8)
-            | (data[index + 4] as usize);
-        let start = index + 5;
-        let end = start.saturating_add(len);
-        if end > data.len() {
-            break;
-        }
-        if flags & 0x80 == 0 {
-            frames.push(data[start..end].to_vec());
-        }
-        index = end;
-    }
-    frames
-}
-
-#[derive(Default)]
-struct ProtoScan {
-    fixed32: Vec<Fixed32Field>,
-    varints: Vec<VarintField>,
-    order: usize,
-}
-
-struct Fixed32Field {
-    path: Vec<u64>,
-    value: f32,
-    order: usize,
-}
-
-struct VarintField {
-    value: u64,
-}
-
-impl ProtoScan {
-    fn scan_message(&mut self, data: &[u8], path: &mut Vec<u64>, depth: usize) {
-        if depth > 8 {
-            return;
-        }
-        let mut i = 0;
-        while i < data.len() {
-            let Some((field, wire, next)) = read_key(data, i) else {
-                break;
-            };
-            i = next;
-            path.push(field);
-            let Some(next) = self.scan_field(data, i, path, depth, wire) else {
-                path.pop();
-                break;
-            };
-            i = next;
-            path.pop();
-        }
-    }
-
-    fn scan_field(
-        &mut self,
-        data: &[u8],
-        i: usize,
-        path: &mut Vec<u64>,
-        depth: usize,
-        wire: u64,
-    ) -> Option<usize> {
-        match wire {
-            0 => self.scan_varint(data, i),
-            2 => self.scan_length_delimited(data, i, path, depth),
-            5 => self.scan_fixed32(data, i, path),
-            1 => Some(i.saturating_add(8)),
-            _ => None,
-        }
-    }
-
-    fn scan_varint(&mut self, data: &[u8], i: usize) -> Option<usize> {
-        let (value, next) = read_varint(data, i)?;
-        self.varints.push(VarintField { value });
-        Some(next)
-    }
-
-    fn scan_length_delimited(
-        &mut self,
-        data: &[u8],
-        i: usize,
-        path: &mut Vec<u64>,
-        depth: usize,
-    ) -> Option<usize> {
-        let (len, next) = read_varint(data, i)?;
-        let start = next;
-        let end = start.saturating_add(len as usize);
-        if end <= data.len() {
-            self.scan_message(&data[start..end], path, depth + 1);
-            Some(end)
-        } else {
-            None
-        }
-    }
-
-    fn scan_fixed32(&mut self, data: &[u8], i: usize, path: &[u64]) -> Option<usize> {
-        if i + 4 > data.len() {
-            return None;
-        }
-        let bytes = [data[i], data[i + 1], data[i + 2], data[i + 3]];
-        self.fixed32.push(Fixed32Field {
-            path: path.to_vec(),
-            value: f32::from_le_bytes(bytes),
-            order: self.order,
-        });
-        self.order += 1;
-        Some(i + 4)
-    }
-}
-
-fn read_key(data: &[u8], i: usize) -> Option<(u64, u64, usize)> {
-    let (key, next) = read_varint(data, i)?;
-    Some((key >> 3, key & 0x07, next))
-}
-
-fn read_varint(data: &[u8], mut i: usize) -> Option<(u64, usize)> {
-    let mut value = 0u64;
-    let mut shift = 0;
-    while i < data.len() && shift < 64 {
-        let b = data[i];
-        i += 1;
-        value |= u64::from(b & 0x7f) << shift;
-        if b & 0x80 == 0 {
-            return Some((value, i));
-        }
-        shift += 7;
-    }
-    None
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn grok_plan_prefers_subscription_tier_display_names() {
-        assert_eq!(
-            grok_plan_display_name(Some("SuperGrok Heavy")),
-            Some("SuperGrok Heavy".to_string())
-        );
-        assert_eq!(
-            grok_plan_display_name(Some("heavy")),
-            Some("SuperGrok Heavy".to_string())
-        );
-        assert_eq!(
-            grok_plan_display_name(Some("SuperGrok")),
-            Some("SuperGrok".to_string())
-        );
-        assert_eq!(
-            grok_plan_display_name(Some(" custom ")),
-            Some("custom".to_string())
-        );
-    }
-
-    #[test]
-    fn parses_auth_file_prefer_oidc() {
-        let auth = r#"{
-          "https://accounts.x.ai/sign-in": {"key": "legacy"},
-          "https://auth.x.ai::abc": {"key": "oidc", "auth_mode": "oidc", "email": "u@example.com"}
-        }"#;
-        let parsed = GrokCredentials::parse_for_kind(auth, GrokAuthKind::OAuth).unwrap();
-        assert_eq!(parsed.access_token, "oidc");
-        assert_eq!(parsed.login_method().as_deref(), Some("SuperGrok"));
-    }
-
-    #[test]
-    fn cli_and_oauth_select_distinct_auth_entries() {
-        let auth = r#"{
-          "https://accounts.x.ai/sign-in": {"key": "cli-token", "auth_mode": "session"},
-          "https://auth.x.ai::abc": {"key": "oauth-token", "auth_mode": "oidc"}
-        }"#;
-        assert_eq!(
-            GrokCredentials::parse_for_kind(auth, GrokAuthKind::Cli)
-                .unwrap()
-                .access_token,
-            "cli-token"
-        );
-        assert_eq!(
-            GrokCredentials::parse_for_kind(auth, GrokAuthKind::OAuth)
-                .unwrap()
-                .access_token,
-            "oauth-token"
-        );
-    }
-    #[test]
-    fn splits_grpc_web_data_frames() {
-        let data = [0, 0, 0, 0, 2, 1, 2, 0x80, 0, 0, 0, 1, b'x'];
-        assert_eq!(grpc_web_data_frames(&data), vec![vec![1, 2]]);
-    }
-
-    #[test]
-    fn cookie_refresh_uses_cache_when_present() {
-        assert_eq!(
-            cookie_refresh_action(true, None),
-            CookieRefreshAction::UseCached
-        );
-    }
-
-    #[test]
-    fn cookie_refresh_reimports_on_auth_failure() {
-        assert_eq!(
-            cookie_refresh_action(true, Some(&ProviderError::AuthRequired)),
-            CookieRefreshAction::ReimportBrowser
-        );
-        assert_eq!(
-            cookie_refresh_action(false, None),
-            CookieRefreshAction::ReimportBrowser
-        );
-    }
-
-    #[test]
-    fn cookie_refresh_gives_up_on_non_auth_errors() {
-        assert_eq!(
-            cookie_refresh_action(true, Some(&ProviderError::Other("network down".into()))),
-            CookieRefreshAction::GiveUp
-        );
-    }
-
-    #[test]
-    fn is_cookie_auth_failure_only_auth_required() {
-        assert!(is_cookie_authentication_failure(
-            &ProviderError::AuthRequired
-        ));
-        assert!(!is_cookie_authentication_failure(&ProviderError::NoCookies));
-    }
-
-    #[test]
-    fn billing_snapshot_leaves_window_minutes_unset() {
-        // A monthly quota with six days left must not be reported as weekly.
-        let resets = Utc::now() + chrono::Duration::days(6);
-        let result = result_from_billing(
-            GrokBillingSnapshot {
-                used_percent: Some(12.0),
-                resets_at: Some(resets),
-            },
-            "web",
-            None,
-            None,
-            Some("SuperGrok".into()),
-        );
-        assert_eq!(result.usage.primary.window_minutes, None);
-        assert_eq!(result.usage.primary.resets_at, Some(resets));
-        assert_eq!(result.usage.login_method.as_deref(), Some("SuperGrok"));
-    }
-
-    #[test]
-    fn period_only_billing_is_informational_not_zero_usage() {
-        let resets = Utc::now() + chrono::Duration::days(6);
-        let result = result_from_billing(
-            GrokBillingSnapshot {
-                used_percent: None,
-                resets_at: Some(resets),
-            },
-            "cli",
-            Some("user@example.com".into()),
-            None,
-            Some("SuperGrok Heavy".into()),
-        );
-
-        assert!(result.usage.primary.is_informational);
-        assert_eq!(result.usage.primary.resets_at, Some(resets));
-        assert_eq!(
-            result.usage.account_email.as_deref(),
-            Some("user@example.com")
-        );
-        assert_eq!(
-            result.usage.login_method.as_deref(),
-            Some("SuperGrok Heavy")
-        );
-    }
-}
+#[path = "tests.rs"]
+mod tests;

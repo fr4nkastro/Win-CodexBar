@@ -40,6 +40,12 @@ pub fn build_restart_script(
     backup_destination: Option<&Path>,
     restore_source: Option<&Path>,
 ) -> String {
+    // Delay is bounded, non-negative seconds rendered to whole milliseconds;
+    // rounding already makes the value whole, so f64->u64 cannot overflow.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "delay is non-negative seconds; whole milliseconds by design"
+    )]
     let delay_ms = (delay_seconds.max(0.0) * 1000.0).round() as u64;
     let log_path = powershell_literal_path(&restart_log_path());
     let effective_session_root = session_root
@@ -58,6 +64,10 @@ $backupDestination = {backup_destination_literal}
 $restoreSource = {restore_source_literal}
 $sessionEntries = {session_entries_literal}
 New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName($logPath)) -Force | Out-Null
+trap {{
+    Add-Content -LiteralPath $logPath -Value ("Restart failed: " + $_.Exception.Message)
+    exit 1
+}}
 function Write-Log([string]$message) {{
     Add-Content -LiteralPath $logPath -Value ("[{{0}}] {{1}}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $message)
 }}
@@ -65,7 +75,11 @@ function Clear-SessionEntry([string]$root, [string]$relativePath) {{
     if (-not $root) {{
         return
     }}
-    $targetPath = Join-Path $root $relativePath
+    $resolvedRoot = [System.IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
+    $targetPath = [System.IO.Path]::GetFullPath((Join-Path $resolvedRoot $relativePath))
+    if (-not $targetPath.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) {{
+        throw 'Session entry escaped its root.'
+    }}
     if (Test-Path -LiteralPath $targetPath) {{
         Remove-Item -LiteralPath $targetPath -Recurse -Force -ErrorAction Stop
     }}
@@ -111,14 +125,14 @@ function Sync-DesktopSessionState() {{
                 Write-Log ("Backed up session entry: " + $relativePath)
             }} catch {{
                 Write-Log ("Failed to back up session entry " + $relativePath + ": " + $_.Exception.Message)
+                throw
             }}
         }}
         Write-Log ("Backed up desktop session state to " + $backupDestination)
     }}
     if ($restoreSource) {{
         if (-not (Test-Path -LiteralPath $restoreSource)) {{
-            Write-Log ("Restore source is missing; leaving the current desktop session in place: " + $restoreSource)
-            return
+            Write-Log ("No saved session for target; clearing the previous desktop session: " + $restoreSource)
         }}
         foreach ($relativePath in $sessionEntries) {{
             try {{
@@ -127,81 +141,51 @@ function Sync-DesktopSessionState() {{
                 Write-Log ("Restored session entry: " + $relativePath)
             }} catch {{
                 Write-Log ("Failed to restore session entry " + $relativePath + ": " + $_.Exception.Message)
+                throw
             }}
         }}
         Write-Log ("Restored desktop session state from " + $restoreSource)
     }}
 }}
 Write-Log 'Restart requested.'
-$mainProcess = Get-CimInstance Win32_Process | Where-Object {{
-    $_.Name -eq 'Codex.exe' -and
-    $_.ExecutablePath -and
-    $_.ExecutablePath -notlike '*\resources\codex.exe' -and
-    $_.CommandLine -notmatch '--type='
-}} | Select-Object -First 1
-$launcherPath = $mainProcess.ExecutablePath
-if ($launcherPath) {{
-    Write-Log ("Using running launcher path: " + $launcherPath)
+$package = Get-AppxPackage -Name OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1
+if (-not $package -or -not $package.InstallLocation) {{
+    throw 'Unable to locate the Codex Desktop package.'
 }}
-if (-not $launcherPath) {{
-    $package = Get-AppxPackage | Where-Object {{
-        $_.Name -eq 'OpenAI.Codex' -or $_.PackageFamilyName -like 'OpenAI.Codex*'
-    }} | Sort-Object Version -Descending | Select-Object -First 1
-    if ($package -and $package.InstallLocation) {{
-        $launcherPath = Join-Path $package.InstallLocation 'app\Codex.exe'
-        Write-Log ("Using package launcher path: " + $launcherPath)
-    }}
-}}
-if (-not $launcherPath) {{
-    Write-Log 'Unable to locate the Codex Desktop executable.'
+$packageRoot = [System.IO.Path]::GetFullPath($package.InstallLocation).TrimEnd('\') + '\'
+[xml]$manifest = Get-Content -LiteralPath (Join-Path $packageRoot 'AppxManifest.xml')
+$application = $manifest.Package.Applications.Application | Select-Object -First 1
+$launcherPath = [System.IO.Path]::GetFullPath((Join-Path $packageRoot $application.Executable))
+if (-not $launcherPath.StartsWith($packageRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    -not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) {{
     throw 'Unable to locate the Codex Desktop executable.'
 }}
+Write-Log ("Using package launcher path: " + $launcherPath)
 Start-Sleep -Milliseconds {delay_ms}
+# Do not kill process trees: this helper can descend from a Codex task.
+# Stop only this package's GUI executable, including its renderer processes.
+# Standalone codex.exe processes and the restart helper must stay running.
 $codexProcesses = Get-CimInstance Win32_Process | Where-Object {{
-    $_.Name -ieq 'Codex.exe' -or
-    $_.ExecutablePath -like '*\OpenAI.Codex_*\app\Codex.exe' -or
-    $_.ExecutablePath -like '*\OpenAI.Codex_*\app\resources\codex.exe'
+    $_.ExecutablePath -and $_.ExecutablePath -ieq $launcherPath
 }}
-Write-Log ("Found " + $codexProcesses.Count + " Codex processes to stop.")
-$codexProcesses | ForEach-Object {{
-    try {{
-        & taskkill.exe /PID $_.ProcessId /F /T | Out-Null
-        Write-Log ("taskkill succeeded for PID " + $_.ProcessId)
-    }} catch {{
-        Write-Log ("taskkill failed for PID " + $_.ProcessId + ": " + $_.Exception.Message)
-    }}
-    try {{
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
-        Write-Log ("Stop-Process succeeded for PID " + $_.ProcessId)
-    }} catch {{
-        Write-Log ("Stop-Process failed for PID " + $_.ProcessId + ": " + $_.Exception.Message)
+foreach ($process in $codexProcesses) {{
+    if (-not (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue)) {{ continue }}
+    Write-Log ("Stopping Desktop GUI process " + $process.ProcessId)
+    & taskkill.exe /PID $process.ProcessId /F 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue)) {{
+        throw 'Unable to stop Codex Desktop. Session files were left unchanged.'
     }}
 }}
 $deadline = (Get-Date).AddSeconds(8)
-while ((Get-Date) -lt $deadline) {{
+do {{
     $remaining = Get-CimInstance Win32_Process | Where-Object {{
-        $_.Name -ieq 'Codex.exe' -or
-        $_.ExecutablePath -like '*\OpenAI.Codex_*\app\Codex.exe' -or
-        $_.ExecutablePath -like '*\OpenAI.Codex_*\app\resources\codex.exe'
+        $_.ExecutablePath -and $_.ExecutablePath -ieq $launcherPath
     }}
-    if (-not $remaining) {{
-        Write-Log 'All Codex processes exited.'
-        break
-    }}
-    Write-Log ("Still waiting for " + $remaining.Count + " Codex processes to exit.")
-    $remaining | ForEach-Object {{
-        try {{
-            & taskkill.exe /PID $_.ProcessId /F /T | Out-Null
-        }} catch {{}}
-    }}
+    if (-not $remaining) {{ break }}
     Start-Sleep -Milliseconds 250
-}}
-if (Get-CimInstance Win32_Process | Where-Object {{
-    $_.Name -ieq 'Codex.exe' -or
-    $_.ExecutablePath -like '*\OpenAI.Codex_*\app\Codex.exe' -or
-    $_.ExecutablePath -like '*\OpenAI.Codex_*\app\resources\codex.exe'
-}}) {{
-    Write-Log 'Continuing with relaunch after timeout while some Codex processes still appear alive.'
+}} while ((Get-Date) -lt $deadline)
+if ($remaining) {{
+    throw 'Codex Desktop is still running. Session files were left unchanged.'
 }}
 Sync-DesktopSessionState
 Start-Sleep -Milliseconds 700
@@ -245,7 +229,7 @@ pub fn build_restart_command(script_path: &Path) -> Vec<String> {
     ]
 }
 
-/// Write the restart script and launch a hidden PowerShell that runs it.
+/// Run the hidden restart script and report failures to the invoking surface.
 pub fn restart_codex_desktop(
     delay_seconds: f64,
     session_root: Option<&Path>,
@@ -283,9 +267,16 @@ fn launch_hidden_powershell(script_path: &Path) -> Result<(), CodexDesktopContro
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    command.spawn().map(|_| ()).map_err(|error| {
+    let status = command.status().map_err(|error| {
         CodexDesktopControlError::Message(format!("Failed to restart Codex Desktop: {error}"))
-    })
+    })?;
+    if !status.success() {
+        return Err(CodexDesktopControlError::Message(format!(
+            "Codex Desktop could not restart. Its session backup or restore may have failed. See {} for details.",
+            restart_log_path().display(),
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -324,6 +315,99 @@ fn powershell_string_array(values: &[&str]) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn hidden_script_failure_is_returned_to_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("failure.ps1");
+        std::fs::write(&script, "throw 'Simulated session copy failure'").unwrap();
+        assert!(
+            launch_hidden_powershell(&script)
+                .unwrap_err()
+                .to_string()
+                .contains("could not restart")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restart_uses_manifest_gui_and_leaves_standalone_cli_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::file_locations::with_app_support_directory(dir.path().join("support"));
+        let package = dir.path().join("package");
+        std::fs::create_dir_all(package.join("app")).unwrap();
+        std::fs::write(package.join("app/ChatGPT.exe"), b"fixture").unwrap();
+        std::fs::write(package.join("AppxManifest.xml"),
+            r#"<Package><Applications><Application Id="App" Executable="app/ChatGPT.exe" /></Applications></Package>"#).unwrap();
+        let session = dir.path().join("session");
+        let backup = dir.path().join("backup");
+        std::fs::create_dir_all(session.join("Local Storage")).unwrap();
+        std::fs::write(session.join("Local Storage/old-account"), b"old session").unwrap();
+        std::fs::write(session.join("Preferences"), b"old preferences").unwrap();
+        std::fs::write(session.join("unrelated-file"), b"preserve").unwrap();
+        let script = format!(
+            r#"
+$fixturePackage = {package}
+$script:stopped = $false
+function Get-AppxPackage {{ [pscustomobject]@{{ InstallLocation = $fixturePackage; Version = '1.0' }} }}
+function Get-CimInstance {{
+    [pscustomobject]@{{ ExecutablePath = 'C:\standalone\codex.exe'; ProcessId = 987654320; Name = 'codex.exe'; CommandLine = 'codex app-server' }}
+    if (-not $script:stopped) {{
+        [pscustomobject]@{{ ExecutablePath = (Join-Path $fixturePackage 'app\ChatGPT.exe'); ProcessId = 987654321; Name = 'ChatGPT.exe'; CommandLine = 'ChatGPT.exe' }}
+    }}
+}}
+function taskkill.exe {{
+    if ($args -contains '/T') {{ throw 'Process-tree shutdown would kill the restart helper' }}
+    if ($args[1] -ne 987654321) {{ throw 'Attempted to stop standalone CLI' }}
+    $script:stopped = $true
+    $global:LASTEXITCODE = 0
+}}
+function Get-Process {{ param($Id) [pscustomobject]@{{ Id = $Id }} }}
+function Start-Sleep {{}}
+function Start-Process {{ param($FilePath)
+    if ($FilePath -ne (Join-Path $fixturePackage 'app\ChatGPT.exe')) {{ throw 'Wrong launcher' }}
+    $script:launched = $true
+}}
+{restart}
+if (-not $script:stopped -or -not $script:launched) {{ throw 'Restart did not complete' }}
+"#,
+            package = powershell_literal_path(&package),
+            restart = build_restart_script(
+                0.0,
+                Some(&session),
+                Some(&backup),
+                Some(&dir.path().join("missing-target"))
+            )
+        );
+        super::super::file_locations::clear_app_support_directory_override();
+        let path = dir.path().join("test-restart.ps1");
+        std::fs::write(&path, script).unwrap();
+        let argv = build_restart_command(&path);
+        let output = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!session.join("Local Storage").exists());
+        assert!(!session.join("Preferences").exists());
+        assert_eq!(
+            std::fs::read(backup.join("Local Storage/old-account")).unwrap(),
+            b"old session"
+        );
+        assert_eq!(
+            std::fs::read(backup.join("Preferences")).unwrap(),
+            b"old preferences"
+        );
+        assert_eq!(
+            std::fs::read(session.join("unrelated-file")).unwrap(),
+            b"preserve"
+        );
+    }
+
     #[test]
     fn build_restart_script_includes_restart_flow() {
         let script = build_restart_script(1.25, None, None, None);
@@ -331,7 +415,9 @@ mod tests {
         assert!(script.contains("Get-CimInstance Win32_Process"));
         assert!(script.contains("Get-AppxPackage"));
         assert!(script.contains("taskkill.exe /PID"));
-        assert!(script.contains("Stop-Process -Id $_.ProcessId -Force"));
+        assert!(script.contains("$manifest.Package.Applications.Application"));
+        assert!(script.contains("$_.ExecutablePath -ieq $launcherPath"));
+        assert!(!script.contains("$_.Name -ieq 'Codex.exe'"));
         assert!(script.contains("Start-Process -FilePath $launcherPath"));
         assert!(script.contains("Start-Sleep -Milliseconds 1250"));
     }
@@ -365,9 +451,7 @@ mod tests {
         assert!(script.contains("Copy-SessionEntry $restoreSource $sessionRoot $relativePath"));
         assert!(script.contains("Clear-SessionEntry $sessionRoot $relativePath"));
         assert!(
-            script.contains(
-                "Restore source is missing; leaving the current desktop session in place"
-            )
+            script.contains("No saved session for target; clearing the previous desktop session")
         );
         assert!(script.contains("Failed to back up session entry"));
         assert!(script.contains("Failed to restore session entry"));

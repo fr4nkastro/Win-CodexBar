@@ -41,7 +41,12 @@ pub(crate) fn add_codex_records_to_summary(
     for record in records.iter().filter(|record| {
         CostUsageDayRange::is_in_range(&record.day_key, &range.since_key, &range.until_key)
     }) {
-        let tokens = CodexTokenCounts::from_values(record.input, record.cached, record.output);
+        let tokens = CodexTokenCounts::from_values(record.input, record.cached, record.output)
+            .with_reasoning(
+                record
+                    .reasoning
+                    .map(|reasoning| u64::try_from(reasoning.max(0)).unwrap_or(0)),
+            );
         let pricing_day = CostUsageDayRange::parse_day_key(&record.day_key);
         if let Some(cost) = add_codex_tokens_to_summary(summary, &record.model, tokens, pricing_day)
         {
@@ -55,7 +60,7 @@ pub(crate) fn add_codex_records_to_summary(
 
 /// Merge billable records into a day→model→`[input,cached,output]` map.
 pub(crate) fn merge_codex_records_into_days(
-    days: &mut std::collections::HashMap<String, std::collections::HashMap<String, Vec<i32>>>,
+    days: &mut std::collections::HashMap<String, std::collections::HashMap<String, Vec<i64>>>,
     records: &[CodexUsageRecord],
 ) {
     for record in records {
@@ -63,15 +68,8 @@ pub(crate) fn merge_codex_records_into_days(
             continue;
         }
         let models = days.entry(record.day_key.clone()).or_default();
-        let packed = models
-            .entry(record.model.clone())
-            .or_insert_with(|| vec![0, 0, 0]);
-        if packed.len() < 3 {
-            packed.resize(3, 0);
-        }
-        packed[0] = packed[0].saturating_add(record.input.max(0));
-        packed[1] = packed[1].saturating_add(record.cached.max(0));
-        packed[2] = packed[2].saturating_add(record.output.max(0));
+        let packed = models.entry(record.model.clone()).or_default();
+        JsonlScanner::merge_codex_record_into_packed(packed, record);
     }
 }
 
@@ -79,16 +77,20 @@ pub(crate) fn merge_codex_records_into_days(
 pub(crate) fn add_codex_packed_tokens_to_summary(
     summary: &mut CostSummary,
     model: &str,
-    packed: &[i32],
+    packed: &[i64],
     pricing_day: Option<NaiveDate>,
 ) -> Option<f64> {
     let input = packed.first().copied().unwrap_or(0);
     let cached = packed.get(1).copied().unwrap_or(0);
     let output = packed.get(2).copied().unwrap_or(0);
+    let reasoning = packed
+        .get(3)
+        .copied()
+        .map(|reasoning| u64::try_from(reasoning.max(0)).unwrap_or(0));
     add_codex_tokens_to_summary(
         summary,
         model,
-        CodexTokenCounts::from_values(input, cached, output),
+        CodexTokenCounts::from_values(input, cached, output).with_reasoning(reasoning),
         pricing_day,
     )
 }
@@ -97,7 +99,7 @@ pub(crate) fn add_codex_packed_tokens_to_summary(
 /// Returns `(session_cost, has_tokens)` — caller adds cost to `total_cost_usd`.
 pub(crate) fn add_codex_days_map_to_summary(
     summary: &mut CostSummary,
-    days: &std::collections::HashMap<String, std::collections::HashMap<String, Vec<i32>>>,
+    days: &std::collections::HashMap<String, std::collections::HashMap<String, Vec<i64>>>,
     range: &CostUsageDayRange,
 ) -> (f64, bool) {
     let mut total_cost = 0.0;
@@ -119,7 +121,13 @@ pub(crate) fn add_codex_days_map_to_summary(
     (total_cost, has_tokens)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "test-only helper path: only scan_codex_file_cost (test) calls this outside tests"
+    )
+)]
 pub(crate) fn scan_codex_file_cost_for_range(path: &Path, range: &CostUsageDayRange) -> f64 {
     let parse_result = match JsonlScanner::parse_codex_file(path, range, 0, None, None) {
         Ok(result) => result,
@@ -141,16 +149,23 @@ struct CodexTokenCounts {
     input: u64,
     cached: u64,
     output: u64,
+    reasoning: Option<u64>,
 }
 
 impl CodexTokenCounts {
-    fn from_values(input: i32, cached: i32, output: i32) -> Self {
-        let input = input.max(0) as u64;
+    fn from_values(input: i64, cached: i64, output: i64) -> Self {
+        let input = u64::try_from(input.max(0)).unwrap_or(0);
         Self {
             input,
-            cached: (cached.max(0) as u64).min(input),
-            output: output.max(0) as u64,
+            cached: u64::try_from(cached.max(0)).unwrap_or(0).min(input),
+            output: u64::try_from(output.max(0)).unwrap_or(0),
+            reasoning: None,
         }
+    }
+
+    fn with_reasoning(mut self, reasoning: Option<u64>) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 
     fn is_empty(self) -> bool {
@@ -159,9 +174,47 @@ impl CodexTokenCounts {
 }
 
 fn add_tokens(summary: &mut ModelTokenCounts, tokens: CodexTokenCounts) {
-    summary.input_tokens += tokens.input;
-    summary.output_tokens += tokens.output;
-    summary.cached_tokens += tokens.cached;
+    let had_core_tokens = has_core_tokens(summary);
+    merge_reasoning_tokens(
+        &mut summary.reasoning_tokens,
+        had_core_tokens,
+        tokens.reasoning,
+    );
+    summary.input_tokens = summary.input_tokens.saturating_add(tokens.input);
+    summary.output_tokens = summary.output_tokens.saturating_add(tokens.output);
+    summary.cached_tokens = summary.cached_tokens.saturating_add(tokens.cached);
+}
+
+fn add_summary_tokens(summary: &mut CostSummary, tokens: CodexTokenCounts) {
+    let had_core_tokens =
+        summary.input_tokens != 0 || summary.output_tokens != 0 || summary.cached_tokens != 0;
+    merge_reasoning_tokens(
+        &mut summary.reasoning_tokens,
+        had_core_tokens,
+        tokens.reasoning,
+    );
+    summary.input_tokens = summary.input_tokens.saturating_add(tokens.input);
+    summary.cached_tokens = summary.cached_tokens.saturating_add(tokens.cached);
+    summary.output_tokens = summary.output_tokens.saturating_add(tokens.output);
+}
+
+fn has_core_tokens(counts: &ModelTokenCounts) -> bool {
+    counts.input_tokens != 0 || counts.output_tokens != 0 || counts.cached_tokens != 0
+}
+
+fn merge_reasoning_tokens(
+    reasoning_tokens: &mut Option<u64>,
+    had_core_tokens: bool,
+    incoming: Option<u64>,
+) {
+    match (had_core_tokens, *reasoning_tokens, incoming) {
+        (false, _, incoming) => *reasoning_tokens = incoming,
+        (true, None, _) => {}
+        (true, Some(_), None) => *reasoning_tokens = None,
+        (true, Some(previous), Some(incoming)) => {
+            *reasoning_tokens = Some(previous.saturating_add(incoming));
+        }
+    }
 }
 
 fn add_codex_tokens_to_summary(
@@ -194,9 +247,7 @@ fn add_codex_tokens_to_summary(
     // not "unknown yet"). Upstream 0.48.0 F18: codex-auto-review rows are retained
     // with cost-nil so priced rows in the same history stay ranked.
     if CostUsagePricing::is_codex_unattributed_model(&model_key) || is_routing_unpriced {
-        summary.input_tokens += tokens.input;
-        summary.cached_tokens += tokens.cached;
-        summary.output_tokens += tokens.output;
+        add_summary_tokens(summary, tokens);
         summary.by_model.entry(model_key.clone()).or_insert(0.0);
         add_tokens(
             summary
@@ -258,9 +309,7 @@ fn add_codex_tokens_to_summary(
         }
     }
 
-    summary.input_tokens += tokens.input;
-    summary.cached_tokens += tokens.cached;
-    summary.output_tokens += tokens.output;
+    add_summary_tokens(summary, tokens);
     *summary.by_model.entry(model_key.clone()).or_insert(0.0) += cost;
 
     let speed_bucket = codex_speed_bucket(&model_key);
@@ -282,7 +331,13 @@ fn add_codex_tokens_to_summary(
     Some(cost)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "only reached from scan_codex_file_cost_for_range, which is test-only in non-test builds"
+    )
+)]
 fn codex_records_cost(records: &[CodexUsageRecord], range: &CostUsageDayRange) -> f64 {
     let mut total_cost = 0.0;
 
@@ -322,7 +377,10 @@ fn codex_speed_bucket(model: &str) -> &'static str {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "only reached from test paths in non-test builds")
+)]
 fn codex_cost_usd(model: &str, input: u64, cached: u64, output: u64) -> f64 {
     codex_cost_usd_for_day(model, input, cached, output, None)
 }
@@ -348,22 +406,9 @@ fn codex_cost_usd_for_day(
     if normalized.contains("fast") || normalized.contains("priority") {
         let fast = pricing_day
             .and_then(|day| {
-                CostUsagePricing::codex_fast_cost_usd_at_date(
-                    model,
-                    input as i32,
-                    cached as i32,
-                    output as i32,
-                    day,
-                )
+                CostUsagePricing::codex_fast_cost_usd_at_date(model, input, cached, output, day)
             })
-            .or_else(|| {
-                CostUsagePricing::codex_fast_cost_usd(
-                    model,
-                    input as i32,
-                    cached as i32,
-                    output as i32,
-                )
-            });
+            .or_else(|| CostUsagePricing::codex_fast_cost_usd(model, input, cached, output));
         if let Some(cost) = fast {
             return cost;
         }
@@ -405,6 +450,116 @@ mod tests {
     }
 
     #[test]
+    fn token_breakdown_addition_saturates_without_wrapping() {
+        let counts = ModelTokenCounts {
+            input_tokens: u64::MAX,
+            output_tokens: 1,
+            cached_tokens: u64::MAX,
+            reasoning_tokens: Some(7),
+        };
+        assert_eq!(counts.total(), u64::MAX);
+
+        let mut merged = ModelTokenCounts {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cached_tokens: u64::MAX,
+            reasoning_tokens: Some(7),
+        };
+        add_tokens(
+            &mut merged,
+            CodexTokenCounts {
+                input: 1,
+                cached: 1,
+                output: 1,
+                reasoning: Some(1),
+            },
+        );
+        assert_eq!(merged.input_tokens, u64::MAX);
+        assert_eq!(merged.output_tokens, u64::MAX);
+        assert_eq!(merged.cached_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn known_reasoning_is_exposed_without_changing_cost() {
+        let target = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+        let range = CostUsageDayRange::new(target, target);
+        let make_record = |reasoning| CodexUsageRecord {
+            day_key: "2026-05-31".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            input: 100,
+            cached: 0,
+            output: 20,
+            reasoning,
+        };
+
+        let mut known_summary = CostSummary::default();
+        let (known_cost, known_has_tokens) =
+            add_codex_records_to_summary(&mut known_summary, &[make_record(Some(7))], &range);
+        let mut unknown_summary = CostSummary::default();
+        let (unknown_cost, unknown_has_tokens) =
+            add_codex_records_to_summary(&mut unknown_summary, &[make_record(None)], &range);
+
+        assert!(known_has_tokens && unknown_has_tokens);
+        assert_eq!(known_summary.output_tokens, 20);
+        assert_eq!(known_summary.reasoning_tokens, Some(7));
+        assert_eq!(
+            known_summary.by_model_tokens["gpt-5.6-sol"].reasoning_tokens,
+            Some(7)
+        );
+        assert_eq!(known_cost, unknown_cost);
+    }
+
+    #[test]
+    fn reasoning_unknown_is_sticky_for_summary_and_model() {
+        let target = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+        let range = CostUsageDayRange::new(target, target);
+        let make_record = |reasoning| CodexUsageRecord {
+            day_key: "2026-05-31".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            input: 1,
+            cached: 0,
+            output: 20,
+            reasoning,
+        };
+        let records = vec![
+            make_record(Some(7)),
+            make_record(None),
+            make_record(Some(3)),
+        ];
+        let mut summary = CostSummary::default();
+
+        add_codex_records_to_summary(&mut summary, &records, &range);
+
+        assert_eq!(summary.reasoning_tokens, None);
+        assert_eq!(
+            summary.by_model_tokens["gpt-5.6-sol"].reasoning_tokens,
+            None
+        );
+    }
+
+    #[test]
+    fn packed_reasoning_slot_distinguishes_known_from_unknown() {
+        let target = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+        let mut known = CostSummary::default();
+        add_codex_packed_tokens_to_summary(
+            &mut known,
+            "gpt-5.6-sol",
+            &[100, 0, 20, 7],
+            Some(target),
+        );
+        assert_eq!(known.reasoning_tokens, Some(7));
+
+        let mut unknown = CostSummary::default();
+        add_codex_packed_tokens_to_summary(
+            &mut unknown,
+            "gpt-5.6-sol",
+            &[100, 0, 20],
+            Some(target),
+        );
+        assert_eq!(unknown.reasoning_tokens, None);
+    }
+
+    #[test]
     fn test_codex_pricing_uses_gpt55_standard_short_context_rates() {
         let cost = codex_cost_usd("gpt-5.5", 1_000_000, 400_000, 1_000_000);
 
@@ -425,6 +580,7 @@ mod tests {
                 input: 200_000,
                 cached: 0,
                 output: 0,
+                reasoning: None,
             },
             CodexUsageRecord {
                 day_key: "2026-05-31".to_string(),
@@ -432,6 +588,7 @@ mod tests {
                 input: 200_000,
                 cached: 0,
                 output: 0,
+                reasoning: None,
             },
             CodexUsageRecord {
                 day_key: "2026-05-30".to_string(),
@@ -439,6 +596,7 @@ mod tests {
                 input: 200_000,
                 cached: 0,
                 output: 0,
+                reasoning: None,
             },
         ];
         let mut summary = CostSummary::default();
@@ -485,6 +643,7 @@ mod tests {
                 input: 100,
                 cached: 0,
                 output: 5,
+                reasoning: None,
             },
             CodexUsageRecord {
                 day_key: "2026-08-19".to_string(),
@@ -492,6 +651,7 @@ mod tests {
                 input: 1_000_000,
                 cached: 0,
                 output: 1_000_000,
+                reasoning: None,
             },
         ];
         let mut summary = CostSummary::default();
@@ -514,6 +674,7 @@ mod tests {
             input: 10,
             cached: 0,
             output: 1,
+            reasoning: None,
         }];
         let mut days = std::collections::HashMap::new();
         merge_codex_records_into_days(&mut days, &records);
@@ -530,6 +691,7 @@ mod tests {
             input: 55_000_000,
             cached: 0,
             output: 0,
+            reasoning: None,
         }];
         let mut summary = CostSummary::default();
 
@@ -558,6 +720,7 @@ mod tests {
             input: 1_000_000,
             cached: 0,
             output: 1_000_000,
+            reasoning: None,
         }];
         let mut summary = CostSummary::default();
 

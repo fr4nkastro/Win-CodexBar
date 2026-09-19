@@ -4,6 +4,7 @@
 //! Requires API key for authentication
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -291,9 +292,10 @@ impl WarpProvider {
             format!("{requests_used}/{request_limit} credits")
         };
 
-        let mut primary = RateWindow::new(used_percent);
-        primary.reset_description = Some(reset_description);
-        primary
+        let resets_at = (!is_unlimited)
+            .then(|| Self::parse_timestamp(limit_info.next_refresh_time.as_deref()))
+            .flatten();
+        RateWindow::with_details(used_percent, None, resets_at, Some(reset_description))
     }
 
     fn primary_used_percent(is_unlimited: bool, requests_used: i64, request_limit: i64) -> f64 {
@@ -328,17 +330,49 @@ impl WarpProvider {
     }
 
     fn bonus_window(all_grants: Vec<&BonusGrant>) -> Option<RateWindow> {
-        let bonus_remaining: i64 = all_grants
-            .iter()
-            .map(|g| g.request_credits_remaining.unwrap_or(0))
-            .sum();
-        let bonus_total: i64 = all_grants
-            .iter()
-            .map(|g| g.request_credits_granted.unwrap_or(0))
-            .sum();
+        let mut bonus_remaining = 0_i64;
+        let mut bonus_total = 0_i64;
+        let mut next_expiration: Option<(DateTime<Utc>, i64)> = None;
 
-        (bonus_total > 0 || bonus_remaining > 0)
-            .then(|| RateWindow::new(Self::bonus_used_percent(bonus_total, bonus_remaining)))
+        for grant in all_grants {
+            let remaining = grant.request_credits_remaining.unwrap_or(0);
+            bonus_remaining = bonus_remaining.saturating_add(remaining);
+            bonus_total = bonus_total.saturating_add(grant.request_credits_granted.unwrap_or(0));
+
+            if remaining > 0
+                && let Some(expiration) = Self::parse_timestamp(grant.expiration.as_deref())
+            {
+                match next_expiration.as_mut() {
+                    Some((current, current_remaining)) if expiration < *current => {
+                        *current = expiration;
+                        *current_remaining = remaining;
+                    }
+                    Some((current, current_remaining)) if expiration == *current => {
+                        *current_remaining = current_remaining.saturating_add(remaining);
+                    }
+                    None => next_expiration = Some((expiration, remaining)),
+                    _ => {}
+                }
+            }
+        }
+
+        if bonus_total <= 0 && bonus_remaining <= 0 {
+            return None;
+        }
+
+        let reset_description = next_expiration.map(|(expiration, remaining)| {
+            format!(
+                "{} credits expire on {}",
+                remaining,
+                expiration.format("%Y-%m-%d %H:%M UTC")
+            )
+        });
+        Some(RateWindow::with_details(
+            Self::bonus_used_percent(bonus_total, bonus_remaining),
+            None,
+            None,
+            reset_description,
+        ))
     }
 
     fn bonus_used_percent(bonus_total: i64, bonus_remaining: i64) -> f64 {
@@ -350,6 +384,12 @@ impl WarpProvider {
         } else {
             100.0
         }
+    }
+
+    fn parse_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
+        value
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
     }
 }
 
@@ -439,5 +479,49 @@ mod tests {
 
         let grants = WarpProvider::all_bonus_grants(Some(&user_grants), Some(&workspaces));
         assert_eq!(grants.len(), 2);
+    }
+
+    #[test]
+    fn primary_window_preserves_refresh_timestamp() {
+        let window = WarpProvider::primary_window(&RequestLimitInfo {
+            is_unlimited: Some(false),
+            next_refresh_time: Some("2026-09-20T12:34:56Z".to_string()),
+            request_limit: Some(100),
+            requests_used: Some(25),
+        });
+
+        assert_eq!(window.used_percent, 25.0);
+        assert_eq!(
+            window.resets_at.map(|value| value.to_rfc3339()),
+            Some("2026-09-20T12:34:56+00:00".to_string())
+        );
+        assert_eq!(window.reset_description.as_deref(), Some("25/100 credits"));
+    }
+
+    #[test]
+    fn bonus_window_describes_earliest_expiring_remaining_grant() {
+        let later = BonusGrant {
+            request_credits_granted: Some(100),
+            request_credits_remaining: Some(80),
+            expiration: Some("2026-10-01T00:00:00Z".to_string()),
+        };
+        let earlier = BonusGrant {
+            request_credits_granted: Some(50),
+            request_credits_remaining: Some(10),
+            expiration: Some("2026-09-22T00:00:00Z".to_string()),
+        };
+        let same_earlier = BonusGrant {
+            request_credits_granted: Some(50),
+            request_credits_remaining: Some(10),
+            expiration: Some("2026-09-22T00:00:00Z".to_string()),
+        };
+
+        let window = WarpProvider::bonus_window(vec![&later, &earlier, &same_earlier])
+            .expect("bonus window");
+        assert_eq!(window.used_percent, 50.0);
+        assert_eq!(
+            window.reset_description.as_deref(),
+            Some("20 credits expire on 2026-09-22 00:00 UTC")
+        );
     }
 }

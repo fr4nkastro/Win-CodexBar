@@ -5,6 +5,48 @@ use std::sync::Arc;
 
 const MAX_CONCURRENT_PROVIDER_FETCHES: usize = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshScope {
+    AllEnabled,
+    AutoResume,
+}
+
+impl RefreshScope {
+    fn provider_ids(self, settings: &Settings, enabled_ids: &[ProviderId]) -> Vec<ProviderId> {
+        match self {
+            Self::AllEnabled => enabled_ids.to_vec(),
+            Self::AutoResume => crate::auto_resume::enabled_provider_ids(settings),
+        }
+    }
+
+    fn refresh_account_lanes(self) -> bool {
+        matches!(self, Self::AllEnabled)
+    }
+}
+
+/// Account changes supersede the old identity's cache and any in-flight batch.
+pub(crate) fn invalidate_account_usage(
+    state: &mut AppState,
+    id: ProviderId,
+) -> ProviderUsageSnapshot {
+    state.provider_refresh_generation = state.provider_refresh_generation.wrapping_add(1);
+    state.is_refreshing = false;
+    state.provider_refresh_started_at = None;
+    state.transient_provider_failure_counts.remove(&id);
+    state.auto_resume.clear_provider(id);
+    state
+        .provider_cache
+        .retain(|snapshot| snapshot.provider_id != id.cli_name());
+    let pending = ProviderUsageSnapshot::from_error(
+        id,
+        instantiate_provider(id).metadata(),
+        format!("Account changed. Refreshing {} usage…", id.display_name()),
+        codexbar::core::ProviderStateKind::Unknown,
+    );
+    state.provider_cache.push(pending.clone());
+    pending
+}
+
 // ── Provider refresh commands ────────────────────────────────────────
 
 /// Build a `FetchContext` for a provider using persisted cookies/keys.
@@ -15,6 +57,7 @@ pub(crate) fn build_fetch_context(
     api_keys: &ApiKeys,
     token_accounts: &HashMap<ProviderId, ProviderAccountData>,
 ) -> FetchContext {
+    let provider = instantiate_provider(id);
     let cookie_source = settings.cookie_source(id);
     let stored_cookie = cookies.get(id.cli_name()).map(|s| s.to_string());
     let stored_api_key = api_keys.get(id.cli_name()).map(|s| s.to_string());
@@ -26,6 +69,9 @@ pub(crate) fn build_fetch_context(
     let active_token_cookie = token_override
         .as_ref()
         .and_then(|override_data| override_data.cookie_header.clone());
+    let defer_provider_browser_cookie_lookup = provider.owns_browser_cookie_resolution()
+        && active_token_cookie.is_none()
+        && stored_cookie.is_none();
     let active_token_env = token_override
         .as_ref()
         .and_then(|override_data| override_data.env_override.as_ref());
@@ -47,6 +93,18 @@ pub(crate) fn build_fetch_context(
         (source_mode, None)
     } else {
         match cookie_source {
+            // #433: an explicitly selected, non-empty Claude manual cookie is
+            // authoritative. Do not let an active OAuth token account silently
+            // replace it; this keeps tray refresh behavior aligned with diagnose,
+            // whose Claude Auto path tries the supplied Web cookie before OAuth.
+            "manual"
+                if provider.manual_cookie_precedes_token_account()
+                    && stored_cookie
+                        .as_deref()
+                        .is_some_and(|cookie| !cookie.trim().is_empty()) =>
+            {
+                (SourceMode::Web, stored_cookie.clone())
+            }
             _ if active_token_env.is_some() => (SourceMode::OAuth, None),
             "off" if provider_uses_oauth_without_cookies(id, usage_source) => {
                 (SourceMode::OAuth, None)
@@ -78,14 +136,18 @@ pub(crate) fn build_fetch_context(
             }
             // `browser` is accepted as a legacy alias from older settings.
             "auto" | "browser" | "web" => {
-                // Try browser cookie extraction as fallback when no manual cookie is set.
-                // On non-Windows this is a harmless no-op that returns an error.
+                // Claude resolves its cached cookie and browser fallback inside
+                // the provider; other providers retain the shell fallback.
                 let cookie_header = active_token_cookie.or(stored_cookie).or_else(|| {
-                    provider_cookie_domain(id, settings).and_then(|domain| {
-                        codexbar::browser::cookies::get_cookie_header(domain)
-                            .ok()
-                            .filter(|h| !h.is_empty())
-                    })
+                    if defer_provider_browser_cookie_lookup {
+                        None
+                    } else {
+                        provider_cookie_domain(id, settings).and_then(|domain| {
+                            codexbar::browser::cookies::get_cookie_header(domain)
+                                .ok()
+                                .filter(|h| !h.is_empty())
+                        })
+                    }
                 });
                 (usage_source, cookie_header)
             }
@@ -97,10 +159,7 @@ pub(crate) fn build_fetch_context(
     // historically mapped "manual + no cookie" to Cli, which surfaces as
     // "Source mode 'Cli' not supported". Remap to Web and try browser cookies
     // unless the user explicitly disabled cookies ("off").
-    if source_mode == SourceMode::Cli
-        && cookie_source != "off"
-        && !instantiate_provider(id).supports_cli()
-    {
+    if source_mode == SourceMode::Cli && cookie_source != "off" && !provider.supports_cli() {
         if cookie_header
             .as_deref()
             .map(str::trim)
@@ -227,6 +286,10 @@ pub(crate) fn invalidate_provider_refresh_and_prune_disabled(
     guard
         .transient_provider_failure_counts
         .retain(|id, _| enabled_ids.contains(id));
+    guard
+        .provider_cache_updated_at_by_provider
+        .retain(|id, _| enabled_ids.contains(id));
+    guard.auto_resume.clear_disabled(enabled_ids);
     Ok(())
 }
 
@@ -236,26 +299,51 @@ pub(crate) fn is_current_provider_refresh_generation(guard: &AppState, generatio
 
 /// Core refresh logic, usable from both the Tauri command and tray menu actions.
 pub(crate) async fn do_refresh_providers(app: &tauri::AppHandle) -> Result<(), String> {
-    do_refresh_providers_with_policy(app, true).await
+    do_refresh_providers_with_policy(app, true, RefreshScope::AllEnabled).await
 }
 
 pub(crate) async fn do_refresh_providers_if_stale(app: &tauri::AppHandle) -> Result<(), String> {
-    do_refresh_providers_with_policy(app, false).await
+    do_refresh_providers_with_policy(app, false, RefreshScope::AllEnabled).await
+}
+
+/// Refresh only enabled providers with the opt-in exact-session watcher. This
+/// keeps a 60-second resume probe from shortening or repeating unrelated
+/// provider work.
+pub(crate) async fn do_refresh_auto_resume_providers_if_stale(
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    do_refresh_providers_with_policy(app, false, RefreshScope::AutoResume).await
 }
 
 async fn do_refresh_providers_with_policy(
     app: &tauri::AppHandle,
     force: bool,
+    scope: RefreshScope,
 ) -> Result<(), String> {
     let state = app.state::<Mutex<AppState>>();
+    let expected_generation = state
+        .lock()
+        .map_err(|e| e.to_string())?
+        .provider_refresh_generation;
+    let settings = Settings::load();
+    let enabled_ids = settings.get_enabled_provider_ids();
+    let refresh_ids = scope.provider_ids(&settings, &enabled_ids);
+    if refresh_ids.is_empty() {
+        return Ok(());
+    }
 
-    let Some(generation) = begin_provider_refresh(&state, force)? else {
+    let inputs = ProviderRefreshInputs::load(settings, enabled_ids);
+    let Some(generation) =
+        begin_provider_refresh(&state, force, &refresh_ids, expected_generation)?
+    else {
+        // Settings or account identity changed while inputs were loading, or a
+        // newer batch already owns the refresh. Discard this input snapshot.
         return Ok(());
     };
 
-    let inputs = ProviderRefreshInputs::load();
     // Ensure cache only contains currently enabled providers for this generation.
-    if let Ok(mut guard) = state.lock()
+    if scope == RefreshScope::AllEnabled
+        && let Ok(mut guard) = state.lock()
         && is_current_provider_refresh_generation(&guard, generation)
     {
         prune_provider_cache_to_enabled(&mut guard.provider_cache, &inputs.enabled_ids);
@@ -263,15 +351,20 @@ async fn do_refresh_providers_with_policy(
 
     events::emit_refresh_started(
         app,
-        inputs
-            .enabled_ids
+        refresh_ids
             .iter()
             .map(|id| id.cli_name().to_string())
             .collect(),
     );
-    let enabled_count = inputs.enabled_ids.len();
+    let enabled_count = refresh_ids.len();
 
-    let handles = spawn_provider_refreshes(app, &inputs, generation);
+    let handles = spawn_provider_refreshes(
+        app,
+        &inputs,
+        &refresh_ids,
+        generation,
+        scope.refresh_account_lanes(),
+    );
     await_provider_refreshes(handles).await;
 
     let Some(error_count) = finish_provider_refresh(&state, generation)? else {
@@ -290,12 +383,26 @@ async fn do_refresh_providers_with_policy(
 fn begin_provider_refresh(
     state: &tauri::State<'_, Mutex<AppState>>,
     force: bool,
+    provider_ids: &[ProviderId],
+    expected_generation: u64,
 ) -> Result<Option<u64>, String> {
     let mut guard = state.lock().map_err(|e| e.to_string())?;
+    reserve_provider_refresh(&mut guard, force, provider_ids, expected_generation)
+}
+
+fn reserve_provider_refresh(
+    guard: &mut AppState,
+    force: bool,
+    provider_ids: &[ProviderId],
+    expected_generation: u64,
+) -> Result<Option<u64>, String> {
     if guard.is_refreshing {
         return Ok(None);
     }
-    if provider_cache_can_skip_refresh(&guard, force) {
+    if guard.provider_refresh_generation != expected_generation {
+        return Ok(None);
+    }
+    if provider_cache_can_skip_refresh(guard, force, provider_ids) {
         return Ok(None);
     }
 
@@ -306,16 +413,30 @@ fn begin_provider_refresh(
     Ok(Some(generation))
 }
 
-fn provider_cache_can_skip_refresh(guard: &AppState, force: bool) -> bool {
+fn provider_cache_can_skip_refresh(
+    guard: &AppState,
+    force: bool,
+    provider_ids: &[ProviderId],
+) -> bool {
+    let cache_has_all = provider_ids.iter().all(|id| {
+        guard
+            .provider_cache
+            .iter()
+            .any(|snapshot| snapshot.provider_id == id.cli_name())
+    });
     // Proof-harness seed: pin the synthetic snapshot for the whole run so a
     // periodic auto-refresh cannot overwrite seeded capture conditions.
-    if !force && crate::proof_harness::seed_usage_json_active() && !guard.provider_cache.is_empty()
-    {
+    if !force && crate::proof_harness::seed_usage_json_active() && cache_has_all {
         return true;
     }
     !force
-        && !guard.provider_cache.is_empty()
-        && is_provider_cache_fresh(guard.provider_cache_updated_at, PROVIDER_CACHE_STALE_AFTER)
+        && cache_has_all
+        && provider_ids.iter().all(|id| {
+            is_provider_cache_fresh(
+                guard.provider_cache_updated_at_by_provider.get(id).copied(),
+                PROVIDER_CACHE_STALE_AFTER,
+            )
+        })
 }
 
 struct ProviderRefreshInputs {
@@ -327,9 +448,7 @@ struct ProviderRefreshInputs {
 }
 
 impl ProviderRefreshInputs {
-    fn load() -> Self {
-        let settings = Settings::load();
-        let enabled_ids = settings.get_enabled_provider_ids();
+    fn load(settings: Settings, enabled_ids: Vec<ProviderId>) -> Self {
         let manual_cookies = ManualCookies::load();
         let api_keys = ApiKeys::load();
         let token_accounts = TokenAccountStore::new().load().unwrap_or_else(|e| {
@@ -350,12 +469,14 @@ impl ProviderRefreshInputs {
 fn spawn_provider_refreshes(
     app: &tauri::AppHandle,
     inputs: &ProviderRefreshInputs,
+    provider_ids: &[ProviderId],
     generation: u64,
+    refresh_account_lanes: bool,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    let mut handles = Vec::with_capacity(inputs.enabled_ids.len());
+    let mut handles = Vec::with_capacity(provider_ids.len());
     let fetch_permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROVIDER_FETCHES));
 
-    for id in &inputs.enabled_ids {
+    for id in provider_ids {
         let id = *id;
         let app_handle = app.clone();
         let fetch_permits = Arc::clone(&fetch_permits);
@@ -387,11 +508,16 @@ fn spawn_provider_refreshes(
     // shared fetch semaphore. The ambient account still publishes the single
     // "codex" provider snapshot used by tray/menu; the lanes fill the account
     // snapshot store consumed by the Settings accounts panel.
-    if inputs.enabled_ids.contains(&ProviderId::Codex) {
+    if refresh_account_lanes && provider_ids.contains(&ProviderId::Codex) {
         let app_handle = app.clone();
         let fetch_permits = Arc::clone(&fetch_permits);
         handles.push(tokio::spawn(async move {
-            super::codex_accounts::refresh_codex_account_lanes(app_handle, fetch_permits).await;
+            super::codex_accounts::refresh_codex_account_lanes(
+                app_handle,
+                fetch_permits,
+                generation,
+            )
+            .await;
         }));
     }
 
@@ -416,7 +542,8 @@ async fn refresh_provider(
     generation: u64,
     token_account_id: Option<uuid::Uuid>,
 ) {
-    let snapshot = fetch_provider_snapshot(id, ctx, token_account_id).await;
+    let (snapshot, account_identity) = fetch_provider_snapshot(id, ctx, token_account_id).await;
+    let fresh_snapshot = snapshot.error.is_none();
 
     let state = app.state::<Mutex<AppState>>();
     let published = if let Ok(mut guard) = state.lock() {
@@ -440,6 +567,11 @@ async fn refresh_provider(
             let mut snapshot = snapshot;
             codex_reset_backfill(&mut snapshot, cached.as_ref());
             upsert_provider_cache(&mut guard.provider_cache, snapshot.clone());
+            if fresh_snapshot {
+                guard
+                    .provider_cache_updated_at_by_provider
+                    .insert(id, std::time::Instant::now());
+            }
             Some(snapshot)
         }
     } else {
@@ -448,16 +580,28 @@ async fn refresh_provider(
 
     if let Some(snapshot) = published {
         events::emit_provider_updated(&app, &snapshot);
+        if fresh_snapshot {
+            crate::auto_resume::observe_fresh_snapshot(
+                &app,
+                id,
+                &snapshot,
+                token_account_id,
+                account_identity.as_deref(),
+            )
+            .await;
+        }
     }
 }
 
 /// F6 (upstream 0.48.0 UsageStore+CodexResetBackfill): backfill missing
 /// `resets_at` / `reset_description` on fresh Codex windows from the cached
-/// lane data when the cached reset is still future. Fresh `used_percent` is
-/// untouched; only the reset timestamp/description are backfilled.
+/// lane data when the cached reset is still future. z.ai five-hour cached
+/// resets use the same plausibility bound as the provider parser, so an
+/// impossible rejected reset cannot be restored from the cache. Fresh
+/// `used_percent` is untouched; only reset metadata is backfilled.
 ///
-/// This is Codex-scoped by design (upstream: "Provider-specific by design"):
-/// other providers do not carry bounded resume state.
+/// This remains provider-scoped by design (upstream: "Provider-specific by
+/// design"): only Codex and z.ai carry the relevant bounded reset semantics.
 ///
 /// Applies to the bridge snapshot before publishing so every surface (tray,
 /// CLI, frontend) sees the backfilled reset instead of a missing one.
@@ -466,19 +610,23 @@ pub(super) fn codex_reset_backfill(
     cached: Option<&ProviderUsageSnapshot>,
 ) {
     let Some(cached) = cached else { return };
-    if snapshot.provider_id != "codex" {
+    if !matches!(snapshot.provider_id.as_str(), "codex" | "zai") {
         return;
     }
 
     // Backfill each slot from the corresponding cached slot.
-    backfill_slot_window(&mut snapshot.primary, &cached.primary);
+    backfill_slot_window(
+        &snapshot.provider_id,
+        &mut snapshot.primary,
+        &cached.primary,
+    );
     if let (Some(fresh), Some(cached_sec)) = (&mut snapshot.secondary, &cached.secondary) {
-        backfill_slot_window(fresh, cached_sec);
+        backfill_slot_window(&snapshot.provider_id, fresh, cached_sec);
     }
     // Tertiary (monthly/other): the Codex bridge doesn't normally populate this,
     // but the slot exists for forward-compat. Backfill when available.
     if let (Some(fresh), Some(cached_ter)) = (&mut snapshot.tertiary, &cached.tertiary) {
-        backfill_slot_window(fresh, cached_ter);
+        backfill_slot_window(&snapshot.provider_id, fresh, cached_ter);
     }
 }
 
@@ -486,6 +634,7 @@ pub(super) fn codex_reset_backfill(
 /// cached window whose reset is still in the future. `used_percent` is never
 /// overwritten (upstream: "fresh used_percent untouched").
 fn backfill_slot_window(
+    provider_id: &str,
     fresh: &mut bridge::RateWindowSnapshot,
     cached: &bridge::RateWindowSnapshot,
 ) {
@@ -497,11 +646,20 @@ fn backfill_slot_window(
     };
     // Only backfill when the cached reset is still future — a stale reset is
     // worse than a missing one.
-    if let Ok(cached_dt) = chrono::DateTime::parse_from_rfc3339(cached_reset) {
-        if cached_dt <= chrono::Utc::now() {
-            return;
-        }
-    } else {
+    let Ok(cached_dt) = chrono::DateTime::parse_from_rfc3339(cached_reset) else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    if cached_dt <= now {
+        return;
+    }
+    // A missing z.ai five-hour reset can mean the provider rejected an
+    // impossible future timestamp. Do not let equally impossible cached
+    // evidence undo that rejection, but preserve a plausible cached reset.
+    if provider_id == "zai"
+        && fresh.window_minutes == Some(300)
+        && cached_dt > now + chrono::Duration::minutes(5 * 60 + 1)
+    {
         return;
     }
     fresh.resets_at = Some(cached_reset.clone());
@@ -516,33 +674,18 @@ pub(super) fn preserve_last_good_transient_failure(
     id: ProviderId,
     snapshot: ProviderUsageSnapshot,
 ) -> ProviderUsageSnapshot {
-    if snapshot.error.is_none() {
+    let Some(error) = snapshot.error.as_deref() else {
+        guard.transient_provider_failure_counts.remove(&id);
+        return snapshot;
+    };
+
+    let policy = instantiate_provider(id).last_good_failure_policy(error);
+    if policy == codexbar::core::LastGoodFailurePolicy::Replace {
         guard.transient_provider_failure_counts.remove(&id);
         return snapshot;
     }
 
-    if id != ProviderId::Claude {
-        guard.transient_provider_failure_counts.remove(&id);
-        return snapshot;
-    }
-
-    let error = snapshot.error.as_deref();
-    // Hard auth loss / subscription-unavailable answers should not keep stale bars.
-    if is_hard_claude_auth_loss(error) {
-        guard.transient_provider_failure_counts.remove(&id);
-        return snapshot;
-    }
-
-    let preservable = is_transient_claude_auth_error(error)
-        || is_claude_cli_usage_parse_failure(error)
-        || is_claude_cli_rate_limit_failure(error)
-        || is_claude_timeout_failure(error);
-    if !preservable {
-        guard.transient_provider_failure_counts.remove(&id);
-        return snapshot;
-    }
-
-    let Some(previous) = guard
+    let Some(mut previous) = guard
         .provider_cache
         .iter()
         .find(|cached| cached.provider_id == id.cli_name() && cached.error.is_none())
@@ -553,72 +696,62 @@ pub(super) fn preserve_last_good_transient_failure(
         // all sources" banner — flag it transient so surfaces show the
         // refreshing affordance instead. `error` text is retained for
         // logs/copy (design D5); hard auth loss already short-circuited
-        // above, and any non-bounded failure leaves `transient` false.
-        let transient = is_bounded_oauth_backoff(error);
+        // above via `LastGoodFailurePolicy::Replace`, and any non-bounded
+        // failure leaves `transient` false.
+        let transient = id == ProviderId::Claude && is_bounded_oauth_backoff(Some(error));
         let mut snapshot = snapshot;
         snapshot.transient = transient;
         return snapshot;
     };
-
-    // Parse / rate-limit / timeout: keep last-good every time (upstream #2247).
-    // Transient auth (unauthorized-ish) still only preserves once so real logout surfaces.
-    let parse_or_rate = is_claude_cli_usage_parse_failure(error)
-        || is_claude_cli_rate_limit_failure(error)
-        || is_claude_timeout_failure(error);
+    // Preserved quota remains useful for display, but the failed current
+    // attempt cannot prove that Claude CLI is available for account actions.
+    previous.has_successful_claude_cli_quota = false;
 
     let count = guard
         .transient_provider_failure_counts
         .entry(id)
         .or_insert(0);
-    if parse_or_rate || *count == 0 {
-        if !parse_or_rate {
-            *count = 1;
+    match policy {
+        codexbar::core::LastGoodFailurePolicy::Preserve => {
+            tracing::warn!(
+                provider = id.cli_name(),
+                error,
+                "preserving last good provider snapshot after transient failure"
+            );
+            previous
         }
-        tracing::warn!(
-            provider = id.cli_name(),
-            error = error.unwrap_or(""),
-            "preserving last good Claude snapshot after transient failure"
-        );
-        previous
-    } else {
-        *count = count.saturating_add(1);
-        snapshot
+        codexbar::core::LastGoodFailurePolicy::PreserveOnce if *count == 0 => {
+            *count = 1;
+            tracing::warn!(
+                provider = id.cli_name(),
+                error,
+                "preserving last good provider snapshot after transient failure"
+            );
+            previous
+        }
+        codexbar::core::LastGoodFailurePolicy::PreserveOnce => {
+            *count = count.saturating_add(1);
+            snapshot
+        }
+        codexbar::core::LastGoodFailurePolicy::PreserveOnceThenSurface if *count == 0 => {
+            *count = 1;
+            tracing::warn!(
+                provider = id.cli_name(),
+                error,
+                "preserving last good provider snapshot after transient failure"
+            );
+            previous
+        }
+        codexbar::core::LastGoodFailurePolicy::PreserveOnceThenSurface => {
+            *count = count.saturating_add(1);
+            let mut surfaced = previous;
+            surfaced.error = snapshot.error;
+            surfaced.error_state = snapshot.error_state;
+            surfaced.fetch_duration_ms = snapshot.fetch_duration_ms;
+            surfaced
+        }
+        codexbar::core::LastGoodFailurePolicy::Replace => snapshot,
     }
-}
-
-fn is_transient_claude_auth_error(error: Option<&str>) -> bool {
-    let Some(error) = error else {
-        return false;
-    };
-    let lower = error.to_ascii_lowercase();
-    lower.contains("unauthorized")
-        || lower.contains("authentication required")
-        || lower.contains("auth required")
-}
-
-fn is_hard_claude_auth_loss(error: Option<&str>) -> bool {
-    let Some(error) = error else {
-        return false;
-    };
-    let lower = error.to_ascii_lowercase();
-    // Credentials truly missing / login required — clear stale usage.
-    lower.contains("credentials not found")
-        || lower.contains("run `claude` to authenticate")
-        || (lower.contains("not installed") && lower.contains("claude"))
-        || (lower.contains("subscription") && lower.contains("unavailable"))
-}
-
-fn is_claude_cli_usage_parse_failure(error: Option<&str>) -> bool {
-    let Some(error) = error else {
-        return false;
-    };
-    let lower = error.to_ascii_lowercase();
-    lower.contains("parse error")
-        || lower.contains("empty output")
-        || lower.contains("missing current session")
-        || lower.contains("treated /usage as a normal prompt")
-        || lower.contains("local activity stats")
-        || lower.contains("could not parse")
 }
 
 fn is_claude_cli_rate_limit_failure(error: Option<&str>) -> bool {
@@ -627,13 +760,6 @@ fn is_claude_cli_rate_limit_failure(error: Option<&str>) -> bool {
     };
     let lower = error.to_ascii_lowercase();
     lower.contains("rate limit") || lower.contains("rate_limit") || lower.contains("ratelimited")
-}
-
-fn is_claude_timeout_failure(error: Option<&str>) -> bool {
-    let Some(error) = error else {
-        return false;
-    };
-    error.eq_ignore_ascii_case("timeout") || error.to_ascii_lowercase().contains("timed out")
 }
 
 /// Upper bound for treating a Claude OAuth 429 backoff as a transient
@@ -657,28 +783,49 @@ async fn fetch_provider_snapshot(
     id: ProviderId,
     ctx: FetchContext,
     token_account_id: Option<uuid::Uuid>,
-) -> ProviderUsageSnapshot {
+) -> (ProviderUsageSnapshot, Option<String>) {
     let provider = instantiate_provider(id);
     let metadata = provider.metadata().clone();
     let started = std::time::Instant::now();
 
-    let mut snapshot =
+    let (mut snapshot, account_identity) =
         match tokio::time::timeout(provider_fetch_timeout(id, &ctx), provider.fetch_usage(&ctx))
             .await
         {
             Ok(Ok(result)) => {
-                ProviderUsageSnapshot::from_fetch_result(id, &metadata, &result, token_account_id)
+                let account_identity = result.account_identity().map(ToOwned::to_owned);
+                (
+                    ProviderUsageSnapshot::from_fetch_result(
+                        id,
+                        &metadata,
+                        &result,
+                        token_account_id,
+                    ),
+                    account_identity,
+                )
             }
-            Ok(Err(e)) => ProviderUsageSnapshot::from_error(
-                id,
-                &metadata,
-                codexbar::logging::safe_error_message(e),
+            Ok(Err(e)) => (
+                ProviderUsageSnapshot::from_error(
+                    id,
+                    &metadata,
+                    codexbar::logging::safe_error_message(&e),
+                    provider.error_state_kind(&e),
+                ),
+                None,
             ),
-            Err(_) => ProviderUsageSnapshot::from_error(id, &metadata, "Timeout".to_string()),
+            Err(_) => (
+                ProviderUsageSnapshot::from_error(
+                    id,
+                    &metadata,
+                    "Timeout".to_string(),
+                    codexbar::core::ProviderStateKind::Unknown,
+                ),
+                None,
+            ),
         };
 
     record_provider_fetch_duration(id, &mut snapshot, started);
-    snapshot
+    (snapshot, account_identity)
 }
 
 fn record_provider_fetch_duration(
@@ -761,22 +908,15 @@ fn notify_usage_thresholds(
                     .and_then(ProviderAccountData::active_account)
                     .map(|account| account.id);
                 let account = quota_notification_account_identity(snapshot, token_account_id);
-                // Skip session notifications for synthetic/no-session placeholders
-                // (e.g. Claude web five_hour: null → informational 5h 0%).
-                if !snapshot.primary.is_informational {
-                    guard.notification_manager.check_and_notify(
-                        provider,
-                        &account,
-                        "session",
-                        snapshot.primary.used_percent,
-                        settings,
-                    );
-                    guard.notification_manager.check_session_transition(
-                        provider,
-                        &account,
-                        snapshot.primary.used_percent,
-                        settings,
-                    );
+                // Skip all session consumers for synthetic/no-session
+                // placeholders (e.g. Claude OAuth five_hour: null).
+                if guard.notification_manager.check_session_lane(
+                    provider,
+                    &account,
+                    snapshot.primary.used_percent,
+                    snapshot.primary.is_informational,
+                    settings,
+                ) {
                     dispatch_quota_hooks(
                         settings,
                         provider,
@@ -1094,7 +1234,12 @@ mod predictive_warning_tests {
         let metadata = codexbar::core::instantiate_provider(ProviderId::Claude)
             .metadata()
             .clone();
-        ProviderUsageSnapshot::from_error(ProviderId::Claude, &metadata, "unused".to_string())
+        ProviderUsageSnapshot::from_error(
+            ProviderId::Claude,
+            &metadata,
+            "unused".to_string(),
+            codexbar::core::ProviderStateKind::Unknown,
+        )
     }
 
     #[test]
@@ -1197,10 +1342,13 @@ mod reset_backfill_tests {
             cost: None,
             plan_name: None,
             account_email: None,
+            subscription: None,
             source_label: String::new(),
+            has_successful_claude_cli_quota: false,
             updated_at: "2026-01-01T00:00:00Z".into(),
             error: None,
             transient: false,
+            error_state: codexbar::core::ProviderStateKind::Ready,
             pace: None,
             account_organization: None,
             tray_status_label: None,
@@ -1258,9 +1406,61 @@ mod reset_backfill_tests {
     }
 
     #[test]
+    fn zai_five_hour_backfill_rejects_impossible_cached_reset() {
+        for (offset, should_backfill) in [
+            (chrono::Duration::hours(1), true),
+            (chrono::Duration::hours(10), false),
+        ] {
+            let future = (chrono::Utc::now() + offset).to_rfc3339();
+            let mut cached = codex_snapshot(win(50.0, Some(&future)));
+            cached.provider_id = "zai".into();
+            let mut fresh = codex_snapshot(win(30.0, None));
+            fresh.provider_id = "zai".into();
+            fresh.primary.reset_description = Some("5-hour".into());
+            codex_reset_backfill(&mut fresh, Some(&cached));
+            assert_eq!(fresh.primary.resets_at.is_some(), should_backfill);
+            assert!((fresh.primary.used_percent - 30.0).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
     fn f6_skips_when_no_cached_snapshot() {
         let mut fresh = codex_snapshot(win(30.0, None));
         codex_reset_backfill(&mut fresh, None);
         assert!(fresh.primary.resets_at.is_none());
+    }
+}
+
+#[cfg(test)]
+mod refresh_generation_tests {
+    use super::*;
+
+    #[test]
+    fn stale_inputs_cannot_reserve_a_new_generation_after_invalidation() {
+        let mut state = AppState::new();
+        let expected_generation = state.provider_refresh_generation;
+
+        invalidate_account_usage(&mut state, ProviderId::Codex);
+
+        assert_eq!(
+            reserve_provider_refresh(&mut state, true, &[ProviderId::Codex], expected_generation,)
+                .expect("reservation should not fail"),
+            None
+        );
+        assert!(!state.is_refreshing);
+    }
+
+    #[test]
+    fn a_matching_generation_reserves_the_next_refresh_generation() {
+        let mut state = AppState::new();
+        let expected_generation = state.provider_refresh_generation;
+
+        let generation =
+            reserve_provider_refresh(&mut state, true, &[ProviderId::Codex], expected_generation)
+                .expect("reservation should succeed")
+                .expect("refresh should be reserved");
+
+        assert_eq!(generation, expected_generation.wrapping_add(1));
+        assert!(state.is_refreshing);
     }
 }

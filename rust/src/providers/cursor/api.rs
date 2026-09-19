@@ -130,7 +130,7 @@ impl CursorApi {
             .json()
             .await
             .map_err(|e| ProviderError::Parse(e.to_string()))?;
-        Ok(status.to_window())
+        Ok(status.to_window(Utc::now()))
     }
 
     async fn fetch_user_info(&self, cookie_header: &str) -> Result<UserInfo, ProviderError> {
@@ -399,11 +399,23 @@ struct SandUsageStatus {
     next_reset_timestamp_utc: Option<String>,
     usage_percent: Option<f64>,
     has_non_zero_included_limit: Option<bool>,
+    included_limit_zero: Option<bool>,
+    sand_trial_expires_at: Option<String>,
 }
 
 impl SandUsageStatus {
-    fn to_window(&self) -> Option<NamedRateWindow> {
-        if self.has_non_zero_included_limit != Some(true) {
+    fn to_window(&self, now: DateTime<Utc>) -> Option<NamedRateWindow> {
+        let has_limit = self
+            .included_limit_zero
+            .map(|is_zero| !is_zero)
+            .or(self.has_non_zero_included_limit);
+        let has_trial = has_limit != Some(true)
+            && self
+                .sand_trial_expires_at
+                .as_deref()
+                .and_then(parse_iso_date)
+                .is_some_and(|expires_at| expires_at > now);
+        if has_limit != Some(true) && !has_trial {
             return None;
         }
         let used = clamp_percent(self.usage_percent?);
@@ -411,13 +423,23 @@ impl SandUsageStatus {
             .current_period_start
             .as_deref()
             .and_then(parse_iso_date);
-        let reset = self
-            .next_reset_timestamp_utc
-            .as_deref()
-            .and_then(parse_iso_date);
+        let reset = (!has_trial)
+            .then(|| {
+                self.next_reset_timestamp_utc
+                    .as_deref()
+                    .and_then(parse_iso_date)
+            })
+            .flatten();
         let minutes = start.zip(reset).and_then(|(start, reset)| {
             let minutes = (reset - start).num_minutes();
-            (minutes > 0).then_some(minutes as u32)
+            // Guarded by the minutes > 0 check; rate windows are far
+            // shorter than u32::MAX minutes.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "guarded by the minutes > 0 check; rate windows are far shorter than u32::MAX minutes"
+            )]
+            let minutes_u32 = minutes as u32;
+            (minutes > 0).then_some(minutes_u32)
         });
         Some(NamedRateWindow::new(
             "cursor-grok-bot",
@@ -482,8 +504,12 @@ mod tests {
             next_reset_timestamp_utc: Some("2026-08-25T00:00:00Z".into()),
             usage_percent: Some(37.5),
             has_non_zero_included_limit: Some(true),
+            included_limit_zero: None,
+            sand_trial_expires_at: None,
         };
-        let row = status.to_window().expect("grok bot window");
+        let row = status
+            .to_window("2026-08-20T00:00:00Z".parse().unwrap())
+            .expect("grok bot window");
         assert_eq!(row.id, "cursor-grok-bot");
         assert_eq!(row.title, "Grok Bot");
         assert!((row.window.used_percent - 37.5).abs() < 0.001);
@@ -497,8 +523,69 @@ mod tests {
             next_reset_timestamp_utc: None,
             usage_percent: Some(0.0),
             has_non_zero_included_limit: Some(false),
+            included_limit_zero: None,
+            sand_trial_expires_at: None,
         };
-        assert!(status.to_window().is_none());
+        assert!(
+            status
+                .to_window("2026-08-20T00:00:00Z".parse().unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sand_usage_maps_paid_allowance_from_explicit_zero_flag() {
+        let status = SandUsageStatus {
+            current_period_start: Some("2026-08-18T00:00:00Z".into()),
+            next_reset_timestamp_utc: Some("2026-08-25T00:00:00Z".into()),
+            usage_percent: Some(37.5),
+            has_non_zero_included_limit: Some(false),
+            included_limit_zero: Some(false),
+            sand_trial_expires_at: None,
+        };
+        let row = status
+            .to_window("2026-08-20T00:00:00Z".parse().unwrap())
+            .expect("paid Grok Bot window");
+        assert_eq!(row.window.window_minutes, Some(10080));
+        assert_eq!(
+            row.window.resets_at,
+            Some("2026-08-25T00:00:00Z".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn sand_usage_maps_an_active_trial_without_a_recurring_reset() {
+        let status = SandUsageStatus {
+            current_period_start: Some("2026-08-18T00:00:00Z".into()),
+            next_reset_timestamp_utc: Some("2026-08-25T00:00:00Z".into()),
+            usage_percent: Some(12.5),
+            has_non_zero_included_limit: Some(false),
+            included_limit_zero: Some(true),
+            sand_trial_expires_at: Some("2026-08-28T00:00:00Z".into()),
+        };
+        let row = status
+            .to_window("2026-08-20T00:00:00Z".parse().unwrap())
+            .expect("active trial window");
+        assert_eq!(row.window.resets_at, None);
+        assert_eq!(row.window.window_minutes, None);
+        assert!((row.window.used_percent - 12.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn sand_usage_hides_expired_trial() {
+        let status = SandUsageStatus {
+            current_period_start: None,
+            next_reset_timestamp_utc: None,
+            usage_percent: Some(12.5),
+            has_non_zero_included_limit: Some(false),
+            included_limit_zero: Some(true),
+            sand_trial_expires_at: Some("2026-08-19T00:00:00Z".into()),
+        };
+        assert!(
+            status
+                .to_window("2026-08-20T00:00:00Z".parse().unwrap())
+                .is_none()
+        );
     }
 
     #[test]

@@ -67,6 +67,12 @@ fn refreshed_cache() -> &'static Mutex<HashMap<CredentialSource, ClaudeOAuthCred
     REFRESHED_CREDENTIALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub(super) fn clear_cache() {
+    if let Ok(mut cache) = refreshed_cache().lock() {
+        cache.clear();
+    }
+}
+
 /// Look up a cached refreshed credential for `source`, returning it only if
 /// it is fresher than `file_creds` (i.e. what was just re-read from disk).
 pub(super) fn cached_refreshed_if_fresher(
@@ -105,9 +111,21 @@ pub(super) fn load_credentials() -> Result<(ClaudeOAuthCredentials, CredentialSo
         ));
     }
 
-    // Try credentials file
+    // Try credentials file. A stale default-profile file can outlive a CLI
+    // re-authentication that has already replaced the Windows credential
+    // manager item, so give a changed, fresh keyring record a chance to
+    // replace an expired file record. Fresh file credentials retain precedence.
     let file_error = match load_from_file() {
-        Ok(creds) => return Ok((creds, CredentialSource::File(credentials_path()?))),
+        Ok(file_creds) => {
+            if file_creds.is_expired()
+                && let Ok(Some(keyring)) = load_from_keyring()
+                && let Some(replacement) =
+                    replacement_from_changed_fresh_keyring(&file_creds, keyring)
+            {
+                return Ok(replacement);
+            }
+            return Ok((file_creds, CredentialSource::File(credentials_path()?)));
+        }
         Err(err) => err,
     };
 
@@ -144,6 +162,23 @@ fn load_from_environment() -> Option<ClaudeOAuthCredentials> {
         scopes,
         rate_limit_tier: None,
     })
+}
+
+/// Adopt a changed, fresh keyring credential only when the file-backed
+/// default-profile credential is expired. The keyring item is unscoped, so
+/// this loader deliberately has no custom-profile recovery path.
+fn replacement_from_changed_fresh_keyring(
+    file_creds: &ClaudeOAuthCredentials,
+    (keyring_creds, source): (ClaudeOAuthCredentials, CredentialSource),
+) -> Option<(ClaudeOAuthCredentials, CredentialSource)> {
+    if !file_creds.is_expired()
+        || keyring_creds.is_expired()
+        || keyring_creds.access_token == file_creds.access_token
+    {
+        return None;
+    }
+
+    Some((keyring_creds, source))
 }
 
 /// Load credentials from ~/.claude/.credentials.json
@@ -286,6 +321,11 @@ fn credentials_from_oauth_data(oauth: OAuthData) -> Result<ClaudeOAuthCredential
 
     // Convert milliseconds to DateTime
     let expires_at = oauth.expires_at.map(|millis| {
+        // OAuth expiry is stored in whole seconds; sub-second precision is dropped.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "expiry is tracked at whole-second granularity"
+        )]
         let secs = (millis / 1000.0) as i64;
         DateTime::from_timestamp(secs, 0).unwrap_or_else(Utc::now)
     });
@@ -461,7 +501,7 @@ mod tests {
     use super::{
         CredentialSource, apply_refresh_to_credentials_json, cached_refreshed_if_fresher,
         credentials_path_in, load_credentials_in, parse_credentials_json,
-        persist_refreshed_credentials_in, store_refreshed,
+        persist_refreshed_credentials_in, replacement_from_changed_fresh_keyring, store_refreshed,
     };
     use crate::providers::claude::oauth::ClaudeOAuthCredentials;
 
@@ -520,6 +560,51 @@ mod tests {
             error
                 .to_string()
                 .contains("Claude OAuth access token missing")
+        );
+    }
+
+    #[test]
+    fn changed_fresh_keyring_replaces_expired_file_credentials() {
+        let expired_file = ClaudeOAuthCredentials {
+            access_token: "expired-file-token".to_string(),
+            refresh_token: Some("expired-file-refresh".to_string()),
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            scopes: vec!["user:profile".to_string()],
+            rate_limit_tier: None,
+        };
+        let keyring_source = CredentialSource::Keyring("test-user".to_string());
+        let fresh_keyring = ClaudeOAuthCredentials {
+            access_token: "fresh-keyring-token".to_string(),
+            refresh_token: Some("fresh-keyring-refresh".to_string()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            scopes: vec!["user:profile".to_string()],
+            rate_limit_tier: None,
+        };
+
+        let adopted = replacement_from_changed_fresh_keyring(
+            &expired_file,
+            (fresh_keyring, keyring_source.clone()),
+        )
+        .expect("changed fresh keyring credentials should replace an expired file");
+        assert_eq!(adopted.0.access_token, "fresh-keyring-token");
+        assert_eq!(adopted.1, keyring_source);
+
+        let expired_keyring = ClaudeOAuthCredentials {
+            access_token: "another-keyring-token".to_string(),
+            refresh_token: None,
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+            scopes: vec!["user:profile".to_string()],
+            rate_limit_tier: None,
+        };
+        assert!(
+            replacement_from_changed_fresh_keyring(
+                &expired_file,
+                (
+                    expired_keyring,
+                    CredentialSource::Keyring("test-user".to_string())
+                )
+            )
+            .is_none()
         );
     }
 

@@ -17,7 +17,7 @@ pub(crate) struct TrayMenuEntry {
 }
 
 impl TrayMenuEntry {
-    fn item(id: impl Into<String>, label: impl Into<String>) -> Self {
+    pub(crate) fn item(id: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
             id: Some(id.into()),
             label: label.into(),
@@ -29,7 +29,11 @@ impl TrayMenuEntry {
     }
 
     /// A checkbox menu item. `checked` mirrors the provider's enabled state.
-    fn check_item(id: impl Into<String>, label: impl Into<String>, checked: bool) -> Self {
+    pub(crate) fn check_item(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        checked: bool,
+    ) -> Self {
         Self {
             id: Some(id.into()),
             label: label.into(),
@@ -40,7 +44,11 @@ impl TrayMenuEntry {
         }
     }
 
-    fn submenu(id: impl Into<String>, label: impl Into<String>, children: Vec<Self>) -> Self {
+    pub(crate) fn submenu(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        children: Vec<Self>,
+    ) -> Self {
         Self {
             id: Some(id.into()),
             label: label.into(),
@@ -51,7 +59,7 @@ impl TrayMenuEntry {
         }
     }
 
-    fn separator() -> Self {
+    pub(crate) fn separator() -> Self {
         Self {
             id: None,
             label: String::new(),

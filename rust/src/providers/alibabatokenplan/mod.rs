@@ -7,6 +7,7 @@
 //! Team path: `GetSubscriptionSummary` / BssOpenAPI-V3 (+ optional sec_token).
 //! Personal/Solo path: OneConsole personal token-plan APIs (+ best-effort sec_token).
 
+mod cli;
 mod personal;
 mod region;
 
@@ -79,6 +80,11 @@ impl AlibabaTokenPlanProvider {
 
     fn resolve_region(ctx: &FetchContext) -> Region {
         Region::from_settings_value(ctx.api_region.as_deref())
+    }
+
+    async fn fetch_via_cli(&self, ctx: &FetchContext) -> Result<UsageSnapshot, ProviderError> {
+        let snapshot = cli::fetch_cli_usage(Self::resolve_region(ctx)).await?;
+        Self::snapshot_to_usage(snapshot)
     }
 
     async fn fetch_via_web(&self, ctx: &FetchContext) -> Result<UsageSnapshot, ProviderError> {
@@ -319,18 +325,29 @@ impl AlibabaTokenPlanProvider {
                 ),
             )
         });
-        let primary = five_hour.or(legacy).ok_or_else(|| {
-            ProviderError::Parse("Alibaba Token Plan quota totals missing".into())
-        })?;
-        let mut usage = UsageSnapshot::new(primary);
-
-        if let Some(weekly_percent) = snapshot.weekly_used_percent {
-            usage = usage.with_secondary(RateWindow::with_details(
-                weekly_percent,
+        let weekly = snapshot.weekly_used_percent.map(|percent| {
+            RateWindow::with_details(
+                percent,
                 Some(WEEKLY_MINUTES),
                 snapshot.weekly_resets_at,
-                quota_detail_percent(weekly_percent, snapshot.weekly_total_quota),
-            ));
+                quota_detail_percent(percent, snapshot.weekly_total_quota),
+            )
+        });
+        // Prefer the 5-hour window, then the Team/legacy credit envelope. Personal/Solo
+        // payloads sometimes expose only `per1WeekPercentage`; promote that window to
+        // primary instead of failing the whole fetch.
+        let (primary, secondary) = match (five_hour.or(legacy), weekly) {
+            (Some(primary), secondary) => (primary, secondary),
+            (None, Some(weekly)) => (weekly, None),
+            (None, None) => {
+                return Err(ProviderError::Parse(
+                    "Alibaba Token Plan quota totals missing".into(),
+                ));
+            }
+        };
+        let mut usage = UsageSnapshot::new(primary);
+        if let Some(secondary) = secondary {
+            usage = usage.with_secondary(secondary);
         }
 
         if let Some(plan) = snapshot.plan_name.filter(|plan| !plan.trim().is_empty()) {
@@ -358,21 +375,50 @@ impl Provider for AlibabaTokenPlanProvider {
 
     async fn fetch_usage(&self, ctx: &FetchContext) -> Result<ProviderFetchResult, ProviderError> {
         match ctx.source_mode {
-            SourceMode::Auto | SourceMode::Web => {
+            SourceMode::Auto if ctx.auto_prefer_web => match self.fetch_via_web(ctx).await {
+                Ok(usage) => Ok(ProviderFetchResult::new(usage, "web")),
+                Err(_) => {
+                    let usage = self.fetch_via_cli(ctx).await?;
+                    Ok(ProviderFetchResult::new(usage, "cli"))
+                }
+            },
+            SourceMode::Auto => match self.fetch_via_cli(ctx).await {
+                Ok(usage) => Ok(ProviderFetchResult::new(usage, "cli")),
+                Err(_) => {
+                    let usage = self.fetch_via_web(ctx).await?;
+                    Ok(ProviderFetchResult::new(usage, "web"))
+                }
+            },
+            SourceMode::Cli => {
+                let usage = self.fetch_via_cli(ctx).await?;
+                Ok(ProviderFetchResult::new(usage, "cli"))
+            }
+            SourceMode::Web => {
                 let usage = self.fetch_via_web(ctx).await?;
                 Ok(ProviderFetchResult::new(usage, "web"))
             }
-            SourceMode::Cli | SourceMode::OAuth => {
-                Err(ProviderError::UnsupportedSource(ctx.source_mode))
-            }
+            SourceMode::OAuth => Err(ProviderError::UnsupportedSource(ctx.source_mode)),
         }
     }
 
     fn available_sources(&self) -> Vec<SourceMode> {
-        vec![SourceMode::Auto, SourceMode::Web]
+        vec![SourceMode::Auto, SourceMode::Cli, SourceMode::Web]
+    }
+
+    fn error_state_kind(&self, error: &ProviderError) -> crate::core::ProviderStateKind {
+        match error {
+            ProviderError::NotInstalled(message) if message.contains("Bailian CLI 'bl'") => {
+                crate::core::ProviderStateKind::LocalRuntimeOffline
+            }
+            _ => error.state_kind(),
+        }
     }
 
     fn supports_web(&self) -> bool {
+        true
+    }
+
+    fn supports_cli(&self) -> bool {
         true
     }
 }
@@ -808,9 +854,14 @@ fn parse_f64(value: Option<&Value>) -> Option<f64> {
 
 fn parse_i64(value: Option<&Value>) -> Option<i64> {
     match value? {
-        Value::Number(number) => number
-            .as_i64()
-            .or_else(|| number.as_f64().map(|v| v as i64)),
+        Value::Number(number) => number.as_i64().or_else(|| {
+            // Quota/timestamp JSON floats are whole numbers; the fractional
+            // part is rounding noise from the upstream API.
+            let v = number.as_f64()?;
+            #[expect(clippy::cast_possible_truncation, reason = "quota/timestamp JSON floats are whole numbers; fractional part is rounding noise")]
+            let whole = v as i64;
+            Some(whole)
+        }),
         Value::String(text) => text.trim().replace(',', "").parse().ok(),
         _ => None,
     }
@@ -919,7 +970,14 @@ fn quota_detail_percent(used_percent: f64, total: Option<f64>) -> Option<String>
 
 fn format_quota(value: f64) -> String {
     if (value.round() - value).abs() < f64::EPSILON {
-        format_count(value.round() as i64)
+        // Guarded above: value is within EPSILON of a whole number, so the
+        // fractional part is zero.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "whole-number guard above; fractional part is zero"
+        )]
+        let whole = value.round() as i64;
+        format_count(whole)
     } else {
         let formatted = format!("{value:.2}");
         let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
@@ -964,6 +1022,17 @@ fn payload_diagnostics(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn missing_bailian_cli_is_local_runtime_offline() {
+        let provider = AlibabaTokenPlanProvider::new();
+        let error = ProviderError::NotInstalled(
+            "Bailian CLI 'bl' is not installed or not on PATH.".to_string(),
+        );
+        assert_eq!(
+            provider.error_state_kind(&error),
+            crate::core::ProviderStateKind::LocalRuntimeOffline
+        );
+    }
     #[test]
     fn parses_token_plan_instance_payload() {
         let payload = serde_json::json!({

@@ -25,8 +25,10 @@ import {
  */
 export default function ClaudeAccountsMenu({
   hideEmail,
+  onLayoutChange,
 }: {
   hideEmail: boolean;
+  onLayoutChange?: () => void;
 }) {
   const { t } = useLocale();
   const [accounts, setAccounts] = useState<ClaudeAccount[]>([]);
@@ -55,6 +57,10 @@ export default function ClaudeAccountsMenu({
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    onLayoutChange?.();
+  }, [accounts.length, error, onLayoutChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -87,7 +93,7 @@ export default function ClaudeAccountsMenu({
   }
 
   return (
-    <details className="claude-menu-accounts">
+    <details className="claude-menu-accounts" onToggle={onLayoutChange}>
       <summary className="claude-menu-accounts__summary">
         <span className="claude-menu-accounts__title">
           {t("ClaudeAccountsTitle")}

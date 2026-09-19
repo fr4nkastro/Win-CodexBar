@@ -4,7 +4,7 @@
 
 use super::AgentProcessRecord;
 use super::command_line_value;
-use super::parser::{PiFamilySessionRecord, parse_session_file};
+use super::parser::PiFamilySessionRecord;
 use super::{MAX_PROFILE_ROOTS, MAX_SETTINGS_BYTES, PiSessionDialect};
 
 use chrono::{DateTime, Utc};
@@ -36,16 +36,174 @@ impl DirectoryScanBudget {
         Instant::now() < self.deadline
     }
 
+    /// Apply enrichment only while the shared metadata deadline remains live.
+    ///
+    /// Directory enumeration is charged separately by [`Self::files`] and
+    /// [`Self::child_directories`]. Callers use this second gate before work
+    /// such as canonicalization, path checks, or file metadata reads so an
+    /// already-enumerated queue cannot continue expensive work after expiry.
+    pub fn compact_map_while_time_remaining<I, Result, Transform>(
+        &self,
+        values: I,
+        transform: Transform,
+    ) -> Vec<Result>
+    where
+        I: IntoIterator,
+        Transform: FnMut(I::Item) -> Option<Result>,
+    {
+        let mut clock = Instant::now;
+        self.compact_map_while_time_remaining_with_clock(values, &mut clock, transform)
+    }
+
+    pub(crate) fn compact_map_while_time_remaining_with_clock<I, Result, Transform, Clock>(
+        &self,
+        values: I,
+        clock: &mut Clock,
+        mut transform: Transform,
+    ) -> Vec<Result>
+    where
+        I: IntoIterator,
+        Transform: FnMut(I::Item) -> Option<Result>,
+        Clock: FnMut() -> Instant,
+    {
+        let mut results = Vec::new();
+        for value in values {
+            // Enumeration already charged the entry count; enrichment shares
+            // its deadline and must not start after it expires.
+            if !self.has_time_remaining_at(clock()) {
+                break;
+            }
+            if let Some(result) = transform(value) {
+                results.push(result);
+            }
+        }
+        results
+    }
+
+    /// Return non-directory entries from one directory, bounded by this
+    /// budget. The entry type check is intentionally performed only after the
+    /// post-enumeration deadline gate.
+    pub fn files(&mut self, directory: &Path) -> Vec<std::fs::DirEntry> {
+        let mut clock = Instant::now;
+        self.files_with_clock(directory, &mut clock)
+    }
+
+    pub(crate) fn files_with_clock<Clock>(
+        &mut self,
+        directory: &Path,
+        clock: &mut Clock,
+    ) -> Vec<std::fs::DirEntry>
+    where
+        Clock: FnMut() -> Instant,
+    {
+        let entries = self.entries_with_clock(directory, clock);
+        self.compact_map_while_time_remaining_with_clock(entries, clock, |entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| !file_type.is_dir())?;
+            Some(entry)
+        })
+    }
+
+    /// Return child directories from one directory, bounded by this budget.
+    pub fn child_directories(&mut self, directory: &Path) -> Vec<std::fs::DirEntry> {
+        let mut clock = Instant::now;
+        self.child_directories_with_clock(directory, &mut clock)
+    }
+
+    pub(crate) fn child_directories_with_clock<Clock>(
+        &mut self,
+        directory: &Path,
+        clock: &mut Clock,
+    ) -> Vec<std::fs::DirEntry>
+    where
+        Clock: FnMut() -> Instant,
+    {
+        let entries = self.entries_with_clock(directory, clock);
+        self.compact_map_while_time_remaining_with_clock(entries, clock, |entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())?;
+            Some(entry)
+        })
+    }
+
+    fn entries_with_clock<Clock>(
+        &mut self,
+        directory: &Path,
+        clock: &mut Clock,
+    ) -> Vec<std::fs::DirEntry>
+    where
+        Clock: FnMut() -> Instant,
+    {
+        if self.max_entry_count == 0 || !self.has_time_remaining_at(clock()) {
+            return Vec::new();
+        }
+        let Ok(mut entries) = std::fs::read_dir(directory) else {
+            return Vec::new();
+        };
+
+        let mut retained = Vec::new();
+        while self.entries_seen < self.max_entry_count && self.has_time_remaining_at(clock()) {
+            let Some(entry) = entries.next() else { break };
+            let Ok(entry) = entry else { continue };
+            self.entries_seen += 1;
+
+            // Do not begin file-type/resource enrichment for an entry fetched
+            // after the deadline. The entry count remains charged.
+            if !self.has_time_remaining_at(clock()) {
+                break;
+            }
+            retained.push(entry);
+        }
+        retained
+    }
+
     pub fn visit_entry(&mut self) -> bool {
-        if !self.has_time_remaining() {
+        if !self.has_time_remaining() || self.entries_seen >= self.max_entry_count {
             return false;
         }
         self.entries_seen += 1;
-        self.entries_seen <= self.max_entry_count
+        true
+    }
+
+    /// Resolve a path only while the shared scan deadline is live.
+    ///
+    /// The operation is gated before it starts. If it finishes after expiry,
+    /// retain the result and let the next gate prevent further work.
+    pub fn canonicalize_if_time_remaining(&self, path: &Path) -> Option<PathBuf> {
+        if !self.has_time_remaining() {
+            return None;
+        }
+        Some(canonicalize_for_scan(path))
+    }
+
+    pub(crate) fn max_depth(&self) -> usize {
+        self.max_depth
     }
 
     fn allowed_depth(&self, depth: usize) -> bool {
         depth <= self.max_depth
+    }
+
+    fn has_time_remaining_at(&self, now: Instant) -> bool {
+        now < self.deadline
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_deadline_for_test(
+        max_entry_count: usize,
+        max_depth: usize,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            max_entry_count,
+            max_depth,
+            entries_seen: 0,
+            deadline,
+        }
     }
 }
 
@@ -538,19 +696,18 @@ pub fn records_in_root(
     if !budget.has_time_remaining() {
         return Vec::new();
     }
-    let canonical_root = canonicalize_for_scan(root);
+    let Some(canonical_root) = budget.canonicalize_if_time_remaining(root) else {
+        return Vec::new();
+    };
     let project_directories: Vec<PathBuf> = match layout {
         RootLayout::Direct => vec![canonical_root.clone()],
         RootLayout::ProjectDirectories => {
-            let Ok(entries) = std::fs::read_dir(&canonical_root) else {
-                return Vec::new();
-            };
-            let mut dirs: Vec<PathBuf> = entries
-                .flatten()
-                .filter(|_entry| budget.visit_entry())
-                .map(|entry| canonicalize_for_scan(&entry.path()))
-                .filter(|path| path.is_dir() && path_is_within(&canonical_root, path))
-                .collect();
+            let entries = budget.child_directories(&canonical_root);
+            let mut dirs: Vec<PathBuf> =
+                budget.compact_map_while_time_remaining(entries, |entry| {
+                    let path = budget.canonicalize_if_time_remaining(&entry.path())?;
+                    (path.is_dir() && path_is_within(&canonical_root, &path)).then_some(path)
+                });
             dirs.sort();
             dirs
         }
@@ -566,21 +723,20 @@ pub fn records_in_root(
         if !budget.has_time_remaining() {
             break;
         }
-        let Ok(entries) = std::fs::read_dir(&project_dir) else {
-            continue;
-        };
-        let mut files: Vec<PathBuf> = entries
-            .flatten()
-            .filter(|_entry| budget.visit_entry())
-            .map(|entry| canonicalize_for_scan(&entry.path()))
-            .filter(|path| {
-                path.extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-                    && path_is_within(&canonical_root, path)
-                    && path.parent() == Some(project_dir.as_path())
-            })
-            .collect();
+        let entries = budget.files(&project_dir);
+        let mut files: Vec<PathBuf> = budget.compact_map_while_time_remaining(entries, |entry| {
+            let path = entry.path();
+            if !path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            {
+                return None;
+            }
+            let path = budget.canonicalize_if_time_remaining(&path)?;
+            (path_is_within(&canonical_root, &path) && path.parent() == Some(project_dir.as_path()))
+                .then_some(path)
+        });
         files.sort();
         for path in files {
             if !budget.has_time_remaining() {
@@ -595,7 +751,11 @@ pub fn records_in_root(
             let Some(modified_at) = metadata.modified().ok().map(DateTime::<Utc>::from) else {
                 continue;
             };
-            if let Some(record) = parse_session_file(&path, dialect, modified_at, now)
+            if !budget.has_time_remaining() {
+                break;
+            }
+            if let Some(record) =
+                super::parser::parse_session_file(&path, dialect, modified_at, now)
                 && visible.insert(record.id.clone())
             {
                 records.push(record);
@@ -610,7 +770,7 @@ pub fn records_in_root(
             .then(lhs.path.cmp(&rhs.path))
     });
     let mut seen_paths = HashSet::new();
-    records.retain(|record| seen_paths.insert(canonicalize_for_scan(&record.path)));
+    records.retain(|record| seen_paths.insert(record.path.clone()));
     records
 }
 

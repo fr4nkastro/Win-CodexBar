@@ -173,15 +173,21 @@ describe("useTrayPanelLayout sizing", () => {
     });
     await waitFor(() => expect(feedbackObserverCallbacks).toBeGreaterThan(0));
 
+    // `layoutReady` can precede one already-queued reveal under a loaded CI runner.
+    // Give that initial work time to drain, but fail if it turns into repeated
+    // feedback-driven passes. Once drained, the count must remain stable.
+    const revealsBeforeSettle =
+      tauriMocks.revealTrayPanelWindow.mock.calls.length;
     await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 300));
+      await new Promise((resolve) => window.setTimeout(resolve, 1_000));
     });
     const settledRevealCount =
       tauriMocks.revealTrayPanelWindow.mock.calls.length;
+    expect(settledRevealCount - revealsBeforeSettle).toBeLessThanOrEqual(1);
+
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 500));
     });
-
     expect(tauriMocks.revealTrayPanelWindow.mock.calls.length).toBe(
       settledRevealCount,
     );

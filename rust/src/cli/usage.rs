@@ -10,6 +10,8 @@ use crate::core::{
 use crate::settings::ApiKeys;
 use crate::status::{ProviderStatus as StatusInfo, StatusLevel, fetch_provider_status};
 
+mod claude_swap;
+
 pub const PROVIDER_ARG_HELP: &str = "Provider to query (for example: codex, claude, gemini, antigravity/agy, nanogpt, deepseek, codebuff, windsurf, all, both)";
 
 /// Arguments for the usage command
@@ -163,7 +165,7 @@ struct ErrorPayload {
 pub async fn run(args: UsageArgs) -> anyhow::Result<()> {
     let command = UsageCommand::from_args(args)?;
     command.log();
-    let output = collect_usage_output(&command).await;
+    let output = claude_swap::collect_usage_output(&command).await;
     print_usage_output(output)
 }
 
@@ -176,6 +178,8 @@ struct UsageCommand {
     pretty: bool,
     /// Optional token-account label/index for a single-provider fetch.
     account: Option<String>,
+    /// Read every external claude-swap account for Claude (read-only).
+    all_accounts: bool,
     ctx: FetchContext,
 }
 
@@ -187,6 +191,9 @@ impl UsageCommand {
         if args.account.is_some() && providers.len() != 1 {
             anyhow::bail!("--account requires a single --provider (not all/both)");
         }
+        if args.all_accounts && args.account.is_some() {
+            anyhow::bail!("--all-accounts cannot be combined with --account");
+        }
 
         Ok(Self {
             format,
@@ -196,6 +203,7 @@ impl UsageCommand {
             fetch_status: args.status,
             pretty: args.pretty,
             account: args.account.clone(),
+            all_accounts: args.all_accounts,
             ctx: build_usage_fetch_context(&args, source_mode),
         })
     }
@@ -244,35 +252,6 @@ enum UsageOutput {
         pretty: bool,
     },
     Toon(Vec<serde_json::Value>),
-}
-
-async fn collect_usage_output(command: &UsageCommand) -> UsageOutput {
-    match command.format {
-        UsageOutputFormat::Text => {
-            let mut sections = Vec::new();
-            for provider_id in &command.providers {
-                sections.push(fetch_provider_text_output(*provider_id, command).await);
-            }
-            UsageOutput::Text(sections)
-        }
-        UsageOutputFormat::Json => {
-            let mut results = Vec::new();
-            for provider_id in &command.providers {
-                results.push(fetch_provider_json_output(*provider_id, command).await);
-            }
-            UsageOutput::Json {
-                results,
-                pretty: command.pretty,
-            }
-        }
-        UsageOutputFormat::Toon => {
-            let mut results = Vec::new();
-            for provider_id in &command.providers {
-                results.push(fetch_provider_json_output(*provider_id, command).await);
-            }
-            UsageOutput::Toon(results)
-        }
-    }
 }
 
 async fn fetch_provider_text_output(provider_id: ProviderId, command: &UsageCommand) -> String {
@@ -554,11 +533,18 @@ fn append_usage_window_lines(
     metadata: &crate::core::ProviderMetadata,
     use_color: bool,
 ) {
-    append_window_line(lines, metadata.session_label, &usage.primary, use_color);
-    // Upstream 0.50.1 #2957: pace for the 5-hour session window.
-    if usage.primary.window_minutes == Some(crate::core::SESSION_WINDOW_MINUTES)
-        && let Some(pace) =
-            UsagePace::weekly(&usage.primary, None, crate::core::SESSION_WINDOW_MINUTES)
+    let primary_label = usage
+        .primary_label
+        .as_deref()
+        .unwrap_or(metadata.session_label);
+    append_window_line(lines, primary_label, &usage.primary, use_color);
+    // Pace for primary windows whose provider published a common cadence.
+    let pace_minutes = usage.primary.window_minutes.filter(|minutes| {
+        *minutes == crate::core::SESSION_WINDOW_MINUTES
+            || *minutes >= crate::core::WEEKLY_WINDOW_MINUTES
+    });
+    if let Some(minutes) = pace_minutes
+        && let Some(pace) = UsagePace::weekly(&usage.primary, None, minutes)
     {
         lines.push(format!(
             "  Pace:    {} {}",
@@ -569,7 +555,10 @@ fn append_usage_window_lines(
     append_secondary_window_line(
         lines,
         usage.secondary.as_ref(),
-        metadata.weekly_label,
+        usage
+            .secondary_label
+            .as_deref()
+            .unwrap_or(metadata.weekly_label),
         use_color,
     );
     append_model_specific_line(lines, usage.model_specific.as_ref(), use_color);
@@ -582,6 +571,11 @@ fn append_usage_window_lines(
             _ => "Tertiary",
         };
         append_window_line(lines, label, tertiary, use_color);
+    }
+    for extra in &usage.extra_rate_windows {
+        if extra.usage_known {
+            append_window_line(lines, &extra.title, &extra.window, use_color);
+        }
     }
 }
 
@@ -643,14 +637,18 @@ fn append_model_specific_line(
 pub fn render_brief_text(provider: ProviderId, result: &ProviderFetchResult) -> String {
     let metadata = instantiate_provider(provider).metadata().clone();
     let usage = &result.usage;
+    let primary_label = usage
+        .primary_label
+        .as_deref()
+        .unwrap_or(metadata.session_label);
     let mut parts = Vec::new();
     let reset = if usage.primary.is_informational {
-        parts.push(format!("{} unavailable", metadata.session_label));
+        parts.push(format!("{primary_label} unavailable"));
         usage.secondary.as_ref().unwrap_or(&usage.primary)
     } else {
         parts.push(format!(
             "{} {}",
-            metadata.session_label,
+            primary_label,
             format_percent(usage.primary.used_percent)
         ));
         &usage.primary
@@ -660,7 +658,10 @@ pub fn render_brief_text(provider: ProviderId, result: &ProviderFetchResult) -> 
     if let Some(secondary) = &usage.secondary {
         parts.push(format!(
             "{} {}",
-            metadata.weekly_label,
+            usage
+                .secondary_label
+                .as_deref()
+                .unwrap_or(metadata.weekly_label),
             format_percent(secondary.used_percent)
         ));
     }
@@ -714,6 +715,11 @@ fn render_progress_bar(percent: f64, width: usize, use_color: bool) -> String {
     } else {
         0.0
     };
+    // percent is clamped to 0..=100, so the rounded product cannot exceed width.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "percent clamped to 0..=100, so the product cannot exceed width"
+    )]
     let filled = ((percent / 100.0) * width as f64).round() as usize;
     let empty = width.saturating_sub(filled);
 
@@ -737,9 +743,144 @@ fn render_progress_bar(percent: f64, width: usize, use_color: bool) -> String {
 mod tests {
     use super::*;
     use crate::core::{ProviderAccountData, TokenAccount, TokenAccountSupport};
+    use crate::providers::claude::claude_swap::ClaudeSwapAccount;
 
     fn fetch_result(usage: UsageSnapshot) -> ProviderFetchResult {
         ProviderFetchResult::new(usage, "test")
+    }
+
+    fn sample_swap_account() -> ClaudeSwapAccount {
+        use crate::providers::claude::claude_swap::{
+            ClaudeSwapScopedWindowDto, ClaudeSwapUsageWindowDto,
+        };
+        ClaudeSwapAccount {
+            id: "claude-swap:2".to_string(),
+            slot: 2,
+            label: "work@example.com".to_string(),
+            email: Some("work@example.com".to_string()),
+            organization: None,
+            alias: None,
+            is_active: false,
+            status: "ok".to_string(),
+            error: None,
+            five_hour: Some(ClaudeSwapUsageWindowDto {
+                used_percent: 81.0,
+                resets_at: None,
+            }),
+            seven_day: Some(ClaudeSwapUsageWindowDto {
+                used_percent: 18.0,
+                resets_at: None,
+            }),
+            scoped: vec![ClaudeSwapScopedWindowDto {
+                name: "Fable only".to_string(),
+                used_percent: 4.0,
+                resets_at: None,
+            }],
+            action: Some(crate::providers::claude::claude_swap::ClaudeSwapAccountAction::Switch),
+            is_disabled: false,
+            spend: None,
+            historical_usage: None,
+        }
+    }
+
+    #[test]
+    fn claude_swap_json_payload_is_allow_listed() {
+        let payload = super::claude_swap::claude_swap_json_payload(&sample_swap_account(), None);
+        assert_eq!(payload["provider"], "claude");
+        assert_eq!(payload["source"], "claude-swap");
+        assert_eq!(payload["account"]["id"], "claude-swap:2");
+        assert_eq!(payload["account"]["fiveHour"]["usedPercent"], 81.0);
+        assert_eq!(payload["account"]["scoped"][0]["name"], "Fable only");
+    }
+
+    #[test]
+    fn claude_swap_json_payload_keeps_provider_status_distinct() {
+        let status = StatusInfo {
+            level: StatusLevel::Degraded,
+            description: "Degraded Performance".to_string(),
+            ..Default::default()
+        };
+        let payload =
+            super::claude_swap::claude_swap_json_payload(&sample_swap_account(), Some(&status));
+        assert_eq!(payload["account"]["status"], "ok");
+        assert_eq!(payload["status"]["level"], "degraded");
+        assert_eq!(payload["status"]["description"], "Degraded Performance");
+    }
+
+    #[test]
+    fn claude_swap_brief_renderer_keeps_one_line_per_provider() {
+        let mut first = sample_swap_account();
+        first.is_active = true;
+        let mut second = sample_swap_account();
+        second.id = "claude-swap:3".to_string();
+        second.slot = 3;
+        second.label = "personal@example.com".to_string();
+        let status = StatusInfo {
+            level: StatusLevel::Operational,
+            description: "All Systems Operational".to_string(),
+            ..Default::default()
+        };
+
+        let text =
+            super::claude_swap::render_claude_swap_brief(&[first, second], Some(&status), false);
+        assert!(!text.contains('\n'));
+        assert!(text.contains("work@example.com (active)"));
+        assert!(text.contains("personal@example.com"));
+        assert!(text.contains("Status All Systems Operational"));
+    }
+
+    #[test]
+    fn claude_swap_text_renderer_shows_windows_and_status() {
+        let text = super::claude_swap::render_claude_swap_text(&sample_swap_account(), None, false);
+        assert!(text.contains("claude-swap"));
+        assert!(text.contains("work@example.com"));
+        assert!(text.contains("Session 81%"));
+        assert!(text.contains("Weekly 18%"));
+        assert!(text.contains("Fable only 4%"));
+    }
+
+    #[test]
+    fn claude_swap_detailed_text_shows_history_but_brief_does_not() {
+        use crate::providers::claude::claude_swap::{
+            ClaudeSwapHistoricalUsageDto, ClaudeSwapSpendWindowDto, ClaudeSwapUsageWindowDto,
+        };
+        let mut account = sample_swap_account();
+        account.spend = Some(ClaudeSwapSpendWindowDto {
+            used: 2.0,
+            limit: 20.0,
+            used_percent: 10.0,
+            currency_code: Some("USD".to_string()),
+            resets_at: None,
+        });
+        account.historical_usage = Some(ClaudeSwapHistoricalUsageDto {
+            five_hour: Some(ClaudeSwapUsageWindowDto {
+                used_percent: 44.0,
+                resets_at: None,
+            }),
+            seven_day: None,
+            scoped: vec![],
+            spend: None,
+            fetched_at: "2026-09-12T00:45:00Z".parse().unwrap(),
+            provenance: "source_reported_last_good",
+        });
+        let detailed = super::claude_swap::render_claude_swap_text(&account, None, false);
+        assert!(detailed.contains("Spend 2.00/20.00 USD (10%)"));
+        assert!(detailed.contains("Last known usage (captured 2026-09-12T00:45:00+00:00)"));
+        assert!(detailed.contains("Session 44%"));
+
+        let brief = super::claude_swap::render_claude_swap_brief(&[account], None, false);
+        assert!(!brief.contains("Last known usage"));
+        assert!(!brief.contains("44%"));
+    }
+
+    #[test]
+    fn all_accounts_conflicts_with_explicit_account() {
+        let args = UsageArgs {
+            all_accounts: true,
+            account: Some("work".to_string()),
+            ..Default::default()
+        };
+        assert!(UsageCommand::from_args(args).is_err());
     }
 
     #[test]
@@ -792,6 +933,31 @@ mod tests {
             output,
             "Claude: Session (5h) <1%, Weekly 100%, resets n/a, Pro"
         );
+    }
+
+    #[test]
+    fn secondary_label_override_is_shared_by_full_and_brief_renderers() {
+        let result = fetch_result(
+            UsageSnapshot::new(RateWindow::new(10.0))
+                .with_secondary(RateWindow::new(20.0))
+                .with_secondary_label("Weekly"),
+        );
+        let full = render_text_with_status(ProviderId::Antigravity, &result, None, false);
+        let brief = render_brief_text(ProviderId::Antigravity, &result);
+        assert!(full.contains("Weekly:"));
+        assert!(brief.contains("Weekly 20%"));
+    }
+    #[test]
+    fn primary_label_override_is_shared_by_full_and_brief_renderers() {
+        let result =
+            fetch_result(UsageSnapshot::new(RateWindow::new(42.0)).with_primary_label("Monthly"));
+
+        let full = render_text_with_status(ProviderId::Grok, &result, None, false);
+        let brief = render_brief_text(ProviderId::Grok, &result);
+
+        assert!(full.contains("Monthly:"));
+        assert!(brief.contains("Grok: Monthly 42%"));
+        assert!(!brief.contains("Credits 42%"));
     }
 
     #[test]

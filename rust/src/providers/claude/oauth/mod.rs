@@ -21,6 +21,13 @@ mod refresh;
 /// reachable from outside `oauth` (design decision D1).
 pub(crate) use credentials_store::{load_credentials_in, persist_refreshed_credentials_in};
 
+pub(super) fn clear_account_cache(credential_path: &std::path::Path) {
+    credentials_store::clear_cache();
+    clear_refresh_backoff(&credentials_store::CredentialSource::File(
+        credential_path.to_path_buf(),
+    ));
+}
+
 /// OAuth credentials from Claude CLI
 #[derive(Debug, Clone)]
 pub struct ClaudeOAuthCredentials {
@@ -47,6 +54,43 @@ impl ClaudeOAuthCredentials {
     pub fn has_scope(&self, scope: &str) -> bool {
         self.scopes.iter().any(|s| s == scope)
     }
+}
+
+/// Return a non-secret identity for the credential that would authorize a
+/// Claude CLI session. JWT subjects survive token rotation; opaque tokens use
+/// a one-way fingerprint and therefore fail closed if the credential changes.
+pub(super) fn credential_identity(credentials: &ClaudeOAuthCredentials) -> Option<String> {
+    let token = credentials.access_token.trim();
+    if token.is_empty() {
+        return None;
+    }
+
+    if let Some(subject) = crate::codex_accounts::api::jwt_payload(token).and_then(|payload| {
+        ["sub", "account_id", "user_id"]
+            .into_iter()
+            .find_map(|key| {
+                payload
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+    }) {
+        return Some(format!("claude-account:{subject}"));
+    }
+
+    Some(format!(
+        "claude-credential:{}",
+        crate::core::sha256_hex(token.as_bytes())
+    ))
+}
+
+/// Load the identity used to authorize Claude Code. Reading Claude Code's
+/// credential stores remains subject to the user's explicit consent setting.
+pub(super) fn auto_resume_identity() -> Option<String> {
+    let (credentials, _) = credentials_store::load_credentials().ok()?;
+    credential_identity(&credentials)
 }
 
 /// OAuth usage response from Claude API
@@ -239,6 +283,7 @@ impl ClaudeOAuthFetcher {
     /// OAuth token first (like the Claude CLI does) so the panel stays green
     /// without the user having to re-run `claude`.
     pub async fn fetch(&self) -> Result<ProviderFetchResult, ProviderError> {
+        let _account_operation = super::accounts::CREDENTIAL_OPERATION.lock().await;
         let (credentials, source) = credentials_store::load_credentials()?;
         let (credentials, refresh_outcome) =
             self.ensure_fresh_credentials(credentials, source).await;
@@ -282,7 +327,11 @@ impl ClaudeOAuthFetcher {
     ) -> Result<ProviderFetchResult, ProviderError> {
         let usage_response = self.fetch_usage(&credentials).await?;
         let usage = self.build_usage_snapshot(&usage_response, &credentials);
-        Ok(ProviderFetchResult::new(usage, "oauth"))
+        let mut result = ProviderFetchResult::new(usage, "oauth");
+        if let Some(identity) = credential_identity(&credentials) {
+            result = result.with_account_identity(identity);
+        }
+        Ok(result)
     }
 
     /// If the token is expired (or about to expire), refresh it using the
@@ -367,7 +416,7 @@ impl ClaudeOAuthFetcher {
         credentials: &ClaudeOAuthCredentials,
     ) -> Result<OAuthUsageResponse, ProviderError> {
         if credentials.is_expired() {
-            return Err(ProviderError::OAuth(
+            return Err(ProviderError::OAuthExpired(
                 "OAuth token expired. Run `claude` to refresh.".to_string(),
             ));
         }
@@ -419,7 +468,7 @@ impl ClaudeOAuthFetcher {
             }
 
             if status.as_u16() == 401 {
-                return Err(ProviderError::OAuth(
+                return Err(ProviderError::OAuthExpired(
                     "OAuth token invalid or expired. Run `claude` to re-authenticate.".to_string(),
                 ));
             }
@@ -557,7 +606,7 @@ impl ClaudeOAuthFetcher {
                     .as_ref()
                     .and_then(|w| Self::to_rate_window(w, Some(300)))
             })
-            .unwrap_or_else(|| RateWindow::new(0.0));
+            .unwrap_or_else(RateWindow::no_active_session);
 
         let mut usage = UsageSnapshot::new(primary);
 

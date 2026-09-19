@@ -3,7 +3,10 @@
 //! Executes interactive CLI commands using the platform pseudo-console.
 //! Provides PTY-like functionality for capturing output from interactive TUI programs.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "TTY runner types reserved for future interactive session management"
+)]
 
 use regex_lite::Regex;
 use std::collections::HashMap;
@@ -188,83 +191,18 @@ impl TtyCommandRunner {
     pub fn which(tool: &str) -> Option<PathBuf> {
         // Check for specific tool overrides
         if tool == "codex"
-            && let Some(path) = Self::locate_codex_binary()
+            && let Some(path) = crate::codex_cli::locate_codex_binary()
         {
             return Some(path);
         }
         if tool == "claude"
-            && let Some(path) = Self::locate_claude_binary()
+            && let Some(path) = crate::providers::claude::locate_claude_binary()
         {
             return Some(path);
         }
 
         // Use `where` on Windows (equivalent to `which` on Unix)
         Self::run_where(tool)
-    }
-
-    /// Locate the Codex binary
-    fn locate_codex_binary() -> Option<PathBuf> {
-        // Check environment override
-        if let Ok(path) = std::env::var("CODEX_BINARY") {
-            let path = PathBuf::from(path);
-            if path.exists() {
-                return Some(path);
-            }
-        }
-
-        // Check common Windows locations
-        let candidates = [
-            // npm global install locations
-            dirs::data_local_dir().map(|d| d.join("npm").join("codex.cmd")),
-            dirs::home_dir().map(|h| {
-                h.join("AppData")
-                    .join("Roaming")
-                    .join("npm")
-                    .join("codex.cmd")
-            }),
-            // Bun install
-            dirs::home_dir().map(|h| h.join(".bun").join("bin").join("codex.exe")),
-        ];
-
-        for candidate in candidates.into_iter().flatten() {
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-
-        // Fall back to PATH search
-        Self::run_where("codex")
-    }
-
-    /// Locate the Claude binary
-    fn locate_claude_binary() -> Option<PathBuf> {
-        // Check environment override
-        if let Ok(path) = std::env::var("CLAUDE_BINARY") {
-            let path = PathBuf::from(path);
-            if path.exists() {
-                return Some(path);
-            }
-        }
-
-        // Check common Windows locations
-        let candidates = [
-            // npm global install locations
-            dirs::data_local_dir().map(|d| d.join("npm").join("claude.cmd")),
-            dirs::home_dir().map(|h| {
-                h.join("AppData")
-                    .join("Roaming")
-                    .join("npm")
-                    .join("claude.cmd")
-            }),
-        ];
-
-        for candidate in candidates.into_iter().flatten() {
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-
-        Self::run_where("claude")
     }
 
     /// Find a binary in PATH.
@@ -309,6 +247,9 @@ impl TtyCommandRunner {
     ///
     /// Uses the platform pseudo-terminal implementation, including Windows
     /// ConPTY, so interactive programs see a real terminal.
+    ///
+    /// run() may block up to `settle_after_stop_secs` after child exit to
+    /// drain remaining output.
     pub fn run(
         &self,
         binary: &str,
@@ -399,7 +340,8 @@ impl TtyCommandRunner {
                     Ok(0) => break,
                     Ok(n) => {
                         if let Ok(s) = String::from_utf8(buf[..n].to_vec()) {
-                            let _ = tx.send(s);
+                            // Best-effort send; the channel is dropped once the main loop exits.
+                            let _sent = tx.send(s);
                         }
                     }
                     Err(_) => break,
@@ -420,15 +362,20 @@ impl TtyCommandRunner {
         for (idx, line) in script_lines.iter().enumerate() {
             if options.script_char_delay_secs > 0.0 {
                 for ch in line.chars() {
-                    let _ = write!(writer, "{}", ch);
-                    let _ = writer.flush();
+                    // Best-effort scripted input; a closed PTY just drops the write.
+                    let _typed = write!(writer, "{}", ch);
+                    // Best-effort flush; failures surface only as missing script output.
+                    let _flushed = writer.flush();
                     std::thread::sleep(Duration::from_secs_f64(options.script_char_delay_secs));
                 }
-                let _ = write!(writer, "\r\n");
+                // Best-effort line terminator; interactive programs expect CRLF.
+                let _newline_written = write!(writer, "\r\n");
             } else {
-                let _ = write!(writer, "{}\r\n", line);
+                // Best-effort whole-line write for the no-delay path.
+                let _line_written = write!(writer, "{}\r\n", line);
             }
-            let _ = writer.flush();
+            // Best-effort flush per script line.
+            let _line_flushed = writer.flush();
             if idx + 1 < script_lines.len() && options.script_line_delay_secs > 0.0 {
                 std::thread::sleep(Duration::from_secs_f64(options.script_line_delay_secs));
             }
@@ -454,9 +401,25 @@ impl TtyCommandRunner {
 
             // Check if process has exited
             if let Ok(Some(_)) = child.try_wait() {
-                // Process exited, drain remaining output
-                while let Ok(chunk) = rx.try_recv() {
-                    buffer.push_str(&chunk);
+                // Process exited; the reader thread may still be forwarding
+                // the final bytes, so drain with bounded blocking receives
+                // instead of one nonblocking sweep that can race the reader
+                // and lose them. Disconnected ends the drain immediately;
+                // the overall deadline bounds it so a reader held open by
+                // inherited handles cannot hang.
+                let drain_deadline = Instant::now() + settle;
+                loop {
+                    let remaining = drain_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match rx.recv_timeout(remaining.min(Duration::from_millis(25))) {
+                        Ok(chunk) => buffer.push_str(&chunk),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        // Quiet slice: keep waiting until the deadline so
+                        // slowly forwarded tail output is not lost.
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
                 }
                 break;
             }
@@ -470,8 +433,10 @@ impl TtyCommandRunner {
                 // Status Report request and wait for a terminal cursor
                 // position response before processing scripted input.
                 if chunk.contains("\x1b[6n") {
-                    let _ = write!(writer, "\x1b[1;1R");
-                    let _ = writer.flush();
+                    // Best-effort cursor-position reply; a dead PTY ignores it.
+                    let _cursor_reply = write!(writer, "\x1b[1;1R");
+                    // Best-effort flush of the cursor reply.
+                    let _cursor_flushed = writer.flush();
                 }
 
                 // Check for URLs
@@ -510,8 +475,10 @@ impl TtyCommandRunner {
                 for (trigger, keys) in &options.send_on_substrings {
                     if !triggered_sends.contains(trigger) && buffer.contains(trigger) {
                         let normalized = keys.replace('\n', "\r\n");
-                        let _ = write!(writer, "{}", normalized);
-                        let _ = writer.flush();
+                        // Best-effort send-trigger input; a closed PTY drops the write.
+                        let _trigger_written = write!(writer, "{}", normalized);
+                        // Best-effort flush after a send-trigger write.
+                        let _trigger_flushed = writer.flush();
                         triggered_sends.insert(trigger.clone());
                     }
                 }
@@ -525,8 +492,10 @@ impl TtyCommandRunner {
             if let Some(interval) = options.send_enter_every_secs
                 && last_enter.elapsed() >= Duration::from_secs_f64(interval)
             {
-                let _ = write!(writer, "\r\n");
-                let _ = writer.flush();
+                // Best-effort periodic Enter keepalive.
+                let _enter_written = write!(writer, "\r\n");
+                // Best-effort flush after the periodic Enter.
+                let _enter_flushed = writer.flush();
                 last_enter = Instant::now();
             }
 
@@ -546,8 +515,10 @@ impl TtyCommandRunner {
         }
 
         if child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill();
-            let _ = child.wait();
+            // Best-effort kill; the process may have exited on its own.
+            let _killed = child.kill();
+            // Best-effort reap; the exit status is intentionally discarded.
+            let _reaped = child.wait();
         }
 
         if buffer.is_empty() && !stopped_early {

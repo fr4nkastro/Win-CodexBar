@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { LocaleKey } from "../../../../i18n/keys";
 import { setProviderUsageSource } from "../../../../lib/tauri";
+import { usageSourcePolicy } from "./usageSourcePolicy";
 
 interface Props {
   providerId: string;
@@ -9,30 +10,8 @@ interface Props {
   onChanged: () => void;
 }
 
-const GROK_OPTIONS = [
-  {
-    value: "auto",
-    label: "Auto",
-    description: "Tries the local Grok login first, then browser cookies.",
-  },
-  {
-    value: "cli",
-    label: "Grok CLI",
-    description: "Uses the locally selected Grok login principal only.",
-  },
-  {
-    value: "oauth",
-    label: "SuperGrok OAuth",
-    description: "Uses the local SuperGrok OAuth principal only, without browser cookies.",
-  },
-  {
-    value: "web",
-    label: "Browser cookies",
-    description: "Uses the configured grok.com browser session only.",
-  },
-] as const;
 
-export function GrokUsageSourceSection({
+export function UsageSourceSection({
   providerId,
   currentValue,
   t,
@@ -41,10 +20,12 @@ export function GrokUsageSourceSection({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (providerId !== "grok") return null;
+  const policy = usageSourcePolicy(providerId);
+  if (!policy) return null;
+  const { options } = policy;
 
   const selected = currentValue ?? "auto";
-  const selectedOption = GROK_OPTIONS.find((option) => option.value === selected) ?? GROK_OPTIONS[0];
+  const selectedOption = options.find((option) => option.value === selected) ?? options[0];
 
   const handleSelect = async (value: string) => {
     if (value === selected || busy) return;
@@ -64,7 +45,7 @@ export function GrokUsageSourceSection({
     <section className="provider-detail-section provider-detail-usage-source">
       <h4>{t("UsageSource")}</h4>
       <div role="radiogroup" aria-label={t("UsageSource")} className="provider-detail-segmented">
-        {GROK_OPTIONS.map((option) => {
+        {options.map((option) => {
           const isActive = option.value === selected;
           return (
             <button

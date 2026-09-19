@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 mod auto_refresh;
+mod auto_resume;
 mod coding_activity;
 mod commands;
 mod events;
@@ -15,6 +16,7 @@ mod shortcut_bridge;
 mod state;
 mod surface;
 mod surface_target;
+mod tray_accounts;
 mod tray_bridge;
 mod tray_menu;
 mod tray_visibility;
@@ -110,6 +112,11 @@ fn should_suppress_blur_dismiss(launch: LaunchBehavior, proof_mode: bool) -> boo
 }
 
 fn main() {
+    // Per-process log file names: the shell writes codexbar-desktop.log so
+    // its cached handle never blocks the CLI's rotation on Windows.
+    // SAFETY: runs before any thread spawns; no concurrent env access exists.
+    unsafe { std::env::set_var("CODEXBAR_PROCESS", "desktop") };
+    codexbar::logging::install_panic_hook();
     codexbar::logging::init(false, false).expect("failed to initialize logging");
 
     let proof_config = proof_harness::ProofConfig::from_env();
@@ -172,6 +179,7 @@ fn main() {
             commands::get_deepseek_pricing_status,
             commands::codex_accounts_list,
             commands::codex_account_add,
+            commands::codex_account_reauthenticate,
             commands::codex_account_remove,
             commands::codex_account_switch,
             commands::codex_account_fetch,
@@ -207,6 +215,7 @@ fn main() {
             commands::remove_token_account,
             commands::set_active_token_account,
             commands::get_app_info,
+            commands::get_safe_diagnostics,
             commands::get_provider_chart_data,
             commands::get_provider_local_usage_summary,
             commands::get_usage_spend_summary,
@@ -216,6 +225,7 @@ fn main() {
             commands::reorder_providers,
             commands::set_provider_cookie_source,
             commands::set_provider_usage_source,
+            commands::set_provider_auto_resume_after_quota_reset,
             commands::has_openrouter_management_api_key,
             commands::set_openrouter_management_api_key,
             commands::remove_openrouter_management_api_key,

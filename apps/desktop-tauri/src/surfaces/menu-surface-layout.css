@@ -1,0 +1,173 @@
+/* Tray/popout account and usage-card layout. */
+.menu-surface {
+  --surface-inset: 16px;
+  line-height: 1.4;
+}
+
+:is(.menu-surface--tray, .menu-surface--popout) .menu-card {
+  --menu-card-x: var(--surface-inset);
+  --menu-card-header-only-y: 12px;
+  --menu-card-section-y: 12px;
+  gap: 12px;
+}
+
+:is(.menu-surface--tray, .menu-surface--popout) .menu-card__name-group {
+  flex-direction: row;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+:is(.menu-surface--tray, .menu-surface--popout) .menu-card__name {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+:is(.menu-surface--tray, .menu-surface--popout) .menu-card__email {
+  max-width: 60%;
+  text-align: right;
+  font-size: 11px;
+}
+
+:is(.menu-surface--tray, .menu-surface--popout) .menu-card__subtitle,
+:is(.menu-surface--tray, .menu-surface--popout) .menu-card__plan-badge {
+  font-size: 11px;
+  font-weight: 400;
+  background: transparent;
+  padding: 0;
+}
+
+:is(.menu-surface--tray, .menu-surface--popout) .menu-card__content,
+.menu-card__metrics,
+.menu-card__more-content {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding-bottom: 0;
+}
+
+:is(.menu-surface--tray, .menu-surface--popout) .menu-card__divider {
+  margin: 0;
+}
+
+:is(.menu-surface--tray, .menu-surface--popout) .menu-metric {
+  gap: 6px;
+}
+
+:is(.menu-surface--tray, .menu-surface--popout) .menu-metric__title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+:is(.menu-surface--tray, .menu-surface--popout) .menu-metric__pct,
+:is(.menu-surface--tray, .menu-surface--popout) .menu-metric__reset {
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.menu-metric__budget-header {
+  color: var(--text-secondary);
+  padding: 2px 0;
+  justify-content: flex-start;
+  gap: 6px;
+}
+.menu-metric__budget-header > span + span {
+  margin-left: auto;
+}
+.menu-metric__budget-header::before {
+  content: "›";
+  margin-right: 4px;
+}
+.menu-metric__budget-header[aria-expanded="true"]::before {
+  transform: rotate(90deg);
+}
+
+.codex-menu-accounts {
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+.codex-menu-accounts__summary,
+.menu-card__more > summary {
+  min-height: 28px;
+  font-size: 12px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.codex-menu-accounts__summary:hover,
+.menu-card__more > summary:hover {
+  color: var(--text-primary);
+}
+.codex-menu-accounts__list {
+  margin-top: 4px;
+  gap: 4px;
+}
+.codex-menu-accounts__row {
+  min-height: 36px;
+  padding: 4px 0;
+}
+.codex-menu-accounts__email {
+  font-size: 12px;
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.codex-menu-accounts__badge {
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-secondary);
+}
+.codex-menu-accounts__switch {
+  min-height: 28px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 500;
+}
+.menu-card__more {
+  border-top: 1px solid var(--panel-border);
+  padding-top: 8px;
+}
+.menu-card__more > summary {
+  line-height: 28px;
+}
+.menu-card__more-content {
+  padding-top: 12px;
+}
+
+:is(.menu-surface--tray, .menu-surface--popout) .menu-stack__item,
+:is(.menu-surface--tray, .menu-surface--popout) .menu-stack__item--selected {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+}
+:is(.menu-surface--tray, .menu-surface--popout) .menu-stack__sep {
+  height: 1px;
+  margin: 4px var(--surface-inset);
+  background: var(--panel-border);
+}
+:is(.menu-surface--tray, .menu-surface--popout) .provider-grid {
+  padding: 8px var(--surface-inset);
+  gap: 8px;
+}
+:is(.menu-surface--tray, .menu-surface--popout) .provider-grid__item {
+  min-height: 32px;
+}
+:is(.menu-surface--tray, .menu-surface--popout) .menu-surface__footer-row {
+  min-height: 28px;
+  font-size: 12px;
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+.context-actions {
+  padding: 0 var(--surface-inset);
+}
+.context-actions__btn {
+  min-height: 28px;
+}

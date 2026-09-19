@@ -1,5 +1,73 @@
 # Changelog
 
+## [Windows] 0.60.4 - 2026-09-19
+
+Fork sync: merges upstream [nesszer/Win-CodexBar](https://github.com/nesszer/Win-CodexBar) **v0.60.3** into this fork (0.56.6) ([#23](https://github.com/fr4nkastro/Win-CodexBar/issues/23)). The upstream 0.56.8 and 0.60.3 entries below describe what came in; the 0.55.1 – 0.56.6 entries are this fork's own history.
+
+### Changed
+- Brings upstream CodexBar ports 0.55.1 – 0.60.3, provider fixes (Cursor, Antigravity, Meta, Grok, Crof, Alibaba, OpenCode Go, Chutes, Ollama, pricing), provider availability states, process-runner reliability fixes, FloatBar/UI fixes, the Rust clippy policy and the TypeScript anti-slop gate.
+- Codex accounts: takes upstream per-account reset times, bundled CLI discovery, privacy-safe labels and login diagnostics redaction, while keeping this fork's deterministic discovered-account ids and a single active-account indicator driven by the live `auth.json` identity.
+- Claude accounts: keeps this fork's `claude_accounts` system (Tauri commands, Settings section, tray card). The native tray account menu from upstream now lists and switches this fork's Claude accounts (consent-gated); upstream's saved-accounts backend and the claude-swap adapter stay in the tree but are not wired into the desktop UI or commands.
+- Claude OAuth: keeps the per-config-dir credential APIs, token-ownership gate and transient 429 backoff, plus upstream's keyring fallback for an expired credentials file and proxy / manual-cookie priority.
+- MiniMax: combines the Token Plan `remains_percent` 5-hour and weekly bars with upstream's Bearer API-key remains API; the stub CLI source stays removed.
+- Updater, About links and issue-template links now point at `fr4nkastro/Win-CodexBar`.
+- Release tooling keeps this fork's `release.yml`, `signpath-test.yml`, `gh-safe.sh` allowlist and fork-aware manifest; upstream SignPath release wiring and the worktree storage policy are not adopted.
+
+---
+
+## [Windows] 0.60.3 - 2026-09-15
+
+Windows port of upstream CodexBar **0.56.8 → 0.60.3**.
+
+### Added
+- Providers: port whitespace-aware Codex rescans, OpenCodex numeric and cache parsing, reserve pricing aliases, Usage & Spend ledger details, and optional tray pace colors ([#488](https://github.com/nesszer/Win-CodexBar/pull/488), [#489](https://github.com/nesszer/Win-CodexBar/pull/489), [#490](https://github.com/nesszer/Win-CodexBar/pull/490), [#492](https://github.com/nesszer/Win-CodexBar/pull/492), [#493](https://github.com/nesszer/Win-CodexBar/pull/493)).
+- Providers: add Vertex OAuth validation and preserve Antigravity structured reports, discrete model pools, Warp add-on pools, Perplexity credit percentages, Abacus details, LiteLLM budgets, LongCat token and expiry data, and Devin organization context ([#494](https://github.com/nesszer/Win-CodexBar/pull/494), [#498](https://github.com/nesszer/Win-CodexBar/pull/498), [#503](https://github.com/nesszer/Win-CodexBar/pull/503)).
+- Accounts: add the Claude-swap multi-account adapter and its historical usage, spend, repair, and account-action behavior ([#482](https://github.com/nesszer/Win-CodexBar/pull/482), [#503](https://github.com/nesszer/Win-CodexBar/pull/503)).
+- Providers: restore Cursor monthly Auto pacing, paid and active-trial Grok Bot allowances, and Antigravity account-source guidance ([#505](https://github.com/nesszer/Win-CodexBar/pull/505)).
+
+### Fixed
+- Providers: harden managed Antigravity CLI fallback, use checked Mistral billing arithmetic, preserve reserved Alibaba/Qwen request characters, and retain partial usage and cost data ([#483](https://github.com/nesszer/Win-CodexBar/pull/483), [#501](https://github.com/nesszer/Win-CodexBar/pull/501), [#503](https://github.com/nesszer/Win-CodexBar/pull/503)).
+- Privacy: keep Codex account labels private and redact login diagnostics ([#491](https://github.com/nesszer/Win-CodexBar/pull/491), [#502](https://github.com/nesszer/Win-CodexBar/pull/502)).
+- Runtime: resume sessions safely after quota reset and keep localized reset countdowns compact ([#499](https://github.com/nesszer/Win-CodexBar/pull/499), [#500](https://github.com/nesszer/Win-CodexBar/pull/500)).
+
+### Changed
+- Claude: disable Remote Control registration during usage probes and keep weekly fallback data out of session warnings while preserving account separation ([#503](https://github.com/nesszer/Win-CodexBar/pull/503), [#505](https://github.com/nesszer/Win-CodexBar/pull/505)).
+- Settings: explain Antigravity automatic account selection and the Windows Local API / agy CLI sources ([#505](https://github.com/nesszer/Win-CodexBar/pull/505)).
+- Reliability: improve Claude Add-account WSL diagnostics, Codex token saturation, dark-theme select popups, ambient account selection, and endpoint/model validation ([#471](https://github.com/nesszer/Win-CodexBar/pull/471), [#472](https://github.com/nesszer/Win-CodexBar/pull/472), [#480](https://github.com/nesszer/Win-CodexBar/pull/480), [#484](https://github.com/nesszer/Win-CodexBar/pull/484), [#485](https://github.com/nesszer/Win-CodexBar/pull/485)).
+- CI: add the curated TypeScript anti-slop gate to hosted validation ([#487](https://github.com/nesszer/Win-CodexBar/pull/487)).
+
+> Release artifacts are unsigned (SignPath onboarding pending); verify them against the attached `.sha256` sidecar files.
+
+---
+
+## [Windows] 0.56.8 - 2026-09-08
+
+Windows release aligned to the reviewed upstream CodexBar **0.56.8** behavior baseline, plus Windows-specific reliability, account-switching, UI, browser-import, and release-pipeline improvements landed since 0.55.0.
+
+### Added
+- Saved Codex and Claude accounts with account switching from Settings and the native tray menu.
+- Antigravity local token-history reporting, improved quota selection, and bounded historical scanning.
+- Expanded Codex usage/cost history, reasoning-token accounting, reset diagnostics, and privacy-aware Usage & Spend reporting.
+- Claude Desktop/session discovery and localized model-specific weekly quota labels.
+
+### Changed
+- Codex account switching now separates credential storage, fetch coordination, and restart orchestration from the HTTP API and Tauri command layers.
+- Tray account actions are isolated behind a dedicated tray-account controller instead of growing the shared tray bridge.
+- Windows typography, Settings layout, and tray/pop-out usage-card layout are split into focused surface styles.
+- pnpm is pinned at 11.25.0 from one canonical package-manager declaration used by the release tooling.
+
+### Fixed
+- Codex preserves authenticated HTTP permission failures instead of misclassifying 403 responses as expired credentials, including PAT paths.
+- Claude refresh can adopt changed fresh Windows Credential Manager credentials when the default file credential is expired.
+- Copilot account reuse is identity-first, preventing legacy labels from replacing a different verified GitHub account.
+- Kiro usage enrichment follows the validated profile ARN region and fails closed for unsupported regions.
+- Codex bundled CLI discovery and desktop restart/account-switch flows are more reliable on Windows.
+- Brave App-Bound Encryption cookie import reports the Windows limitation clearly instead of implying a generic cookie failure.
+- Ollama browser-cookie import tries viable browser sources without letting one failed source hide another valid source.
+- Minimax API-key quota retrieval uses the provider API rather than treating browser cookies as the only usable path.
+
+---
+
 ## [Windows] 0.56.6 - 2026-09-02
 
 ### Fixed

@@ -113,7 +113,8 @@ pub(super) fn cache_validated_session_cookie(source: &OllamaCookieSource) {
             OllamaCookieSource::Manual(_) => "validated",
             OllamaCookieSource::Browser(_) => "browser",
         };
-        let _ = CookieHeaderCache::store(ProviderId::Ollama, &header, label);
+        // Cache store is best-effort: a failed write just means the next fetch re-validates.
+        let _stored = CookieHeaderCache::store(ProviderId::Ollama, &header, label);
     }
 }
 
@@ -152,16 +153,49 @@ pub(super) fn resolve_browser_cookie_header(
         return Ok(Some(cached.cookie_header));
     }
 
-    match crate::providers::browser_cookies_for_domain(OLLAMA_COOKIE_DOMAIN) {
-        Ok(cookies) => {
-            let url = Url::parse("https://ollama.com/settings")
-                .map_err(|e| ProviderError::Other(e.to_string()))?;
-            Ok(ollama_cookie_header_for_url(&cookies, &url)
-                .filter(|h| has_recognized_ollama_session_cookie(h)))
+    let url = Url::parse("https://ollama.com/settings")
+        .map_err(|e| ProviderError::Other(e.to_string()))?;
+
+    // Upstream Win-CodexBar #426: the generic `browser_cookies_for_domain` helper
+    // stops at the FIRST installed browser that has *any* cookies for the domain,
+    // even if those cookies are stale/irrelevant (e.g. a consent or CDN cookie left
+    // behind in Chrome/Edge from a one-off visit) and don't include a recognized
+    // Ollama session cookie. That starves out a later browser (often Brave) that
+    // actually holds the logged-in session. Walk every detected browser ourselves
+    // and keep going until one yields a header with a recognized session cookie.
+    use crate::browser::cookies::CookieExtractor;
+    use crate::browser::detection::BrowserDetector;
+
+    let mut first_error = None;
+    for browser in BrowserDetector::detect_all() {
+        match CookieExtractor::extract_for_domain(&browser, OLLAMA_COOKIE_DOMAIN) {
+            Ok(cookies) => {
+                if let Some(header) = ollama_cookie_header_for_url(&cookies, &url) {
+                    return Ok(Some(header));
+                }
+            }
+            Err(error) => {
+                let error = crate::providers::map_browser_cookie_error(error);
+                if !matches!(error, ProviderError::NoCookies) && first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
-        Err(ProviderError::NoCookies) => Ok(None),
-        Err(err) => Err(err),
     }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(None)
+}
+
+/// Return the header for the first cookie set (in order) that contains a
+/// recognized Ollama session cookie for `url`, skipping sets that decrypt
+/// fine but carry no usable session (see `resolve_browser_cookie_header`).
+fn first_recognized_cookie_header(
+    mut cookie_sets: impl Iterator<Item = Vec<Cookie>>,
+    url: &Url,
+) -> Option<String> {
+    cookie_sets.find_map(|cookies| ollama_cookie_header_for_url(&cookies, url))
 }
 
 pub(super) fn should_attach_ollama_cookie(url: &Url) -> bool {
@@ -282,6 +316,62 @@ mod tests {
             normalize_cookie_header("-b \"__Secure-session=abc123\""),
             Some("__Secure-session=abc123".to_string())
         );
+    }
+
+    #[test]
+    fn first_recognized_cookie_header_skips_browsers_without_a_session_cookie() {
+        // Regression for #426: an earlier-priority browser (e.g. Chrome/Edge)
+        // may hold only stale/irrelevant ollama.com cookies (analytics,
+        // consent) with no session cookie at all. The old
+        // `browser_cookies_for_domain` helper stopped at that first non-empty
+        // result and never reached a later browser (e.g. Brave) that actually
+        // holds the logged-in session.
+        let irrelevant_only = vec![Cookie {
+            name: "aid".to_string(),
+            value: "device-id".to_string(),
+            domain: "ollama.com".to_string(),
+            path: "/".to_string(),
+            expires: None,
+            is_secure: true,
+            is_http_only: false,
+        }];
+        let real_session = vec![Cookie {
+            name: OLLAMA_SESSION_COOKIE_NAME.to_string(),
+            value: "abc123".to_string(),
+            domain: "ollama.com".to_string(),
+            path: "/".to_string(),
+            expires: None,
+            is_secure: true,
+            is_http_only: true,
+        }];
+
+        let url = Url::parse("https://ollama.com/settings").unwrap();
+        let header =
+            first_recognized_cookie_header(vec![irrelevant_only, real_session].into_iter(), &url);
+
+        assert_eq!(
+            header.as_deref(),
+            Some("__Secure-session=abc123"),
+            "should skip the first (irrelevant) cookie set and use the second (real session)"
+        );
+    }
+
+    #[test]
+    fn first_recognized_cookie_header_none_when_no_set_has_a_session_cookie() {
+        let only_irrelevant = vec![Cookie {
+            name: "aid".to_string(),
+            value: "device-id".to_string(),
+            domain: "ollama.com".to_string(),
+            path: "/".to_string(),
+            expires: None,
+            is_secure: true,
+            is_http_only: false,
+        }];
+
+        let url = Url::parse("https://ollama.com/settings").unwrap();
+        let header = first_recognized_cookie_header(vec![only_irrelevant].into_iter(), &url);
+
+        assert_eq!(header, None);
     }
 
     #[test]

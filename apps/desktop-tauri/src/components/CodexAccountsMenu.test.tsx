@@ -40,14 +40,17 @@ function account(id: string, extra: Partial<CodexAccount> = {}): CodexAccount {
   };
 }
 
-function snapshot(usedPercent: number): CodexAccountUsageSnapshot {
+function snapshot(
+  usedPercent: number,
+  resetAt: string | null = null,
+): CodexAccountUsageSnapshot {
   return {
     email: "user@example.com",
     providerAccountId: null,
     plan: "free",
     allowed: true,
     limitReached: false,
-    primaryWindow: { usedPercent, resetAt: null, limitWindowSeconds: 3600 },
+    primaryWindow: { usedPercent, resetAt, limitWindowSeconds: 18_000 },
     secondaryWindow: null,
     credits: null,
     updatedAt: "2024-01-01T00:00:00Z",
@@ -57,12 +60,19 @@ function snapshot(usedPercent: number): CodexAccountUsageSnapshot {
 // Wrap the component so the `t` from useLocale is a stable identity that just
 // returns the key (the component uses `t(key)` for locale strings and a badge
 // label; returning the key is enough to assert rendering).
-function renderMenu(hideEmail: boolean, state: CodexAccountsStateBridge) {
+function renderMenu(
+  hideEmail: boolean,
+  state: CodexAccountsStateBridge,
+  resetTimeRelative = true,
+) {
   tauriMocks.getCodexAccountsState.mockResolvedValue(state);
   tauriMocks.getLocaleStrings.mockResolvedValue(buildBundle({}));
   return render(
     <LocaleProvider>
-      <CodexAccountsMenu hideEmail={hideEmail} />
+      <CodexAccountsMenu
+        hideEmail={hideEmail}
+        resetTimeRelative={resetTimeRelative}
+      />
     </LocaleProvider>,
   );
 }
@@ -75,6 +85,7 @@ describe("CodexAccountsMenu", () => {
   it("renders nothing for a single-account setup (single-account fallback)", async () => {
     const { container } = renderMenu(false, {
       accounts: [account("1", { source: "ambient" })],
+      accountOrdinals: { "1": 1 },
       snapshots: {},
     });
     await waitFor(() => {
@@ -87,6 +98,7 @@ describe("CodexAccountsMenu", () => {
   it("marks the activeAccountId row active even when every account is managed", async () => {
     const { container } = renderMenu(false, {
       accounts: [account("1"), account("2")],
+      accountOrdinals: { "1": 1, "2": 2 },
       snapshots: { "1": snapshot(30), "2": snapshot(70) },
       activeAccountId: "1",
     });
@@ -136,6 +148,7 @@ describe("CodexAccountsMenu", () => {
     };
     const { container } = renderMenu(false, {
       accounts: [account("1", { source: "ambient" }), account("2")],
+      accountOrdinals: { "1": 1, "2": 2 },
       snapshots: { "1": weeklyOnly },
     });
     await screen.findByText("user-1@example.com");
@@ -147,9 +160,35 @@ describe("CodexAccountsMenu", () => {
     expect((fills[0] as HTMLElement).style.width).toBe("42%");
   });
 
+  it("shows the five-hour usage and local reset time for each account", async () => {
+    const resetAt = "2030-01-02T03:04:00Z";
+    const expectedReset = new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(new Date(resetAt));
+
+    renderMenu(
+      false,
+      {
+        accounts: [account("1", { source: "ambient" }), account("2")],
+        accountOrdinals: { "1": 1, "2": 2 },
+        snapshots: { "1": snapshot(30, resetAt), "2": snapshot(70, resetAt) },
+      },
+      false,
+    );
+
+    await screen.findByText("user-1@example.com");
+    expect(screen.getAllByText("5h")).toHaveLength(2);
+    expect(screen.getByText("30% PanelUsedSuffix")).toBeDefined();
+    expect(screen.getAllByText(`MetricResetsIn ${expectedReset}`)).toHaveLength(2);
+  });
+
   it("switches an account and kicks a provider refresh", async () => {
     renderMenu(false, {
-      accounts: [account("1"), account("2")],
+      accounts: [account("1", { source: "ambient" }), account("2")],
+      accountOrdinals: { "1": 1, "2": 2 },
       snapshots: {},
       activeAccountId: "1",
     });
@@ -157,7 +196,8 @@ describe("CodexAccountsMenu", () => {
 
     tauriMocks.codexAccountSwitch.mockResolvedValue({});
     tauriMocks.getCodexAccountsState.mockResolvedValue({
-      accounts: [account("1"), account("2")],
+      accounts: [account("1", { source: "ambient" }), account("2")],
+      accountOrdinals: { "1": 1, "2": 2 },
       snapshots: {},
       activeAccountId: "1",
     });
@@ -170,4 +210,62 @@ describe("CodexAccountsMenu", () => {
     expect(tauriMocks.codexAccountSwitch).toHaveBeenCalledWith("2");
     expect(tauriMocks.refreshProviders).toHaveBeenCalledTimes(1);
   });
+  it("uses opaque ordinal labels and matching tooltips while hideEmail is on", async () => {
+    const { container: hidden } = renderMenu(true, {
+      accounts: [account("1", { source: "ambient" }), account("2")],
+      accountOrdinals: { "1": 1, "2": 2 },
+      snapshots: {},
+    });
+    await waitFor(() => {
+      expect(
+        hidden.querySelectorAll(".codex-menu-accounts__email").length,
+      ).toBe(2);
+    });
+    const hiddenEmail = hidden.querySelectorAll(
+      ".codex-menu-accounts__email",
+    )[1] as HTMLElement;
+    expect(hiddenEmail.getAttribute("title")).toBe(hiddenEmail.textContent);
+    expect(hiddenEmail.textContent).toBe("Account 2");
+    expect(hiddenEmail.textContent).not.toContain("@");
+    expect(hiddenEmail.textContent).not.toContain("example.com");
+
+    const { container: visible } = renderMenu(false, {
+      accounts: [account("1", { source: "ambient" }), account("2")],
+      accountOrdinals: { "1": 1, "2": 2 },
+      snapshots: {},
+    });
+    await waitFor(() => {
+      expect(
+        visible.querySelectorAll(".codex-menu-accounts__email").length,
+      ).toBe(2);
+    });
+    const rawEmail = visible.querySelectorAll(
+      ".codex-menu-accounts__email",
+    )[1] as HTMLElement;
+    expect(rawEmail.getAttribute("title")).toBe("user-2@example.com");
+  });
+
+  it("uses canonical opaque ordinals supplied by the account bridge", async () => {
+    const first = account("uuid-b", {
+      emailHint: "alice@example.com",
+      nickname: "team@example.com",
+    });
+    const second = account("uuid-a", {
+      emailHint: "bob@example.com",
+      nickname: "Private workspace",
+    });
+
+    const { container } = renderMenu(true, {
+      accounts: [first, second],
+      accountOrdinals: { "uuid-b": 2, "uuid-a": 1 },
+      snapshots: {},
+    });
+    await screen.findByText("Account 2");
+    const labels = container.querySelectorAll(".codex-menu-accounts__email");
+    expect(labels[0].textContent).toBe("Account 2");
+    expect(labels[1].textContent).toBe("Account 1");
+    expect(labels[0].textContent).not.toContain("@");
+    expect(labels[1].textContent).not.toContain("example.com");
+  });
 });
+

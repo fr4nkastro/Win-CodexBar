@@ -10,5 +10,10 @@
     <pe-file path="CodexBar-${version}-portable.exe">
       <authenticode-sign />
     </pe-file>
+    <zip-file path="CodexBarCLI-v${version}-windows-x64.zip">
+      <pe-file path="codexbar-cli.exe">
+        <authenticode-sign />
+      </pe-file>
+    </zip-file>
   </zip-file>
 </artifact-configuration>

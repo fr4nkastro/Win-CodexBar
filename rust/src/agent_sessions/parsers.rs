@@ -113,18 +113,28 @@ struct WindowsProcessMetadata {
 }
 
 impl WindowsProcessOutputParser {
-    pub fn parse(output: &str) -> Vec<AgentProcessRecord> {
-        let Ok(value) = serde_json::from_str::<Value>(output.trim()) else {
-            return Vec::new();
+    /// Parse `ConvertTo-Json` output from the Windows process query.
+    ///
+    /// Distinguishes "legitimately no processes" (empty array) from an
+    /// unparseable response: only genuinely malformed JSON is an error, so
+    /// callers can surface parse failures instead of silently reporting an
+    /// empty discovery result.
+    pub fn parse(output: &str) -> Result<Vec<AgentProcessRecord>, String> {
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            return Err("process query produced no output".to_string());
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            return Err("process query output was not valid JSON".to_string());
         };
         let values = match value {
             Value::Array(values) => values,
             Value::Object(_) => vec![value],
-            _ => return Vec::new(),
+            _ => return Err("process query output was not a JSON array".to_string()),
         };
         let mut seen = HashSet::new();
 
-        values
+        Ok(values
             .into_iter()
             .filter_map(|value| serde_json::from_value::<WindowsProcessMetadata>(value).ok())
             .filter(|process| process.process_id > 0 && seen.insert(process.process_id))
@@ -153,7 +163,7 @@ impl WindowsProcessOutputParser {
                     command: None,
                 }
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -368,28 +378,49 @@ impl ClaudeSessionProjectMapper {
     }
 
     pub fn transcripts(cwd: &str, home_directory: &Path) -> Vec<ClaudeTranscript> {
+        let mut budget =
+            super::pi_family::DirectoryScanBudget::new(4096, 1, std::time::Duration::from_secs(1));
+        Self::transcripts_with_budget(cwd, home_directory, &mut budget)
+    }
+
+    /// Enumerate Claude transcript metadata with a shared scan deadline.
+    ///
+    /// Claude Desktop project roots are included on Windows by the same
+    /// bounded locator used by the local scanner. The compatibility wrapper
+    /// above supplies the upstream-style one-second default budget.
+    pub fn transcripts_with_budget(
+        cwd: &str,
+        home_directory: &Path,
+        budget: &mut super::pi_family::DirectoryScanBudget,
+    ) -> Vec<ClaudeTranscript> {
+        if cwd.trim().is_empty() || !budget.has_time_remaining() {
+            return Vec::new();
+        }
+
+        let escaped_cwd = Self::escaped_cwd(cwd);
+        let mut directories = Self::project_directories(cwd, home_directory);
+        directories.extend(
+            super::claude_desktop::ClaudeDesktopProjectsLocator::roots(budget)
+                .into_iter()
+                .map(|root| root.join(&escaped_cwd)),
+        );
+
         let mut transcripts = Vec::new();
 
-        for directory in Self::project_directories(cwd, home_directory) {
-            let Ok(entries) = fs::read_dir(&directory) else {
-                continue;
-            };
-
-            for entry in entries.flatten() {
+        for directory in directories {
+            if !budget.has_time_remaining() {
+                break;
+            }
+            let entries = budget.files(&directory);
+            let found = budget.compact_map_while_time_remaining(entries, |entry| {
                 let path = entry.path();
                 if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                    continue;
+                    return None;
                 }
-
-                let Ok(metadata) = entry.metadata() else {
-                    continue;
-                };
-                let Ok(modified) = metadata.modified() else {
-                    continue;
-                };
-
-                transcripts.push(ClaudeTranscript::new(path, modified.into()));
-            }
+                let modified = entry.metadata().ok()?.modified().ok()?;
+                Some(ClaudeTranscript::new(path, modified.into()))
+            });
+            transcripts.extend(found);
         }
 
         transcripts.sort_by(|lhs, rhs| {
@@ -412,9 +443,14 @@ impl ClaudeTranscriptMetadataParser {
     pub fn parse(reader: impl Read) -> Option<ClaudeTranscriptMetadata> {
         let mut session_id = None;
         let mut cwd = None;
-        let reader = BufReader::new(reader.take(Self::MAX_BYTES));
+        let lines = BufReader::new(reader.take(Self::MAX_BYTES))
+            .lines()
+            .take(Self::MAX_LINES);
 
-        for line in reader.lines().take(Self::MAX_LINES).map_while(Result::ok) {
+        for line in lines {
+            let Ok(line) = line else {
+                break;
+            };
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
@@ -473,7 +509,7 @@ impl CodexRolloutFirstLineParser {
     }
 
     pub fn read_first_line(path: &Path) -> Option<String> {
-        let file = File::open(path).ok()?;
+        let file = std::fs::File::open(path).ok()?;
         let mut reader = BufReader::new(file);
         let mut line = String::new();
         let bytes = reader.read_line(&mut line).ok()?;

@@ -79,14 +79,8 @@ pub(super) async fn fetch_usage(
         request = request.header("ChatGPT-Account-Id", account_id);
     }
     let response = request.send().await?;
-    let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(ProviderError::AuthRequired);
-    }
-    if !status.is_success() {
-        return Err(ProviderError::Other(format!(
-            "Codex PAT usage API returned {status}"
-        )));
+    if !response.status().is_success() {
+        return Err(super::authenticated_http_error(response, "Codex PAT usage API").await);
     }
     let usage = response.json::<Value>().await.map_err(|error| {
         ProviderError::Parse(format!("Invalid Codex PAT usage response: {error}"))
@@ -95,14 +89,8 @@ pub(super) async fn fetch_usage(
 }
 
 async fn decode_whoami(response: reqwest::Response) -> Result<PatWhoami, ProviderError> {
-    let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(ProviderError::AuthRequired);
-    }
-    if !status.is_success() {
-        return Err(ProviderError::Other(format!(
-            "Codex PAT whoami returned {status}"
-        )));
+    if !response.status().is_success() {
+        return Err(super::authenticated_http_error(response, "Codex PAT whoami").await);
     }
     let response = response.json::<WhoamiResponse>().await.map_err(|error| {
         ProviderError::Parse(format!("Invalid Codex PAT whoami response: {error}"))
@@ -179,5 +167,37 @@ mod tests {
                 .starts_with("codex_cli_rs/0.148.0-alpha.9 (")
         );
         assert!(user_agent(None).starts_with("codex_cli_rs ("));
+    }
+
+    #[tokio::test]
+    async fn whoami_distinguishes_401_from_403() {
+        for (status, expects_authentication) in [(401, true), (403, false)] {
+            let mut server = mockito::Server::new_async().await;
+            let path = format!("/whoami-{status}");
+            let mock = server
+                .mock("GET", path.as_str())
+                .with_status(status)
+                .with_body("fixture refusal")
+                .create_async()
+                .await;
+            let response = reqwest::Client::new()
+                .get(format!("{}{path}", server.url()))
+                .send()
+                .await
+                .expect("mock response");
+
+            let error = decode_whoami(response)
+                .await
+                .expect_err("expected rejection");
+            if expects_authentication {
+                assert!(matches!(error, ProviderError::AuthRequired));
+            } else {
+                let message = error.to_string();
+                assert!(message.contains("403"));
+                assert!(message.contains("fixture refusal"));
+                assert!(!matches!(error, ProviderError::AuthRequired));
+            }
+            mock.assert_async().await;
+        }
     }
 }

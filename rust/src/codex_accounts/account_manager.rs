@@ -14,7 +14,8 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::api::{AuthBackedIdentity, CodexApiError, load_identity};
+use super::api::CodexApiError;
+use super::credentials::{AuthBackedIdentity, load_identity};
 use super::file_locations::{
     ambient_codex_home, auth_backups_directory, codex_desktop_session_root,
     desktop_session_snapshot_path, ensure_directories, managed_homes_directory,
@@ -41,6 +42,7 @@ impl From<CodexApiError> for CodexAccountManagerError {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexSwitchResult {
+    pub switch_id: Uuid,
     pub materialized_account: Option<CodexAccount>,
     pub backup_path: Option<PathBuf>,
     pub ambient_account: Option<CodexAccount>,
@@ -71,7 +73,9 @@ impl CodexAccountManager {
         {
             Ok(account) => Ok(account),
             Err(error) => {
-                let _ = fs::remove_dir_all(&home_path);
+                // Best-effort teardown of the fresh managed home on failure;
+                // a removal error cannot change the authentication outcome.
+                let _removed_home = fs::remove_dir_all(&home_path);
                 Err(error)
             }
         }
@@ -83,6 +87,9 @@ impl CodexAccountManager {
         account: &CodexAccount,
         handle: Option<&ManagedLoginProcess>,
     ) -> Result<CodexAccount, CodexAccountManagerError> {
+        // Keep credential replacement exclusive with provider reads and
+        // refreshes, just like an account switch.
+        let _credentials = super::CREDENTIAL_OPERATIONS.blocking_write();
         self.authenticate_account(
             &account.codex_home_path,
             account.source,
@@ -188,6 +195,9 @@ impl CodexAccountManager {
         target: &CodexAccount,
         existing: &[CodexAccount],
     ) -> Result<CodexSwitchResult, CodexAccountManagerError> {
+        // Called by the shell's blocking worker: keep the guard here so
+        // cancelling its async caller cannot release it before the copy ends.
+        let _credentials = super::CREDENTIAL_OPERATIONS.blocking_write();
         ensure_directories()?;
 
         let target_auth_path = target.codex_home_path.join("auth.json");
@@ -198,6 +208,21 @@ impl CodexAccountManager {
         }
 
         let ambient_account = self.discover_ambient_account(existing);
+        if ambient_account
+            .as_ref()
+            .is_some_and(|ambient| ambient.matches(target))
+        {
+            // A no-op must not replace auth or restore/clear the live session.
+            return Ok(CodexSwitchResult {
+                switch_id: Uuid::new_v4(),
+                materialized_account: None,
+                backup_path: None,
+                ambient_account,
+                desktop_session_backup_path: None,
+                desktop_session_restore_path: None,
+                desktop_session_restore_exists: false,
+            });
+        }
         let session_root = codex_desktop_session_root();
         let mut materialized_account: Option<CodexAccount> = None;
         if let Some(ambient) = &ambient_account {
@@ -226,11 +251,12 @@ impl CodexAccountManager {
         self.sync_ambient_global_state(
             ambient_account
                 .as_ref()
-                .and_then(|account| account.provider_account_id.clone()),
+                .and_then(CodexAccount::effective_workspace_account_id),
             self.target_account_id(target)?,
         );
 
         Ok(CodexSwitchResult {
+            switch_id: Uuid::new_v4(),
             materialized_account,
             backup_path,
             ambient_account: self.discover_ambient_account(existing),
@@ -259,7 +285,7 @@ impl CodexAccountManager {
         fs::copy(&source_auth_path, destination_home.join("auth.json"))?;
 
         let now = utc_now();
-        Ok(CodexAccount::new(
+        let mut materialized = CodexAccount::new(
             account.id,
             account.nickname.clone(),
             account.email_hint.clone(),
@@ -270,7 +296,9 @@ impl CodexAccountManager {
             account.created_at,
             now,
             Some(account.last_authenticated_at.unwrap_or(now)),
-        ))
+        );
+        materialized.workspace_account_id = account.workspace_account_id.clone();
+        Ok(materialized)
     }
 
     fn backup_ambient_auth(&self) -> Result<Option<PathBuf>, CodexAccountManagerError> {
@@ -286,8 +314,8 @@ impl CodexAccountManager {
     }
 
     fn target_account_id(&self, target: &CodexAccount) -> Result<Option<String>, CodexApiError> {
-        if let Some(account_id) = &target.provider_account_id {
-            return Ok(Some(account_id.clone()));
+        if let Some(account_id) = target.effective_workspace_account_id() {
+            return Ok(Some(account_id));
         }
         let identity = load_identity(&target.codex_home_path)?;
         Ok(identity.provider_account_id)
@@ -355,7 +383,9 @@ impl CodexAccountManager {
         let Ok(encoded) = serde_json::to_string_pretty(&payload) else {
             return;
         };
-        let _ = fs::write(path, format!("{encoded}\n"));
+        // Best-effort teardown: persisting the rewritten payload is advisory
+        // and a write error cannot change the in-memory rewrite result.
+        let _written_payload = fs::write(path, format!("{encoded}\n"));
     }
 
     fn managed_home_paths_matching(
@@ -363,6 +393,14 @@ impl CodexAccountManager {
         account: &CodexAccount,
     ) -> Result<Vec<PathBuf>, CodexAccountManagerError> {
         ensure_directories()?;
+        if self
+            .discovered_managed_account(&account.codex_home_path, &[])
+            .is_some_and(|fresh| !fresh.matches(account))
+        {
+            return Err(CodexAccountManagerError::Message(
+                "This managed home now belongs to a different account. Refresh the account list before removing it.".into(),
+            ));
+        }
         let mut targets: Vec<PathBuf> = vec![
             std::path::absolute(&account.codex_home_path)
                 .unwrap_or_else(|_| account.codex_home_path.clone()),
@@ -416,7 +454,7 @@ impl CodexAccountManager {
             }
             CodexLoginOutcome::MissingBinary => {
                 return Err(CodexAccountManagerError::Message(
-                    "The `codex` command could not be found.".to_string(),
+                    "Codex CLI could not be found. Install Codex Desktop or the Codex CLI, then restart CodexBar.".to_string(),
                 ));
             }
             CodexLoginOutcome::TimedOut(_) => {
@@ -445,26 +483,29 @@ impl CodexAccountManager {
         }
 
         let now = utc_now();
-        Ok(CodexAccount::new(
+        let mut authenticated = CodexAccount::new(
             existing
                 .map(|account| account.id)
                 .unwrap_or_else(Uuid::new_v4),
             existing.and_then(|account| account.nickname.clone()),
             identity
                 .email
+                .clone()
                 .or_else(|| existing.and_then(|account| account.email_hint.clone())),
             identity
                 .auth_subject
+                .clone()
                 .or_else(|| existing.and_then(|account| account.auth_subject.clone())),
-            identity
-                .provider_account_id
-                .or_else(|| existing.and_then(|account| account.provider_account_id.clone())),
+            provider_account_id_after_auth(&identity, existing),
             home_path.to_path_buf(),
             source,
             existing.map(|account| account.created_at).unwrap_or(now),
             now,
             Some(now),
-        ))
+        );
+        authenticated.workspace_account_id =
+            existing.and_then(|account| account.workspace_account_id.clone());
+        Ok(authenticated)
     }
 
     fn discovered_managed_account(
@@ -501,7 +542,7 @@ impl CodexAccountManager {
     }
 }
 
-fn candidate_account(
+pub(super) fn candidate_account(
     identity: AuthBackedIdentity,
     home_path: &Path,
     source: CodexAccountSource,
@@ -588,6 +629,34 @@ fn derive_account_uuid(key: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+/// Keep a v0.56.3 provider id when it is the legacy selected workspace. A
+/// fresh auth read may report the auth-file default instead; that value must
+/// not silently replace the app-owned selection.
+fn provider_account_id_after_auth(
+    identity: &AuthBackedIdentity,
+    existing: Option<&CodexAccount>,
+) -> Option<String> {
+    if let Some(existing) = existing
+        && existing.workspace_account_id.is_none()
+        && existing.provider_account_id.is_some()
+        && identity
+            .provider_account_id
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|auth_id| {
+                existing
+                    .normalized_provider_account_id()
+                    .is_some_and(|selected_id| selected_id != auth_id.to_lowercase())
+            })
+    {
+        return existing.provider_account_id.clone();
+    }
+    identity
+        .provider_account_id
+        .clone()
+        .or_else(|| existing.and_then(|account| account.provider_account_id.clone()))
+}
+
 fn build_discovered_account(
     matched: Option<&CodexAccount>,
     identity: AuthBackedIdentity,
@@ -598,18 +667,18 @@ fn build_discovered_account(
     let id = matched
         .map(|account| account.id)
         .unwrap_or_else(|| stable_discovered_id(&home_path, &identity));
-    CodexAccount::new(
+    let mut discovered = CodexAccount::new(
         id,
         matched.and_then(|account| account.nickname.clone()),
         identity
             .email
+            .clone()
             .or_else(|| matched.and_then(|account| account.email_hint.clone())),
         identity
             .auth_subject
+            .clone()
             .or_else(|| matched.and_then(|account| account.auth_subject.clone())),
-        identity
-            .provider_account_id
-            .or_else(|| matched.and_then(|account| account.provider_account_id.clone())),
+        provider_account_id_after_auth(&identity, matched),
         home_path,
         source,
         matched
@@ -621,7 +690,10 @@ fn build_discovered_account(
         matched
             .and_then(|account| account.last_authenticated_at)
             .or(Some(discovered_at)),
-    )
+    );
+    discovered.workspace_account_id =
+        matched.and_then(|account| account.workspace_account_id.clone());
+    discovered
 }
 
 fn directory_timestamp(path: &Path) -> DateTime<Utc> {
@@ -1007,6 +1079,117 @@ mod tests {
         assert!(other_home.exists());
 
         super::super::file_locations::clear_app_support_directory_override();
+    }
+
+    #[test]
+    fn removing_stale_account_preserves_replacement_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        super::super::file_locations::with_app_support_directory(dir.path().to_path_buf());
+        let home = dir.path().join("managed-homes/replaced");
+        std::fs::create_dir_all(&home).unwrap();
+        let stale = make_account(home.clone(), "old@example.com", "old-id");
+        write_auth(&home, "new@example.com", "new-id");
+        let before = std::fs::read(home.join("auth.json")).unwrap();
+        assert!(
+            CodexAccountManager::new()
+                .remove_managed_files_if_owned(&stale)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), before);
+        super::super::file_locations::clear_app_support_directory_override();
+    }
+
+    #[test]
+    fn same_identity_switch_preserves_auth_and_has_no_session_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let ambient = dir.path().join("ambient");
+        let saved = dir.path().join("managed-homes/saved");
+        let session = dir.path().join("session");
+        for path in [&ambient, &saved, &session] {
+            fs::create_dir_all(path).unwrap();
+        }
+        write_auth(&ambient, "same@example.com", "same-id");
+        write_auth(&saved, "same@example.com", "same-id");
+        fs::write(session.join("Preferences"), "current-session").unwrap();
+        let auth_before = fs::read(ambient.join("auth.json")).unwrap();
+        super::super::file_locations::with_app_support_directory(dir.path().to_path_buf());
+        super::super::file_locations::with_ambient_codex_home(ambient.clone());
+        super::super::file_locations::with_codex_desktop_session_root(session.clone());
+        for home in [ambient.clone(), saved] {
+            let target = make_account(home, "same@example.com", "same-id");
+            let result = CodexAccountManager::new()
+                .switch_active_account(&target, &[])
+                .unwrap();
+            assert!(result.backup_path.is_none());
+            assert!(result.materialized_account.is_none());
+            assert!(result.desktop_session_backup_path.is_none());
+            assert!(result.desktop_session_restore_path.is_none());
+            assert_eq!(fs::read(ambient.join("auth.json")).unwrap(), auth_before);
+            assert_eq!(
+                fs::read_to_string(session.join("Preferences")).unwrap(),
+                "current-session"
+            );
+        }
+        super::super::file_locations::clear_app_support_directory_override();
+        super::super::file_locations::clear_ambient_codex_home_override();
+        super::super::file_locations::clear_codex_desktop_session_root_override();
+    }
+
+    #[test]
+    fn switch_waits_for_credential_refresh_before_materializing_outgoing_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let ambient = dir.path().join("ambient");
+        let saved = dir.path().join("managed-homes/target");
+        fs::create_dir_all(&ambient).unwrap();
+        fs::create_dir_all(&saved).unwrap();
+        write_auth(&ambient, "old@example.com", "old-id");
+        write_auth(&saved, "new@example.com", "new-id");
+        let refresh_guard = super::super::CREDENTIAL_OPERATIONS.blocking_read();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let root = dir.path().to_path_buf();
+        let worker_ambient = ambient.clone();
+        let worker = std::thread::spawn(move || {
+            super::super::file_locations::with_app_support_directory(root.clone());
+            super::super::file_locations::with_ambient_codex_home(worker_ambient);
+            super::super::file_locations::with_codex_desktop_session_root(root.join("session"));
+            let target = make_account(saved, "new@example.com", "new-id");
+            ready_tx.send(()).unwrap();
+            let result = CodexAccountManager::new().switch_active_account(&target, &[]);
+            done_tx.send(result).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        let mut refreshed: serde_json::Value =
+            serde_json::from_slice(&fs::read(ambient.join("auth.json")).unwrap()).unwrap();
+        refreshed["tokens"]["access_token"] = serde_json::json!("rotated-old-token");
+        fs::write(
+            ambient.join("auth.json"),
+            serde_json::to_vec(&refreshed).unwrap(),
+        )
+        .unwrap();
+        drop(refresh_guard);
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        let materialized = result.materialized_account.unwrap();
+        let outgoing: serde_json::Value = serde_json::from_slice(
+            &fs::read(materialized.codex_home_path.join("auth.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(outgoing["tokens"]["access_token"], "rotated-old-token");
+        assert_eq!(
+            load_identity(&ambient)
+                .unwrap()
+                .provider_account_id
+                .as_deref(),
+            Some("new-id")
+        );
     }
 
     #[test]

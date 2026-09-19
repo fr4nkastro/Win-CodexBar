@@ -12,16 +12,8 @@
  */
 :root {
   color-scheme: dark;
-  /* SF-system stack first so the rendered text matches macOS upstream
-     when the host font is available; Inter / Segoe UI remain as the
-     Windows fallbacks. */
-  font-family:
-    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro",
-    "Segoe UI Variable", Inter, "Segoe UI", system-ui, sans-serif;
-  /* Force macOS-style thin font rendering instead of Windows ClearType
-     heavy strokes. WebView2 (Chromium) respects this. */
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  --font-ui: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-family: var(--font-ui);
   text-rendering: optimizeLegibility;
   background: var(--app-bg, #1c1c1e);
   color: var(--text-primary, #f5f5f7);
@@ -815,6 +807,10 @@ html {
 }
 
 .credential-card__link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
   font-size: 0.78rem;
   color: var(--text-eyebrow);
   text-decoration: none;
@@ -3832,17 +3828,7 @@ html:has(.menu-surface--tray) {
   margin-top: 0;
   font-size: 10px;
 }
-/* Hide pace section in tray — macOS doesn't show pace in the compact popover */
-.menu-surface--tray .menu-card__pace,
-.menu-surface--tray .menu-card__pace + .menu-card__divider,
-.menu-surface--tray .menu-card__content > .menu-card__divider:has(+ .menu-card__pace) {
-  display: none;
-}
-/* Hide large charts in tray; keep the compact local token/cost summary visible. */
-.menu-surface--tray .menu-card__charts,
-.menu-surface--tray .menu-card__local-chart {
-  display: none;
-}
+/* Secondary charts and pace are available inside the Usage details disclosure. */
 .menu-surface--tray .menu-card__local-grid {
   gap: 9px 20px;
 }
@@ -4057,6 +4043,24 @@ html:has(.menu-surface--tray) {
   text-transform: uppercase;
   letter-spacing: 0.03em;
   color: var(--provider-status-ok, #4ade80);
+}
+
+.codex-menu-accounts__usage {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-width: 0;
+  font-size: 0.66rem;
+  color: var(--provider-row-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.codex-menu-accounts__usage > span + span::before {
+  content: "·";
+  margin: 0 5px;
+  opacity: 0.65;
 }
 
 .codex-menu-accounts__bar {
@@ -4460,6 +4464,17 @@ html:has(.menu-surface--tray) {
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
   flex: 0 0 auto;
+}
+
+/* A live forecast is its own full-width row. Release the base percent label's
+   no-shrink rule so refreshed text is constrained by the row and tail-truncated
+   inside the fixed tray width instead of painting past it. */
+.menu-metric__forecast .menu-metric__pct {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .menu-metric__reset {
@@ -5485,17 +5500,29 @@ html:has(.menu-surface--tray) {
 .select {
   appearance: none;
   -webkit-appearance: none;
-  padding: 0 10px;
+  padding: 0 28px 0 10px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238e8e93'/%3E%3C/svg%3E");
+  background-size: 10px 6px;
+  background-repeat: no-repeat;
+  background-position: right 10px center;
   line-height: 20px;
-  color-scheme: light;
 }
-.select option {
-  color: #000;
-  background: #fff;
+[data-theme="dark"] .select,
+[data-theme="dark"] .provider-detail-select,
+[data-theme="dark"] .settings-select {
+  color-scheme: dark;
 }
-.select option:checked {
-  color: #000;
-  background: #dceeff;
+[data-theme="dark"] .select option,
+[data-theme="dark"] .provider-detail-select option,
+[data-theme="dark"] .settings-select option {
+  color: var(--text-primary);
+  background: var(--app-bg);
+}
+[data-theme="dark"] .select option:checked,
+[data-theme="dark"] .provider-detail-select option:checked,
+[data-theme="dark"] .settings-select option:checked {
+  color: #fff;
+  background: var(--accent);
 }
 .text-input {
   padding: 0 10px;
@@ -5513,22 +5540,26 @@ html:has(.menu-surface--tray) {
   line-height: 20px;
 }
 [data-theme="light"] .select,
+[data-theme="light"] .provider-detail-select,
+[data-theme="light"] .settings-select {
+  color-scheme: light;
+}
+[data-theme="light"] .select,
 [data-theme="light"] .number-input,
 [data-theme="light"] .text-input {
-  background: #fff;
+  background-color: #fff;
   border: 1px solid rgba(0, 0, 0, 0.12);
   box-shadow: none;
 }
-[data-theme="light"] .select {
-  background-image:
-    linear-gradient(45deg, transparent 50%, var(--text-secondary) 50%),
-    linear-gradient(135deg, var(--text-secondary) 50%, transparent 50%);
-}
-[data-theme="light"] .select option {
+[data-theme="light"] .select option,
+[data-theme="light"] .provider-detail-select option,
+[data-theme="light"] .settings-select option {
   background: #fff;
   color: var(--text-primary);
 }
-[data-theme="light"] .select option:checked {
+[data-theme="light"] .select option:checked,
+[data-theme="light"] .provider-detail-select option:checked,
+[data-theme="light"] .settings-select option:checked {
   background: var(--accent);
   color: #fff;
 }
@@ -6174,4 +6205,16 @@ html:has(.menu-surface--tray) {
 .menu-card__monthly-spend {
   margin-top: 4px;
   font-weight: 500;
+}
+/* Shared Windows typography and control sizing. */
+button, input, select, textarea {
+  font-family: var(--font-ui);
+}
+
+
+.select, .number-input, .text-input {
+  min-height: 28px;
+}
+.select {
+  max-width: 240px;
 }

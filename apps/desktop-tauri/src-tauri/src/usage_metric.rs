@@ -93,6 +93,15 @@ fn automatic_window(
     snapshot: &ProviderUsageSnapshot,
     provider: Option<ProviderId>,
 ) -> Option<RateWindowSnapshot> {
+    // Cursor's Auto usage is the monthly included allowance, surfaced by the
+    // provider in the semantic secondary slot. Do not let a higher percentage
+    // in the aggregate or API slot change which quota Automatic represents.
+    if provider == Some(ProviderId::Cursor)
+        && let Some(semantic_monthly) = non_informational(snapshot.secondary.as_ref())
+    {
+        return Some(semantic_monthly.clone());
+    }
+
     if provider == Some(ProviderId::Claude) {
         let weekly = non_informational(snapshot.secondary.as_ref());
         if let (Some(model), Some(weekly)) = (snapshot.model_specific.as_ref(), weekly) {
@@ -107,20 +116,69 @@ fn automatic_window(
         }
     }
 
-    highest_window(
-        std::iter::once(&snapshot.primary)
-            .chain(snapshot.secondary.iter())
-            .chain(snapshot.model_specific.iter())
-            .chain(snapshot.tertiary.iter())
-            .chain(
-                snapshot
-                    .extra_rate_windows
-                    .iter()
-                    .map(|extra| &extra.window),
-            )
-            .filter(|window| !window.is_informational),
-    )
-    .cloned()
+    let policy = automatic_metric_policy(provider);
+    let mut windows = Vec::with_capacity(4 + snapshot.extra_rate_windows.len());
+    windows.push(&snapshot.primary);
+    windows.extend(snapshot.secondary.iter());
+    windows.extend(snapshot.model_specific.iter());
+    windows.extend(snapshot.tertiary.iter());
+    if policy.uses_extra_windows {
+        windows.extend(
+            snapshot
+                .extra_rate_windows
+                .iter()
+                .map(|extra| &extra.window),
+        );
+    }
+    let windows = windows
+        .into_iter()
+        .filter(|window| !window.is_informational);
+    let selected = if policy.prefers_available_window {
+        highest_available_window(windows)
+    } else if policy.prioritizes_exhausted_window {
+        highest_automatic_window(windows)
+    } else {
+        highest_window(windows)
+    };
+
+    selected.cloned()
+}
+
+#[derive(Clone, Copy)]
+struct AutomaticMetricPolicy {
+    prefers_available_window: bool,
+    prioritizes_exhausted_window: bool,
+    uses_extra_windows: bool,
+}
+
+fn automatic_metric_policy(provider: Option<ProviderId>) -> AutomaticMetricPolicy {
+    match provider {
+        Some(ProviderId::Antigravity) => AutomaticMetricPolicy {
+            prefers_available_window: true,
+            prioritizes_exhausted_window: false,
+            uses_extra_windows: false,
+        },
+        // Cursor's monthly Auto lane is the semantic weekly pace. Grok Bot is
+        // a named extra allowance and must stay available through the explicit
+        // ExtraUsage preference without changing the automatic bar.
+        Some(ProviderId::Cursor) => AutomaticMetricPolicy {
+            prefers_available_window: false,
+            prioritizes_exhausted_window: codexbar::core::instantiate_provider(ProviderId::Cursor)
+                .automatic_metric_prioritizes_exhausted_window(),
+            uses_extra_windows: false,
+        },
+        Some(id) => AutomaticMetricPolicy {
+            prefers_available_window: false,
+            prioritizes_exhausted_window: codexbar::core::instantiate_provider(id)
+                .automatic_metric_prioritizes_exhausted_window(),
+            uses_extra_windows: true,
+        },
+        None => AutomaticMetricPolicy {
+            prefers_available_window: false,
+            prioritizes_exhausted_window: true,
+            uses_extra_windows: true,
+        },
+    }
 }
 
 fn average_window(snapshot: &ProviderUsageSnapshot) -> Option<RateWindowSnapshot> {
@@ -187,6 +245,37 @@ fn highest_window<'a>(
     })
 }
 
+fn highest_available_window<'a>(
+    windows: impl Iterator<Item = &'a RateWindowSnapshot>,
+) -> Option<&'a RateWindowSnapshot> {
+    let windows = windows.collect::<Vec<_>>();
+    highest_window(
+        windows
+            .iter()
+            .copied()
+            .filter(|window| !automatic_window_is_exhausted(window)),
+    )
+    .or_else(|| highest_window(windows.into_iter()))
+}
+
+fn highest_automatic_window<'a>(
+    windows: impl Iterator<Item = &'a RateWindowSnapshot>,
+) -> Option<&'a RateWindowSnapshot> {
+    windows.max_by(|a, b| {
+        automatic_window_is_exhausted(a)
+            .cmp(&automatic_window_is_exhausted(b))
+            .then_with(|| {
+                a.used_percent
+                    .partial_cmp(&b.used_percent)
+                    .unwrap_or(Ordering::Equal)
+            })
+    })
+}
+
+fn automatic_window_is_exhausted(window: &RateWindowSnapshot) -> bool {
+    window.is_exhausted || window.used_percent >= 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,10 +299,13 @@ mod tests {
             cost: None,
             plan_name: None,
             account_email: None,
+            subscription: None,
             source_label: "test".to_string(),
+            has_successful_claude_cli_quota: false,
             updated_at: "2026-08-16T00:00:00Z".to_string(),
             error: None,
             transient: false,
+            error_state: codexbar::core::ProviderStateKind::Ready,
             pace: None,
             account_organization: None,
             tray_status_label: None,
@@ -257,6 +349,138 @@ mod tests {
             selected_usage_window(&snapshot, &Settings::default()).used_percent,
             60.0
         );
+    }
+
+    #[test]
+    fn cursor_automatic_uses_semantic_monthly_lane_and_keeps_grok_bot_explicit() {
+        let mut snapshot = snapshot();
+        snapshot.provider_id = "cursor".to_string();
+        snapshot.primary = window(85.0);
+        snapshot.secondary = Some(window(20.0));
+        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
+            id: "cursor-grok-bot".to_string(),
+            title: "Grok Bot".to_string(),
+            window: window(95.0),
+        }];
+
+        assert_eq!(
+            selected_usage_window(&snapshot, &Settings::default()).used_percent,
+            20.0
+        );
+
+        let mut settings = Settings::default();
+        settings.set_provider_metric(ProviderId::Cursor, MetricPreference::ExtraUsage);
+        assert_eq!(
+            selected_usage_window(&snapshot, &settings).used_percent,
+            95.0
+        );
+    }
+
+    #[test]
+    fn opencodego_automatic_prefers_explicitly_exhausted_window_over_higher_percentage() {
+        let mut snapshot = snapshot();
+        snapshot.provider_id = "opencodego".to_string();
+        snapshot.primary.is_exhausted = true;
+
+        let selected = selected_usage_window(&snapshot, &Settings::default());
+
+        assert_eq!(selected.used_percent, 20.0);
+        assert!(selected.is_exhausted);
+    }
+
+    #[test]
+    fn claude_and_codex_automatic_keep_highest_used_window() {
+        for provider_id in ["claude", "codex"] {
+            let mut snapshot = snapshot();
+            snapshot.provider_id = provider_id.to_string();
+            snapshot.primary.is_exhausted = true;
+
+            let selected = selected_usage_window(&snapshot, &Settings::default());
+
+            assert_eq!(
+                selected.used_percent, 60.0,
+                "{provider_id} should keep highest-used automatic selection"
+            );
+            assert!(!selected.is_exhausted);
+        }
+    }
+
+    #[test]
+    fn automatic_treats_a_full_window_as_exhausted_even_without_the_flag() {
+        let mut snapshot = snapshot();
+        let mut full = window(100.0);
+        full.is_exhausted = false;
+        snapshot.tertiary = Some(full);
+
+        let selected = selected_usage_window(&snapshot, &Settings::default());
+
+        assert_eq!(selected.used_percent, 100.0);
+        assert!(!selected.is_exhausted);
+    }
+
+    #[test]
+    fn non_automatic_highest_window_keeps_percentage_order() {
+        let healthy = window(80.0);
+        let mut exhausted = window(20.0);
+        exhausted.is_exhausted = true;
+
+        let selected = highest_window([&healthy, &exhausted].into_iter()).expect("window");
+
+        assert_eq!(selected.used_percent, 80.0);
+    }
+
+    #[test]
+    fn antigravity_automatic_prefers_active_core_quota_over_exhausted_extra_window() {
+        let mut snapshot = snapshot();
+        snapshot.provider_id = "antigravity".to_string();
+        snapshot.primary = window(100.0);
+        snapshot.primary.is_exhausted = true;
+        snapshot.primary_label = Some("Gemini 5h".to_string());
+        snapshot.secondary = Some(window(88.0));
+        snapshot.secondary_label = Some("Gemini Weekly".to_string());
+        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
+            id: "antigravity-quota-summary-3p-weekly".to_string(),
+            title: "Claude/GPT weekly".to_string(),
+            window: window(100.0),
+        }];
+
+        let selected = selected_usage_window(&snapshot, &Settings::default());
+
+        assert_eq!(selected.used_percent, 88.0);
+        assert!(!selected.is_exhausted);
+    }
+
+    #[test]
+    fn antigravity_automatic_uses_core_slots_only() {
+        let mut snapshot = snapshot();
+        snapshot.provider_id = "antigravity".to_string();
+        snapshot.primary = window(80.0);
+        snapshot.secondary = Some(window(20.0));
+        snapshot.model_specific = Some(window(90.0));
+        snapshot.extra_rate_windows = vec![crate::commands::NamedRateWindowSnapshot {
+            id: "legacy-other".to_string(),
+            title: "Other".to_string(),
+            window: window(100.0),
+        }];
+
+        let selected = selected_usage_window(&snapshot, &Settings::default());
+
+        assert_eq!(selected.used_percent, 90.0);
+    }
+
+    #[test]
+    fn single_meaningful_quota_omits_the_companion_icon_lane() {
+        let mut snapshot = snapshot();
+        snapshot
+            .secondary
+            .as_mut()
+            .expect("fixture has a secondary window")
+            .is_informational = true;
+
+        let (selected, companion) = selected_usage_icon_windows(&snapshot, &Settings::default());
+
+        assert_eq!(selected.used_percent, 20.0);
+        assert!(companion.is_none());
     }
 
     #[test]

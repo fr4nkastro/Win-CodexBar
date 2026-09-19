@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useLocale } from "../../../hooks/useLocale";
 import {
+  getSafeDiagnostics,
   registerGlobalShortcut,
   unregisterGlobalShortcut,
 } from "../../../lib/tauri";
@@ -26,12 +27,38 @@ function parseSshHosts(value: string): string[] {
 export default function AdvancedTab({ settings, set, saving }: TabProps) {
   const { t } = useLocale();
   const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const [diagnosticsStatus, setDiagnosticsStatus] = useState<string | null>(
+    null,
+  );
   const [codexDirsDraft, setCodexDirsDraft] = useState(() =>
     formatCodexSessionsDirs(settings.codexCustomSessionsDirs),
   );
   const [sshHostsDraft, setSshHostsDraft] = useState(() =>
     (settings.agentSessionSshHosts ?? []).join(", "),
   );
+  const [proxyUrlDraft, setProxyUrlDraft] = useState(() =>
+    settings.httpProxyUrl ?? "",
+  );
+  const [proxyUsernameDraft, setProxyUsernameDraft] = useState(() =>
+    settings.httpProxyUsername ?? "",
+  );
+  const [proxyPasswordDraft, setProxyPasswordDraft] = useState(() =>
+    settings.httpProxyPassword ?? "",
+  );
+
+  const copyDiagnostics = useCallback(async () => {
+    try {
+      const text = await getSafeDiagnostics();
+      await navigator.clipboard.writeText(text);
+      setDiagnosticsStatus(t("DiagnosticsCopied"));
+    } catch (error) {
+      setDiagnosticsStatus(`${t("DiagnosticsCopyFailed")} ${String(error)}`);
+    }
+  }, [t]);
+
+  const commitCodexDirs = useCallback(() => {
+    set({ codexCustomSessionsDirs: parseCodexSessionsDirs(codexDirsDraft) });
+  }, [codexDirsDraft, set]);
 
   useEffect(() => {
     if (!saving) {
@@ -42,6 +69,34 @@ export default function AdvancedTab({ settings, set, saving }: TabProps) {
   useEffect(() => {
     if (!saving) setSshHostsDraft((settings.agentSessionSshHosts ?? []).join(", "));
   }, [saving, settings.agentSessionSshHosts]);
+
+  useEffect(() => {
+    if (!saving) setProxyUrlDraft(settings.httpProxyUrl ?? "");
+  }, [saving, settings.httpProxyUrl]);
+
+  useEffect(() => {
+    if (!saving) setProxyUsernameDraft(settings.httpProxyUsername ?? "");
+  }, [saving, settings.httpProxyUsername]);
+
+  useEffect(() => {
+    if (!saving) setProxyPasswordDraft(settings.httpProxyPassword ?? "");
+  }, [saving, settings.httpProxyPassword]);
+
+  const commitProxyUrl = useCallback(() => {
+    const next = proxyUrlDraft.trim();
+    if (next !== (settings.httpProxyUrl ?? "")) set({ httpProxyUrl: next });
+  }, [proxyUrlDraft, set, settings.httpProxyUrl]);
+
+  const commitProxyUsername = useCallback(() => {
+    const next = proxyUsernameDraft.trim();
+    if (next !== (settings.httpProxyUsername ?? "")) set({ httpProxyUsername: next });
+  }, [proxyUsernameDraft, set, settings.httpProxyUsername]);
+
+  const commitProxyPassword = useCallback(() => {
+    if (proxyPasswordDraft !== (settings.httpProxyPassword ?? "")) {
+      set({ httpProxyPassword: proxyPasswordDraft });
+    }
+  }, [proxyPasswordDraft, set, settings.httpProxyPassword]);
 
   const commitShortcut = useCallback(
     async (accelerator: string) => {
@@ -66,9 +121,6 @@ export default function AdvancedTab({ settings, set, saving }: TabProps) {
     }
   }, [set]);
 
-  const commitCodexDirs = useCallback(() => {
-    set({ codexCustomSessionsDirs: parseCodexSessionsDirs(codexDirsDraft) });
-  }, [codexDirsDraft, set]);
 
   return (
     <>
@@ -220,26 +272,29 @@ export default function AdvancedTab({ settings, set, saving }: TabProps) {
             <input
               type="text"
               className="text-input"
-              value={settings.httpProxyUrl ?? ""}
+              value={proxyUrlDraft}
               placeholder="http://127.0.0.1:7890"
               aria-label={t("NetworkProxyUrlLabel")}
               disabled={saving || !settings.httpProxyEnabled}
-              onChange={(event) => set({ httpProxyUrl: event.target.value })}
-              onBlur={(event) =>
-                set({ httpProxyUrl: event.target.value.trim() })
-              }
+              onChange={(event) => setProxyUrlDraft(event.target.value)}
+              onBlur={commitProxyUrl}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
             />
           </Field>
           <Field label={t("NetworkProxyUserLabel")}>
             <input
               type="text"
               className="text-input"
-              value={settings.httpProxyUsername ?? ""}
+              value={proxyUsernameDraft}
               autoComplete="off"
               disabled={saving || !settings.httpProxyEnabled}
-              onChange={(event) =>
-                set({ httpProxyUsername: event.target.value })
-              }
+              onChange={(event) => setProxyUsernameDraft(event.target.value)}
+              onBlur={commitProxyUsername}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
             />
           </Field>
           <Field
@@ -249,12 +304,14 @@ export default function AdvancedTab({ settings, set, saving }: TabProps) {
             <input
               type="password"
               className="text-input"
-              value={settings.httpProxyPassword ?? ""}
+              value={proxyPasswordDraft}
               autoComplete="new-password"
               disabled={saving || !settings.httpProxyEnabled}
-              onChange={(event) =>
-                set({ httpProxyPassword: event.target.value })
-              }
+              onChange={(event) => setProxyPasswordDraft(event.target.value)}
+              onBlur={commitProxyPassword}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
             />
           </Field>
         </div>
@@ -312,6 +369,25 @@ export default function AdvancedTab({ settings, set, saving }: TabProps) {
               onChange={(v) => set({ claudeAvoidKeychainPrompts: v })}
             />
           </Field>
+        </div>
+      </section>
+
+      {/* ── Diagnostics ──────────────────────────────────────────── */}
+      <section className="settings-section">
+        <h3 className="settings-section__title settings-section__title--bold">
+          {t("DiagnosticsSectionHeading")}
+        </h3>
+        <div className="settings-section__group">
+          <button
+            type="button"
+            className="credential-btn"
+            onClick={() => void copyDiagnostics()}
+          >
+            {t("DiagnosticsCopyButton")}
+          </button>
+          {diagnosticsStatus && (
+            <p className="settings-section__hint">{diagnosticsStatus}</p>
+          )}
         </div>
       </section>
     </>

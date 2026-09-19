@@ -19,6 +19,7 @@ import {
 } from "../lib/tauri";
 import { ProviderIcon } from "../components/providers/ProviderIcon";
 import { getProviderIcon } from "../components/providers/providerIcons";
+import { describeProviderState } from "../lib/providerState";
 import type {
   BootstrapState,
   ProviderLocalUsageSummary,
@@ -55,7 +56,27 @@ function ResetIcon({ size }: { size: number }) {
   );
 }
 
-function inlineResetTime(resetText: string): string {
+function inlineResetTime(
+  resetText: string,
+  resetsAt: string | null,
+  relative: boolean,
+): string {
+  if (relative && resetsAt) {
+    const target = Date.parse(resetsAt);
+    if (!Number.isNaN(target)) {
+      const diffMs = target - Date.now();
+      if (diffMs <= 0) return "now";
+
+      const totalMinutes = Math.max(1, Math.floor(diffMs / 60_000));
+      const days = Math.floor(totalMinutes / 1440);
+      const hours = Math.floor((totalMinutes % 1440) / 60);
+      const minutes = totalMinutes % 60;
+      if (days > 0) return `${days}d ${hours}h`;
+      if (hours > 0) return `${hours}h ${minutes}m`;
+      return `${minutes}m`;
+    }
+  }
+
   const normalized = resetText.trim();
   if (/^reset(?:s|ting)?(?:\s+due)?\s*(?:now)?$/i.test(normalized)) {
     return "now";
@@ -98,11 +119,13 @@ function CostPill({
   scale,
   todayLabel,
   thirtyDayLabel,
+  estimateLabel,
 }: {
   summary: FloatBarCostSummary;
   scale: number;
   todayLabel: string;
   thirtyDayLabel: string;
+  estimateLabel: string;
 }) {
   const today = formatUsd(summary.todayCost);
   const thirtyDay = formatUsd(summary.thirtyDayCost);
@@ -118,7 +141,7 @@ function CostPill({
   return (
     <div
       className="floatbar__cost-pill"
-      title={`${summary.displayName}: ${title}`}
+      title={`${summary.displayName}: ${title} (${estimateLabel})`}
       data-tauri-drag-region
       style={{ "--brand": brand } as CSSProperties}
     >
@@ -147,6 +170,9 @@ function CostPill({
           </span>
         )}
       </span>
+      <span className="floatbar__cost-estimate" data-tauri-drag-region>
+        {estimateLabel}
+      </span>
     </div>
   );
 }
@@ -167,6 +193,7 @@ function ProviderPill({
   resetRelative,
   usedSuffix,
   remainingSuffix,
+  stateLabel,
 }: {
   provider: ProviderUsageSnapshot;
   highRemaining: number;
@@ -177,33 +204,41 @@ function ProviderPill({
   resetRelative: boolean;
   usedSuffix: string;
   remainingSuffix: string;
+  stateLabel: string;
 }) {
   const rateWindow = provider.selectedMetric;
   const remaining = Math.max(0, Math.min(100, rateWindow.remainingPercent));
   const used = Math.max(0, Math.min(100, rateWindow.usedPercent));
   const displayPercent = showAsUsed ? used : remaining;
   const displaySuffix = showAsUsed ? usedSuffix : remainingSuffix;
-  const exhausted = rateWindow.isExhausted || provider.error;
+  const state = describeProviderState(provider.errorState);
+  const exhausted = rateWindow.isExhausted || state.isProblem;
   let tone: "ok" | "warn" | "crit" = "ok";
   if (exhausted || remaining <= critRemaining) tone = "crit";
   else if (remaining <= highRemaining) tone = "warn";
 
   const brand = getProviderIcon(provider.providerId).brandColor;
-  const label = provider.error ? "—" : `${Math.round(displayPercent)}%`;
+  const label = state.isProblem ? stateLabel : `${Math.round(displayPercent)}%`;
   const resetText = useFormattedResetTime(
     rateWindow.resetsAt,
     rateWindow.resetDescription,
     resetRelative,
   );
   const resetSuffix = resetText ? `\n${resetText}` : "";
-  const inlineReset = resetText ? inlineResetTime(resetText) : null;
+  const inlineReset = resetText
+    ? inlineResetTime(resetText, rateWindow.resetsAt, resetRelative)
+    : null;
   const iconSize = Math.round(11 * scale);
   const resetIconSize = Math.round(10 * scale);
 
   return (
     <div
       className={`floatbar__pill floatbar__pill--${tone}`}
-      title={`${provider.displayName}: ${label} ${displaySuffix}${resetSuffix}`}
+      title={
+        state.isProblem
+          ? `${provider.displayName}: ${stateLabel}`
+          : `${provider.displayName}: ${label} ${displaySuffix}${resetSuffix}`
+      }
       data-tauri-drag-region
       style={{ "--brand": brand } as CSSProperties}
     >
@@ -478,6 +513,7 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
               resetRelative={settings.resetTimeRelative}
               usedSuffix={t("PanelUsedSuffix")}
               remainingSuffix={t("FloatBarRemainingSuffix")}
+              stateLabel={t(describeProviderState(p.errorState).labelKey)}
             />
           ))}
           {visibleCosts.map((summary) => (
@@ -487,6 +523,7 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
               scale={scale}
               todayLabel={t("PanelToday")}
               thirtyDayLabel={t("FloatBarThirtyDayShort")}
+              estimateLabel={t("OverviewSpendEstimate")}
             />
           ))}
         </>

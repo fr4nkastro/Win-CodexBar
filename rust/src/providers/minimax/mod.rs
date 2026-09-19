@@ -6,10 +6,14 @@
 mod coding_plan;
 mod coding_plan_html;
 mod local_storage;
+mod remains_api;
 mod token_plan;
 
 // Re-exports for local storage import
-#[allow(unused_imports)]
+#[allow(
+    unused_imports,
+    reason = "imports needed for future MiniMax provider wiring"
+)]
 pub use local_storage::{ImportError, MiniMaxLocalStorageImporter, MiniMaxSession};
 
 use async_trait::async_trait;
@@ -264,10 +268,30 @@ impl MiniMaxProvider {
     /// Fetch usage via MiniMax API with region fallback
     async fn fetch_via_web(
         &self,
+        ctx: &FetchContext,
         region: MiniMaxRegion,
     ) -> Result<ProviderFetchResult, ProviderError> {
-        let (group_id, api_key) = self.read_api_key().await?;
+        // Prefer the coding-plan remains endpoint (Win-CodexBar #425): the
+        // console's usage/plan pages are client-rendered (Next.js `ssr:false`),
+        // so no server HTML ever contains real numbers, even with a valid
+        // cookie. The underlying `coding_plan/remains` endpoint instead
+        // accepts a plain `Authorization: Bearer <api_key>` with no cookie at
+        // all (no group_id needed), and returns the same `model_remains`
+        // shape the cookie-based parser already understands. This key can
+        // come from Settings (GUI-stored) or the environment, independent of
+        // the dual group_id+api_key credential the legacy billing endpoint
+        // below requires.
+        if let Some(key) = Self::read_plain_api_key(ctx) {
+            match remains_api::fetch_remains_via_api_key(&key, region).await {
+                Ok(result) => return Ok(result),
+                // Endpoint/shape incompatibility may still use the legacy
+                // group-id path. Auth and transport failures are authoritative.
+                Err(ProviderError::Parse(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
 
+        let (group_id, api_key) = self.read_api_key().await?;
         match self.fetch_from_region(&group_id, &api_key, region).await {
             Ok(result) => Ok(result),
             Err(ProviderError::AuthRequired) if region == MiniMaxRegion::Global => {
@@ -276,6 +300,11 @@ impl MiniMaxProvider {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// A plain MiniMax API key from Settings or `MINIMAX_API_KEY`.
+    fn read_plain_api_key(ctx: &FetchContext) -> Option<String> {
+        remains_api::read_plain_api_key(ctx)
     }
 
     /// Fetch from a specific region endpoint
@@ -969,6 +998,10 @@ impl Default for MiniMaxProvider {
 
 #[async_trait]
 impl Provider for MiniMaxProvider {
+    fn automatic_metric_prioritizes_exhausted_window(&self) -> bool {
+        false
+    }
+
     fn id(&self) -> ProviderId {
         ProviderId::MiniMax
     }
@@ -997,14 +1030,14 @@ impl Provider for MiniMaxProvider {
                     return Ok(result);
                 }
                 // Fall through to API keys.
-                if let Ok(result) = self.fetch_via_web(region).await {
+                if let Ok(result) = self.fetch_via_web(ctx, region).await {
                     return Ok(result);
                 }
                 return Err(ProviderError::AuthRequired);
             }
             SourceMode::Web => match self.resolve_web_cookie(ctx, region)? {
                 Some(cookie) => self.fetch_with_cookie(&cookie, region).await,
-                None => self.fetch_via_web(region).await,
+                None => self.fetch_via_web(ctx, region).await,
             },
             SourceMode::Cli => Err(ProviderError::UnsupportedSource(SourceMode::Cli)),
             SourceMode::OAuth => Err(ProviderError::UnsupportedSource(SourceMode::OAuth)),

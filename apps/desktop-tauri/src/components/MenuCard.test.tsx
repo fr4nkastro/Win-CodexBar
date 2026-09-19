@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -6,6 +7,7 @@ const tauriMocks = vi.hoisted(() => ({
   getDeepSeekPricingStatus: vi.fn(),
   getLocaleStrings: vi.fn(),
   setUiLanguage: vi.fn(),
+  getClaudeAccountsState: vi.fn(),
 }));
 
 const eventMocks = vi.hoisted(() => ({
@@ -71,6 +73,7 @@ function provider(
     sourceLabel: "oauth",
     updatedAt: "2026-05-24T00:00:00Z",
     error,
+    errorState: "unknown",
     pace: null,
     accountOrganization: null,
     trayStatusLabel: null,
@@ -85,6 +88,7 @@ function renderCard(
     showResetWhenExhausted?: boolean;
     showPace?: boolean;
     onLayoutChange?: () => void;
+    costSummaryDisplayStyle?: "compact" | "detailed" | "hidden";
   } = {},
 ) {
   return render(
@@ -97,6 +101,7 @@ function renderCard(
           showAsUsed: opts.showAsUsed,
           showResetWhenExhausted: opts.showResetWhenExhausted,
           showPace: opts.showPace,
+          costSummaryDisplayStyle: opts.costSummaryDisplayStyle,
         }}
         onLayoutChange={opts.onLayoutChange}
       />
@@ -107,9 +112,15 @@ function renderCard(
 describe("MenuCard", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    tauriMocks.getClaudeAccountsState.mockResolvedValue({
+      accounts: [],
+      snapshots: {},
+      activeAccountId: null,
+    });
     tauriMocks.getLocaleStrings.mockResolvedValue(
       buildBundle({
         ActionCopyError: "Copy error",
+        ApiSpendTitle: "API spend",
         DetailPaceRunsOutIn: "Runs out in",
         PanelEstimatedFromLocalLogs: "Estimated from local logs",
         PanelLeftSuffix: "left",
@@ -166,6 +177,31 @@ describe("MenuCard", () => {
     eventMocks.listen.mockResolvedValue(() => {});
   });
 
+  it("keeps Fireworks vendor API spend visible when local cost summaries are hidden", async () => {
+    const snapshot = provider(null, 0);
+    snapshot.providerId = "fireworks";
+    snapshot.displayName = "Fireworks";
+    snapshot.cost = {
+      used: 12.34,
+      limit: null,
+      remaining: null,
+      currencyCode: "USD",
+      currencySymbol: "$",
+      period: "30 days",
+      resetsAt: null,
+      formattedUsed: "$12.34",
+      formattedLimit: null,
+      balance: null,
+      formattedBalance: null,
+      daily: [],
+      alwaysVisible: true,
+    };
+
+    renderCard(snapshot, { costSummaryDisplayStyle: "hidden" });
+
+    expect(await screen.findByText("API spend")).toBeInTheDocument();
+    expect(document.querySelector(".menu-card__cost-line")).toHaveTextContent("$12.34");
+  });
   it("does not mix stale local usage into an error card", async () => {
     const { container } = renderCard(
       provider("OAuth error: Claude OAuth credentials not found."),
@@ -258,6 +294,35 @@ describe("MenuCard", () => {
 
     expect(await screen.findByText("Additional Budget")).toBeInTheDocument();
     expect(screen.getByText("58% left")).toBeInTheDocument();
+  });
+
+  it("localizes Claude scoped weekly extra-window labels", async () => {
+    tauriMocks.getLocaleStrings.mockResolvedValue(buildBundle({ ClaudeScopedWeeklyLabel: "{} weekly" }));
+    const snapshot = provider(null, 20);
+    snapshot.extraRateWindows = [
+      {
+        id: "claude-weekly-scoped-fable",
+        title: "Fable only",
+        window: rateWindow(42, { windowMinutes: 7 * 24 * 60 }),
+      },
+      {
+        id: "custom",
+        title: "Custom only",
+        window: rateWindow(10),
+      },
+    ];
+
+    renderCard(snapshot);
+
+    expect(await screen.findByText("Fable weekly")).toBeInTheDocument();
+    expect(screen.getByText("Custom only")).toBeInTheDocument();
+    expect(screen.queryByText("Fable only")).not.toBeInTheDocument();
+
+    const otherProvider = provider(null, 20);
+    otherProvider.providerId = "synthetic";
+    otherProvider.extraRateWindows = [{ ...snapshot.extraRateWindows[0], id: "synthetic-weekly" }];
+    renderCard(otherProvider);
+    expect(await screen.findByText("Fable only")).toBeInTheDocument();
   });
 
   it("renders informational metrics without quota percentages", async () => {
@@ -454,6 +519,41 @@ describe("MenuCard", () => {
     expect(container.querySelector(".menu-metric__forecast")).not.toBeInTheDocument();
   });
 
+  it("hides derived pace advice for local OpenCode Go estimates", async () => {
+    const resetAt = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+    const snapshot = provider(null, 12);
+    snapshot.providerId = "opencodego";
+    snapshot.displayName = "OpenCode Go";
+    snapshot.sourceLabel = "local estimate";
+    snapshot.primary = rateWindow(12, {
+      windowMinutes: 5 * 60,
+      resetsAt: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+    });
+    snapshot.secondary = rateWindow(23, {
+      windowMinutes: 7 * 24 * 60,
+      resetsAt: resetAt.toISOString(),
+      reservePercent: 34,
+      reserveWillLastToReset: true,
+    });
+    snapshot.pace = {
+      stage: "far_ahead",
+      deltaPercent: 20,
+      expectedUsedPercent: 20,
+      actualUsedPercent: 40,
+      etaSeconds: 90 * 60,
+      willLastToReset: false,
+    };
+
+    const { container } = renderCard(snapshot);
+
+    expect(await screen.findByText("88% left")).toBeInTheDocument();
+    expect(screen.getByText("77% left")).toBeInTheDocument();
+    expect(container.querySelector(".menu-card__pace")).not.toBeInTheDocument();
+    expect(screen.queryByText("On-pace budget")).not.toBeInTheDocument();
+    expect(screen.queryByText(/in reserve/)).not.toBeInTheDocument();
+    expect(container.querySelector(".menu-metric__forecast")).not.toBeInTheDocument();
+  });
+
   it("renders local token and cost totals after chart data loads", async () => {
     const { container } = renderCard(provider(null));
 
@@ -464,6 +564,37 @@ describe("MenuCard", () => {
     expect(screen.getByText("30d tokens")).toBeInTheDocument();
     expect(screen.getByText("584K")).toBeInTheDocument();
     expect(screen.getByText("Estimated from local logs")).toBeInTheDocument();
+    const details = container.querySelector<HTMLDetailsElement>(".menu-card__more")!;
+    expect(details.open).toBe(false);
+    fireEvent.click(details.querySelector("summary")!);
+    expect(details.open).toBe(true);
+  });
+
+  it("places Claude accounts above metrics and the collapsed usage details", async () => {
+    const claudeAccount = (id: string, email: string) => ({
+      id,
+      nickname: null,
+      emailHint: email,
+      orgId: null,
+      orgName: null,
+      subscriptionType: null,
+      claudeConfigDir: `C:/claude/${id}`,
+      source: "managedByApp" as const,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      lastAuthenticatedAt: null,
+    });
+    tauriMocks.getClaudeAccountsState.mockResolvedValue({
+      accounts: [claudeAccount("a", "a@example.com"), claudeAccount("b", "b@example.com")],
+      snapshots: {},
+      activeAccountId: "a",
+    });
+    const { container } = renderCard(provider(null));
+    await screen.findByText("ClaudeAccountsTitle");
+    const accounts = container.querySelector(".claude-menu-accounts")!;
+    const metrics = container.querySelector(".menu-card__metrics")!;
+    expect(accounts.compareDocumentPosition(metrics) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(container.querySelector<HTMLDetailsElement>(".menu-card__more")?.open).toBe(false);
   });
 
   it("shows on-pace budgets and expands projection details", async () => {
@@ -482,12 +613,13 @@ describe("MenuCard", () => {
     renderCard(snapshot, { onLayoutChange });
 
     const toggle = await screen.findByRole("button", { name: /On-pace budget/ });
-    expect(screen.getByText("now 20%")).toBeInTheDocument();
-    expect(screen.getByText("1h 21%")).toBeInTheDocument();
+    expect(screen.queryByText("now 20%")).not.toBeInTheDocument();
     expect(screen.queryByRole("img", { name: /PaceChartAriaLabel/i })).not.toBeInTheDocument();
 
     fireEvent.click(toggle);
 
+    expect(screen.getByText("now 20%")).toBeInTheDocument();
+    expect(screen.getByText("1h 21%")).toBeInTheDocument();
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("img", { name: /PaceChartAriaLabel/i })).toBeInTheDocument();
     await waitFor(() => {
@@ -505,12 +637,12 @@ describe("MenuCard", () => {
 
     renderCard(snapshot);
 
-    expect(
-      await screen.findByRole("button", { name: /On-pace budget/ }),
-    ).toBeInTheDocument();
-      expect(screen.getByText("now 0%")).toBeInTheDocument();
-      expect(screen.queryByText(/in reserve/)).not.toBeInTheDocument();
-      expect(screen.queryByText("Lasts until reset")).not.toBeInTheDocument();
+    const toggle = await screen.findByRole("button", { name: /On-pace budget/ });
+    expect(screen.queryByText("now 0%")).not.toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(screen.getByText("now 0%")).toBeInTheDocument();
+    expect(screen.queryByText(/in reserve/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Lasts until reset")).not.toBeInTheDocument();
   });
 
   it("does not show pace budgets for a five-hour session window", async () => {
@@ -653,5 +785,64 @@ describe("MenuCard", () => {
     expect(container.querySelector(".menu-card--error")).toBeInTheDocument();
     expect(container.querySelector(".menu-card--refreshing")).not.toBeInTheDocument();
     expect(screen.queryByText("SummaryRefreshing")).not.toBeInTheDocument();
+  });
+});
+
+// The SwiftUI fix this regression came from protecting a cached native
+// measurement. The Windows card has no cached measurement layer: its live
+// forecast is a normal flex row whose width is recomputed by WebView2.
+if (!import.meta.dirname) {
+  throw new Error("import.meta.dirname unavailable to vitest runner");
+}
+const stylesSource = readFileSync(import.meta.dirname + "/../styles.css", "utf8");
+
+function ruleBlock(source: string, selector: string): string {
+  const escaped = selector.replace(/[^\w-]/g, "\\$&");
+  const match = source.match(
+    new RegExp("(?:^|\\r?\\n)" + escaped + "\\s*\\{([^}]*)\\}"),
+  );
+  expect(match).not.toBeNull();
+  return match![1];
+}
+
+describe("MenuCard live forecast layout", () => {
+  it("renders the changing forecast in the current full-width flex row", async () => {
+    const snapshot = provider(null, 20);
+    snapshot.secondary = rateWindow(35, { windowMinutes: 7 * 24 * 60 });
+    snapshot.secondaryLabel = "Weekly";
+    snapshot.sessionEquivalentForecast = {
+      estimatedWindowsToExhaustWeekly: 123,
+      windowsUntilReset: 4,
+      availableWindowsUntilReset: 4,
+      sampleCount: 8,
+      weeklyResetsAt: "2026-06-01T00:00:00Z",
+      weeklyUsedPercent: 35,
+    };
+
+    const { container } = renderCard(snapshot);
+    const forecast = await screen.findByText("Estimated: 123 session quotas left");
+    const row = forecast.closest(".menu-metric__forecast");
+
+    expect(row).toBeInTheDocument();
+    expect(row).toHaveClass("menu-metric__row");
+    expect(row?.parentElement).toHaveClass("menu-metric");
+    expect(container.querySelector(".menu-card__content")).toBeInTheDocument();
+
+    const card = ruleBlock(stylesSource, ".menu-card");
+    expect(card).toContain("align-items: stretch");
+    const content = ruleBlock(stylesSource, ".menu-card__content");
+    expect(content).toContain("display: flex");
+    expect(content).toContain("flex-direction: column");
+    const metricRow = ruleBlock(stylesSource, ".menu-metric__row");
+    expect(metricRow).toContain("min-width: 0");
+    const forecastLabel = ruleBlock(
+      stylesSource,
+      ".menu-metric__forecast .menu-metric__pct",
+    );
+    expect(forecastLabel).toContain("flex: 1 1 auto");
+    expect(forecastLabel).toContain("min-width: 0");
+    expect(forecastLabel).toContain("overflow: hidden");
+    expect(forecastLabel).toContain("text-overflow: ellipsis");
+    expect(forecastLabel).toContain("white-space: nowrap");
   });
 });

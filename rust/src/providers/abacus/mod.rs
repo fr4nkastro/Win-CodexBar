@@ -15,6 +15,8 @@ use crate::core::{
 
 const COMPUTE_URL: &str = "https://apps.abacus.ai/api/_getOrganizationComputePoints";
 const BILLING_URL: &str = "https://apps.abacus.ai/api/_getBillingInfo";
+const CREDITS_LABEL: &str = "Credits";
+const FALLBACK_MONTHLY_WINDOW_MINUTES: u32 = 30 * 24 * 60;
 
 #[derive(Debug, Deserialize)]
 struct ApiEnvelope<T> {
@@ -52,7 +54,7 @@ impl AbacusProvider {
             metadata: ProviderMetadata {
                 id: ProviderId::Abacus,
                 display_name: "Abacus AI",
-                session_label: "Credits",
+                session_label: CREDITS_LABEL,
                 weekly_label: "",
                 supports_opus: false,
                 supports_credits: true,
@@ -81,17 +83,19 @@ impl AbacusProvider {
             0.0
         };
 
-        let mut primary = RateWindow::new(percent);
-        primary.reset_description = Some(format!("{:.0}/{:.0} cp", used, total));
+        let resets_at = billing
+            .as_ref()
+            .and_then(|b| b.next_billing_date.as_deref())
+            .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        let primary = RateWindow::with_details(
+            percent,
+            RateWindow::monthly_window_minutes(resets_at).or(Some(FALLBACK_MONTHLY_WINDOW_MINUTES)),
+            resets_at,
+            Some(format_credit_detail(used, total)),
+        );
 
-        if let Some(ref b) = billing
-            && let Some(ts) = b.next_billing_date.as_deref()
-            && let Ok(dt) = DateTime::parse_from_rfc3339(ts)
-        {
-            primary.resets_at = Some(dt.with_timezone(&Utc));
-        }
-
-        let mut snapshot = UsageSnapshot::new(primary);
+        let mut snapshot = UsageSnapshot::new(primary).with_primary_label(CREDITS_LABEL);
         if let Some(b) = billing
             && let Some(tier) = b.current_tier
             && !tier.is_empty()
@@ -163,6 +167,52 @@ impl AbacusProvider {
     }
 }
 
+fn format_credit_detail(used: f64, total: f64) -> String {
+    format!(
+        "{} / {} credits",
+        format_credit_value(used),
+        format_credit_value(total)
+    )
+}
+
+fn format_credit_value(value: f64) -> String {
+    let value = if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    };
+    let formatted = if value >= 1000.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    };
+
+    let (integer, fraction) = match formatted.split_once('.') {
+        Some(parts) => parts,
+        None => (formatted.as_str(), ""),
+    };
+    let grouped = group_credit_digits(integer);
+    if fraction.is_empty() {
+        grouped
+    } else {
+        format!("{grouped}.{fraction}")
+    }
+}
+
+fn group_credit_digits(value: &str) -> String {
+    let mut reversed = String::with_capacity(value.len() + value.len() / 3);
+    for (index, digit) in value.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            reversed.push(',');
+        }
+        reversed.push(digit);
+    }
+    reversed.chars().rev().collect()
+}
+
 impl Default for AbacusProvider {
     fn default() -> Self {
         Self::new()
@@ -230,23 +280,57 @@ mod tests {
             compute_points_left: 750.0,
         };
         let billing = BillingInfo {
-            next_billing_date: Some("2025-01-01T00:00:00Z".into()),
+            next_billing_date: Some("2025-03-01T00:00:00Z".into()),
             current_tier: Some("Pro".into()),
         };
         let snap = AbacusProvider::build_snapshot(compute, Some(billing)).unwrap();
         assert!((snap.primary.used_percent - 25.0).abs() < 0.001);
-        assert!(snap.primary.resets_at.is_some());
+        assert_eq!(
+            snap.primary.reset_description.as_deref(),
+            Some("250 / 1,000 credits")
+        );
+        assert_eq!(
+            snap.primary.resets_at,
+            Some(
+                DateTime::parse_from_rfc3339("2025-03-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        assert_eq!(snap.primary.window_minutes, Some(28 * 24 * 60));
+        assert_eq!(snap.primary_label.as_deref(), Some(CREDITS_LABEL));
         assert_eq!(snap.login_method.as_deref(), Some("Pro"));
+        assert!(snap.account_email.is_none());
+        assert!(snap.account_organization.is_none());
     }
 
     #[test]
     fn handles_missing_billing() {
         let compute = ComputePoints {
-            total_compute_points: 0.0,
-            compute_points_left: 0.0,
+            total_compute_points: 500.0,
+            compute_points_left: 500.0,
         };
         let snap = AbacusProvider::build_snapshot(compute, None).unwrap();
         assert!((snap.primary.used_percent - 0.0).abs() < f64::EPSILON);
+        assert_eq!(
+            snap.primary.reset_description.as_deref(),
+            Some("0 / 500 credits")
+        );
+        assert_eq!(
+            snap.primary.window_minutes,
+            Some(FALLBACK_MONTHLY_WINDOW_MINUTES)
+        );
+        assert!(snap.primary.resets_at.is_none());
+        assert_eq!(snap.primary_label.as_deref(), Some(CREDITS_LABEL));
         assert!(snap.login_method.is_none());
+    }
+
+    #[test]
+    fn formats_credit_details_with_grouping_and_fraction() {
+        assert_eq!(
+            format_credit_detail(12_345.0, 50_000.0),
+            "12,345 / 50,000 credits"
+        );
+        assert_eq!(format_credit_detail(42.5, 100.0), "42.5 / 100 credits");
     }
 }

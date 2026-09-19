@@ -3,6 +3,28 @@ import { useLocale } from "./useLocale";
 
 export type ResetTimeFormatMode = "reset" | "expires";
 
+/** Normalize backend reset descriptions without changing their suffix. */
+export function normalizeResetDescription(description: string | null): string | null {
+  const trimmed = description?.trim() ?? "";
+  if (!trimmed) return null;
+
+  const lowercased = trimmed.toLowerCase();
+  if (lowercased === "reset" || lowercased === "resets") {
+    return "Resets";
+  }
+  for (const prefix of ["resets in ", "reset in "]) {
+    if (lowercased.startsWith(prefix)) {
+      return `Resets in ${trimmed.slice(prefix.length)}`;
+    }
+  }
+  for (const prefix of ["resets ", "reset "]) {
+    if (lowercased.startsWith(prefix)) {
+      return `Resets ${trimmed.slice(prefix.length)}`;
+    }
+  }
+  return `Resets ${trimmed}`;
+}
+
 const absoluteResetFormatter = new Intl.DateTimeFormat(undefined, {
   month: "short",
   day: "numeric",
@@ -37,12 +59,15 @@ export function useFormattedResetTime(
     return () => window.clearInterval(id);
   }, [resetsAt, relative]);
 
+  const normalizedFallback =
+    mode === "reset" ? normalizeResetDescription(fallback) : fallback?.trim() || null;
+
   if (!resetsAt) {
-    return fallback;
+    return normalizedFallback;
   }
   const target = Date.parse(resetsAt);
   if (Number.isNaN(target)) {
-    return fallback;
+    return normalizedFallback;
   }
 
   if (relative) {
@@ -72,6 +97,6 @@ export function useFormattedResetTime(
   try {
     return absoluteResetFormatter.format(new Date(target));
   } catch {
-    return fallback;
+    return normalizedFallback;
   }
 }

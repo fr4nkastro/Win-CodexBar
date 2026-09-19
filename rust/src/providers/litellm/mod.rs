@@ -141,8 +141,11 @@ fn result_from_key_info(value: &Value) -> ProviderFetchResult {
     let percent = limit
         .filter(|v| *v > 0.0)
         .map_or(0.0, |limit| spend / limit * 100.0);
-    let mut snapshot = UsageSnapshot::new(RateWindow::new(percent))
-        .with_login_method(format!("Spend ${spend:.2}"));
+    let mut primary = RateWindow::new(percent);
+    if let Some(limit) = limit.filter(|value| *value > 0.0) {
+        primary.reset_description = Some(budget_detail(spend, limit));
+    }
+    let mut snapshot = UsageSnapshot::new(primary).with_login_method(format!("Spend ${spend:.2}"));
     if let Some(team) = root.get("team_info").or_else(|| root.get("teamInfo"))
         && let Some(team_spend) = number(team, &["spend", "team_spend", "teamSpend"])
     {
@@ -150,8 +153,15 @@ fn result_from_key_info(value: &Value) -> ProviderFetchResult {
         let team_percent = team_limit
             .filter(|v| *v > 0.0)
             .map_or(0.0, |limit| team_spend / limit * 100.0);
-        snapshot =
-            snapshot.with_extra_rate_window("team", "Team budget", RateWindow::new(team_percent));
+        let mut team_window = RateWindow::new(team_percent);
+        if let Some(team_limit) = team_limit.filter(|value| *value > 0.0) {
+            let alias = string(team, &["team_alias", "teamAlias", "alias"])
+                .map(|value| format!("Team {value}: "))
+                .unwrap_or_default();
+            team_window.reset_description =
+                Some(format!("{alias}{}", budget_detail(team_spend, team_limit)));
+        }
+        snapshot = snapshot.with_extra_rate_window("team", "Team budget", team_window);
     }
     let mut result = ProviderFetchResult::new(snapshot, "api");
     if spend > 0.0 {
@@ -169,6 +179,18 @@ fn number(value: &Value, keys: &[&str]) -> Option<f64> {
         .find_map(|key| value.get(*key).and_then(Value::as_f64))
 }
 
+fn string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn budget_detail(spend: f64, budget: f64) -> String {
+    format!("${spend:.2} / ${budget:.2}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +200,31 @@ mod tests {
         let result =
             result_from_key_info(&serde_json::json!({"info":{"spend":25.0,"max_budget":100.0}}));
         assert_eq!(result.usage.primary.used_percent, 25.0);
+        assert_eq!(
+            result.usage.primary.reset_description.as_deref(),
+            Some("$25.00 / $100.00")
+        );
+    }
+
+    #[test]
+    fn preserves_team_budget_detail_with_alias() {
+        let result = result_from_key_info(&serde_json::json!({
+            "info": {
+                "team_info": {
+                    "team_alias": "Platform",
+                    "spend": 70.0,
+                    "max_budget": 1000.0
+                }
+            }
+        }));
+        assert_eq!(result.usage.extra_rate_windows.len(), 1);
+        assert_eq!(
+            result.usage.extra_rate_windows[0]
+                .window
+                .reset_description
+                .as_deref(),
+            Some("Team Platform: $70.00 / $1000.00")
+        );
     }
 
     #[test]

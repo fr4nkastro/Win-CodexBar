@@ -1,3 +1,7 @@
+pub(crate) mod pace;
+mod status;
+pub(crate) use status::{compact_tray_status_label, friendly_provider_error};
+
 use super::*;
 
 // ── Bridge snapshot types ────────────────────────────────────────────
@@ -99,9 +103,15 @@ pub struct CostSnapshotBridge {
     #[serde(default)]
     pub balance: Option<f64>,
     #[serde(default)]
+    pub balance_updated_at: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
     pub formatted_balance: Option<String>,
     #[serde(default)]
     pub daily: Vec<CostDailyPointBridge>,
+    #[serde(default)]
+    pub always_visible: bool,
 }
 
 fn default_currency() -> String {
@@ -159,6 +169,15 @@ pub struct SessionEquivalentForecastSnapshot {
     pub weekly_used_percent: f64,
 }
 
+/// Subscription dates from an authenticated OpenAI dashboard/API response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionMetadataSnapshot {
+    pub starts_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub renews_at: Option<String>,
+}
+
 /// A frontend-friendly snapshot of one provider's usage data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -187,8 +206,12 @@ pub struct ProviderUsageSnapshot {
     pub plan_name: Option<String>,
     #[serde(default)]
     pub account_email: Option<String>,
+    #[serde(default)]
+    pub subscription: Option<SubscriptionMetadataSnapshot>,
     #[serde(default = "default_source_label")]
     pub source_label: String,
+    #[serde(default)]
+    pub has_successful_claude_cli_quota: bool,
     /// Defaults to launch time when absent so the card renders as fresh.
     #[serde(default)]
     pub updated_at: String,
@@ -201,6 +224,8 @@ pub struct ProviderUsageSnapshot {
     /// persisted caches and seed JSON deserialize unchanged.
     #[serde(default)]
     pub transient: bool,
+    #[serde(default = "default_error_state")]
+    pub error_state: codexbar::core::ProviderStateKind,
     #[serde(default)]
     pub pace: Option<PaceSnapshot>,
     #[serde(default)]
@@ -221,6 +246,10 @@ fn default_display_name() -> String {
 
 fn default_source_label() -> String {
     "seed".to_string()
+}
+
+fn default_error_state() -> codexbar::core::ProviderStateKind {
+    codexbar::core::ProviderStateKind::Unknown
 }
 
 /// Provider payload after applying settings-driven cross-surface presentation.
@@ -253,19 +282,6 @@ pub(crate) fn filter_hidden_codex_spark_rows(
     }
 }
 
-pub(crate) fn pace_stage_str(stage: codexbar::core::PaceStage) -> &'static str {
-    use codexbar::core::PaceStage;
-    match stage {
-        PaceStage::OnTrack => "on_track",
-        PaceStage::SlightlyAhead => "slightly_ahead",
-        PaceStage::Ahead => "ahead",
-        PaceStage::FarAhead => "far_ahead",
-        PaceStage::SlightlyBehind => "slightly_behind",
-        PaceStage::Behind => "behind",
-        PaceStage::FarBehind => "far_behind",
-    }
-}
-
 impl ProviderUsageSnapshot {
     pub(super) fn from_fetch_result(
         id: ProviderId,
@@ -274,6 +290,7 @@ impl ProviderUsageSnapshot {
         token_account_id: Option<uuid::Uuid>,
     ) -> Self {
         let usage = &result.usage;
+        let allows_pace = result.pace_authoritative;
 
         // A missing session is represented by an informational primary so the
         // weekly lane keeps its canonical role. Use that weekly lane for the
@@ -283,11 +300,14 @@ impl ProviderUsageSnapshot {
         } else {
             Some(&usage.primary)
         };
-        let primary_pace = primary_pace_window
-            .and_then(|window| codexbar::core::UsagePace::weekly(window, None, 10080));
+        let primary_pace = allows_pace.then(|| {
+            primary_pace_window
+                .and_then(|window| codexbar::core::UsagePace::weekly(window, None, 10080))
+        });
+        let primary_pace = primary_pace.flatten();
 
         let pace = primary_pace.as_ref().map(|p| PaceSnapshot {
-            stage: pace_stage_str(p.stage).to_string(),
+            stage: pace::stage_str(p.stage).to_string(),
             delta_percent: p.delta_percent,
             will_last_to_reset: p.will_last_to_reset,
             eta_seconds: p.eta_seconds,
@@ -296,10 +316,13 @@ impl ProviderUsageSnapshot {
         });
 
         // Compute pace for secondary window (weekly) to derive reserve info
-        let secondary_pace = usage
-            .secondary
-            .as_ref()
-            .and_then(|sw| codexbar::core::UsagePace::weekly(sw, None, 10080));
+        let secondary_pace = allows_pace.then(|| {
+            usage
+                .secondary
+                .as_ref()
+                .and_then(|sw| codexbar::core::UsagePace::weekly(sw, None, 10080))
+        });
+        let secondary_pace = secondary_pace.flatten();
 
         let primary_snap = RateWindowSnapshot::from_rate_window(&usage.primary);
 
@@ -327,12 +350,19 @@ impl ProviderUsageSnapshot {
             provider_id: id.cli_name().to_string(),
             display_name: id.display_name().to_string(),
             primary: primary_snap,
-            primary_label: Some(metadata.session_label.to_string()),
+            primary_label: Some(
+                usage
+                    .primary_label
+                    .clone()
+                    .unwrap_or_else(|| metadata.session_label.to_string()),
+            ),
             secondary: secondary_snap,
-            secondary_label: usage
-                .secondary
-                .as_ref()
-                .map(|_| metadata.weekly_label.to_string()),
+            secondary_label: usage.secondary.as_ref().map(|_| {
+                usage
+                    .secondary_label
+                    .clone()
+                    .unwrap_or_else(|| metadata.weekly_label.to_string())
+            }),
             model_specific: usage
                 .model_specific
                 .as_ref()
@@ -372,6 +402,8 @@ impl ProviderUsageSnapshot {
                 formatted_used: c.format_used(),
                 formatted_limit: c.format_limit(),
                 balance: c.balance,
+                balance_updated_at: c.balance_updated_at.map(|dt| dt.to_rfc3339()),
+                account_id: c.account_id.clone(),
                 formatted_balance: c.format_balance(),
                 daily: c
                     .daily
@@ -381,13 +413,23 @@ impl ProviderUsageSnapshot {
                         amount: point.amount,
                     })
                     .collect(),
+                always_visible: c.always_visible,
             }),
             plan_name: usage.login_method.clone(),
             account_email: usage.account_email.clone(),
+            subscription: usage.subscription.as_ref().map(|subscription| {
+                SubscriptionMetadataSnapshot {
+                    starts_at: subscription.starts_at.map(|date| date.to_rfc3339()),
+                    expires_at: subscription.expires_at.map(|date| date.to_rfc3339()),
+                    renews_at: subscription.renews_at.map(|date| date.to_rfc3339()),
+                }
+            }),
             source_label: result.source_label.clone(),
+            has_successful_claude_cli_quota: result.has_successful_claude_cli_quota,
             updated_at: usage.updated_at.to_rfc3339(),
             error: None,
             transient: false,
+            error_state: codexbar::core::ProviderStateKind::Ready,
             pace,
             account_organization: usage.account_organization.clone(),
             tray_status_label: None,
@@ -397,7 +439,12 @@ impl ProviderUsageSnapshot {
         }
     }
 
-    pub(super) fn from_error(id: ProviderId, metadata: &ProviderMetadata, error: String) -> Self {
+    pub(super) fn from_error(
+        id: ProviderId,
+        metadata: &ProviderMetadata,
+        error: String,
+        state_kind: codexbar::core::ProviderStateKind,
+    ) -> Self {
         let error = friendly_provider_error(id, &error);
         Self {
             provider_id: id.cli_name().to_string(),
@@ -425,10 +472,13 @@ impl ProviderUsageSnapshot {
             cost: None,
             plan_name: None,
             account_email: None,
+            subscription: None,
             source_label: String::new(),
+            has_successful_claude_cli_quota: false,
             updated_at: chrono::Utc::now().to_rfc3339(),
             error: Some(error),
             transient: false,
+            error_state: state_kind,
             pace: None,
             account_organization: None,
             tray_status_label: None,
@@ -507,135 +557,6 @@ fn session_equivalent_forecast_for(
     })
 }
 
-/// Build a compact tray status label from a raw snapshot using the current language.
-/// Localization is done at render time so cached snapshots stay language-neutral.
-pub(crate) fn compact_tray_status_label(
-    window: &RateWindowSnapshot,
-    lang: codexbar::settings::Language,
-) -> String {
-    if window.is_informational {
-        return window
-            .reset_description
-            .clone()
-            .unwrap_or_else(|| "Unavailable".to_string());
-    }
-
-    let pct = format!("{:.0}%", window.used_percent);
-    if let Some(reset) = compact_reset_description(window, lang) {
-        format!("{pct} • {reset}")
-    } else {
-        pct
-    }
-}
-
-fn compact_reset_description(
-    window: &RateWindowSnapshot,
-    lang: codexbar::settings::Language,
-) -> Option<String> {
-    if let Some(ref resets_at) = window.resets_at {
-        let dt = chrono::DateTime::parse_from_rfc3339(resets_at)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc))?;
-        return Some(format_compact_reset_countdown(dt, lang));
-    }
-
-    window
-        .reset_description
-        .as_deref()
-        .map(|desc| normalize_reset_description(desc, lang))
-        .filter(|desc| !desc.is_empty())
-}
-
-fn format_compact_reset_countdown(
-    resets_at: chrono::DateTime<chrono::Utc>,
-    lang: codexbar::settings::Language,
-) -> String {
-    let now = chrono::Utc::now();
-    if resets_at <= now {
-        return locale::get_text(lang, locale::LocaleKey::ResetInProgress);
-    }
-
-    let total_minutes = (resets_at - now).num_minutes().max(0);
-    let days = total_minutes / 1440;
-    let hours = (total_minutes % 1440) / 60;
-    let minutes = total_minutes % 60;
-
-    if days > 0 {
-        locale::format_locale(
-            lang,
-            locale::LocaleKey::ResetsInDaysHours,
-            &[&days.to_string(), &hours.to_string()],
-        )
-    } else {
-        locale::format_locale(
-            lang,
-            locale::LocaleKey::ResetsInHoursMinutes,
-            &[&hours.to_string(), &format!("{minutes:02}")],
-        )
-    }
-}
-
-fn normalize_reset_description(desc: &str, lang: codexbar::settings::Language) -> String {
-    let trimmed = desc.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let prefix_len = ["resets in ", "reset in ", "in "]
-        .iter()
-        .find(|&&p| lower.starts_with(p))
-        .map(|p| p.len())
-        .unwrap_or(0);
-    let body = trimmed[prefix_len..].trim_start();
-    format!(
-        "{} {body}",
-        locale::get_text(lang, locale::LocaleKey::ResetsInShort)
-    )
-}
-
-pub(crate) fn friendly_provider_error(id: ProviderId, error: &str) -> String {
-    if id != ProviderId::Claude {
-        return error.to_string();
-    }
-
-    let trimmed = error.trim();
-    let lower = trimmed.to_lowercase();
-
-    if lower.contains("swift.cancellationerror")
-        || lower.contains("the operation couldn't be completed")
-        || lower.contains("the operation could not be completed")
-    {
-        return "Claude usage fetch was cancelled before usage data was returned. Refresh Claude, or re-authenticate with Claude Code and try again.".to_string();
-    }
-
-    if lower.contains("claude oauth credentials not found") {
-        return "Claude sign-in was not found. Run `claude` once to authenticate, then refresh Claude in Win-CodexBar.".to_string();
-    }
-
-    if lower.contains("oauth token expired") || lower.contains("token invalid or expired") {
-        return "Claude sign-in expired. Run `claude` to refresh your Claude Code login, then refresh Claude in Win-CodexBar.".to_string();
-    }
-
-    if trimmed == "Authentication required" {
-        return "Claude needs sign-in before Win-CodexBar can read usage. Run `claude` once, or add Claude cookies in Provider settings.".to_string();
-    }
-
-    if lower.starts_with("claude usage failed from all configured sources.") {
-        return trimmed
-            .replace(
-                "OAuth: OAuth error: Claude OAuth credentials not found. Run `claude` to authenticate.",
-                "OAuth: sign-in not found",
-            )
-            .replace(
-                "Web: No cookies available for web API",
-                "Web: no Claude cookies available",
-            )
-            .replace(
-                "CLI: Provider not installed:",
-                "CLI: not installed:",
-            );
-    }
-
-    trimmed.to_string()
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapState {
@@ -710,6 +631,8 @@ pub struct SettingsSnapshot {
     tray_scale_percent: u16,
     powertoys_status_pipe_enabled: bool,
     claude_avoid_keychain_prompts: bool,
+    claude_swap_enabled: bool,
+    claude_swap_executable_path: String,
     codex_spark_usage_visible: bool,
     disable_keychain_access: bool,
     wayfinder_gateway_url: String,
@@ -759,6 +682,8 @@ pub fn get_settings_snapshot() -> SettingsSnapshot {
 impl From<Settings> for SettingsSnapshot {
     fn from(settings: Settings) -> Self {
         let avoid_keychain_prompts = settings.claude_avoid_keychain_prompts();
+        let claude_swap_enabled = settings.claude_swap_enabled();
+        let claude_swap_executable_path = settings.claude_swap_executable_path().to_string();
         let codex_spark_usage_visible = settings.codex_spark_usage_visible();
         let wayfinder_gateway_url = settings.gateway_url(ProviderId::Wayfinder).to_string();
 
@@ -824,6 +749,8 @@ impl From<Settings> for SettingsSnapshot {
             tray_scale_percent: settings.tray_scale_percent,
             powertoys_status_pipe_enabled: settings.powertoys_status_pipe_enabled,
             claude_avoid_keychain_prompts: avoid_keychain_prompts,
+            claude_swap_enabled,
+            claude_swap_executable_path,
             codex_spark_usage_visible,
             disable_keychain_access: settings.disable_keychain_access,
             wayfinder_gateway_url,

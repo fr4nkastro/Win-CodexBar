@@ -1,4 +1,25 @@
+use super::legacy_status::{ModelFamily, canonical_model_id, classify_model};
 use super::*;
+
+#[test]
+fn cadence_labels_are_owned_by_antigravity_snapshot() {
+    let mut secondary = RateWindow::new(20.0);
+    secondary.window_minutes = Some(7 * 24 * 60);
+    let usage = UsageSnapshot::new(RateWindow::new(10.0)).with_secondary(secondary);
+    let usage = AntigravityProvider::with_cadence_labels(usage);
+    assert_eq!(usage.secondary_label.as_deref(), Some("Weekly"));
+}
+
+#[test]
+fn explicit_quota_summary_cadence_label_survives_normalization() {
+    let mut secondary = RateWindow::new(20.0);
+    secondary.window_minutes = Some(7 * 24 * 60);
+    let usage = UsageSnapshot::new(RateWindow::new(10.0))
+        .with_secondary(secondary)
+        .with_secondary_label("Gemini Weekly");
+    let usage = AntigravityProvider::with_cadence_labels(usage);
+    assert_eq!(usage.secondary_label.as_deref(), Some("Gemini Weekly"));
+}
 
 #[test]
 fn test_classify_model_families() {
@@ -111,11 +132,19 @@ fn antigravity_extra_windows_preserve_usage_known() {
             "cascadeModelConfigData": {
                 "clientModelConfigs": [
                     {
-                        "label": "Gemini 2.5 Pro",
+                        "label": "Claude 4 Sonnet",
                         "quotaInfo": {"remainingFraction": 0.8}
                     },
                     {
-                        "label": "Claude 4 Sonnet",
+                        "label": "Gemini 2.5 Pro",
+                        "quotaInfo": {"remainingFraction": 0.6}
+                    },
+                    {
+                        "label": "Gemini 2.5 Flash",
+                        "quotaInfo": {"remainingFraction": 0.4}
+                    },
+                    {
+                        "label": "Claude 3.5 Sonnet",
                         "quotaInfo": {"remainingFraction": null}
                     }
                 ]
@@ -124,17 +153,11 @@ fn antigravity_extra_windows_preserve_usage_known() {
     });
     let resp: UserStatusResponse = serde_json::from_value(json).unwrap();
     let snap = AntigravityProvider::new().parse_user_status(resp).unwrap();
-    let gemini = snap
-        .extra_rate_windows
-        .iter()
-        .find(|window| window.title.contains("Gemini"))
-        .unwrap();
     let claude = snap
         .extra_rate_windows
         .iter()
         .find(|window| window.title.contains("Claude"))
         .unwrap();
-    assert!(gemini.usage_known);
     assert!(!claude.usage_known);
     assert_eq!(claude.window.used_percent, 0.0);
 }
@@ -154,11 +177,35 @@ fn test_parse_user_status_standard() {
     assert!((sec.used_percent - 50.0).abs() < 0.1);
     let ter = snap.model_specific.unwrap();
     assert!((ter.used_percent - 10.0).abs() < 0.1);
+    assert!(snap.extra_rate_windows.is_empty());
+}
+
+#[test]
+fn antigravity_extra_windows_preserve_all_unselected_configs() {
+    let resp = make_response(vec![
+        ("Claude 4 Sonnet", 0.8),
+        ("GPT-4o", 0.8),
+        ("Mistral Large", 0.6),
+        ("Qwen Max", 0.6),
+    ]);
+    let provider = AntigravityProvider::new();
+    let snap = provider.parse_user_status(resp).unwrap();
+
     assert_eq!(snap.extra_rate_windows.len(), 3);
     assert!(
         snap.extra_rate_windows
             .iter()
-            .any(|window| window.title == "Gemini 2.5 Flash")
+            .any(|window| window.title == "GPT-4o")
+    );
+    assert!(
+        snap.extra_rate_windows
+            .iter()
+            .any(|window| window.title == "Mistral Large")
+    );
+    assert!(
+        snap.extra_rate_windows
+            .iter()
+            .any(|window| window.title == "Qwen Max")
     );
 }
 
@@ -210,10 +257,88 @@ fn test_noisy_models_do_not_drive_summary_windows() {
 }
 
 #[test]
-fn not_running_error_tells_user_how_to_start() {
-    let error = ProviderError::NotInstalled(NOT_RUNNING_MESSAGE.to_string()).to_string();
+fn missing_cli_error_explains_runtime_state() {
+    let error = ProviderError::NotInstalled(AGY_NOT_FOUND_MESSAGE.to_string()).to_string();
 
-    assert!(error.contains("Start Google Antigravity and sign in"));
+    assert!(error.contains("not running"));
+    assert!(error.contains("agy CLI was not found"));
+}
+
+#[test]
+fn managed_agy_candidates_prefer_override_then_path_then_known_installs() {
+    let explicit = PathBuf::from(r"D:\tools\agy.exe");
+    let path_lookup = PathBuf::from(r"C:\path\agy.exe");
+    let local_app_data = PathBuf::from(r"C:\Users\test\AppData\Local");
+    let home = PathBuf::from(r"C:\Users\test");
+
+    let candidates = AntigravityProvider::agy_binary_candidates(
+        Some(explicit.clone()),
+        Some(path_lookup.clone()),
+        Some(local_app_data.clone()),
+        Some(home.clone()),
+    );
+
+    assert_eq!(candidates[0], explicit);
+    assert_eq!(candidates[1], path_lookup);
+    // Build expectations with `join` so the assertions match on every host:
+    // on Unix `\` is an ordinary character and `join` inserts `/`.
+    assert_eq!(
+        candidates[2],
+        local_app_data.join("agy").join("bin").join("agy.exe")
+    );
+    assert_eq!(
+        candidates[3],
+        home.join(".local")
+            .join("bin")
+            .join(if cfg!(windows) { "agy.exe" } else { "agy" })
+    );
+}
+
+// ── Managed lifecycle policy (fake outcomes) ───────────────────────
+//
+// The process lifecycle itself is covered by `crate::managed_process`; these
+// exercise the provider-side policy that maps a lifecycle outcome onto a fetch
+// result without spawning a real `agy`.
+
+#[cfg(windows)]
+#[test]
+fn reused_user_runtime_stays_local() {
+    let usage = UsageSnapshot::new(RateWindow::new(10.0));
+    let result = AntigravityProvider::resolve_managed_outcome(Ok(ManagedAgyOutcome::Reused(
+        ProviderFetchResult::new(usage, "local"),
+    )))
+    .expect("reused outcome resolves")
+    .expect("reused outcome yields usage");
+    assert_eq!(result.source_label, "local");
+}
+
+#[cfg(windows)]
+#[test]
+fn owned_cli_fetch_reports_cli_source() {
+    let usage = UsageSnapshot::new(RateWindow::new(10.0));
+    let result = AntigravityProvider::resolve_managed_outcome(Ok(ManagedAgyOutcome::Fetched(
+        ProviderFetchResult::new(usage, "local"),
+    )))
+    .expect("owned outcome resolves")
+    .expect("owned outcome yields usage");
+    assert_eq!(result.source_label, "cli");
+    assert_eq!(result.usage.primary.used_percent, 10.0);
+    assert!(!result.usage.primary.is_informational);
+}
+
+#[cfg(windows)]
+#[test]
+fn missing_runtime_is_a_policy_no_op() {
+    let result = AntigravityProvider::resolve_managed_outcome(Ok(ManagedAgyOutcome::Missing))
+        .expect("a missing runtime is not an error");
+    assert!(result.is_none(), "missing runtime falls through to offline");
+}
+
+#[cfg(windows)]
+#[test]
+fn managed_auth_required_surfaces_instead_of_offline() {
+    let result = AntigravityProvider::resolve_managed_outcome(Err(ProviderError::AuthRequired));
+    assert!(matches!(result, Err(ProviderError::AuthRequired)));
 }
 
 // ── agy CLI process matching ───────────────────────────────────────
@@ -348,23 +473,24 @@ fn is_agy_cli_command_rejects_unrelated_names() {
     assert!(!is_agy_cli_command(""));
 }
 
-// ── Upstream 0.50.1 #2963: one lane per quota bucket ──────────────────────
+// ── Upstream 0.50.1 #2963: preserve unselected quota configs ────────────────
 
 #[test]
-fn multiple_models_in_same_quota_bucket_collapse_to_one_lane() {
-    // Two Claude variants sharing the same remaining fraction (same 5h
-    // session bucket) should produce one extra rate window, not two.
+fn multiple_unselected_models_with_same_reading_remain_visible() {
+    // Equal readings are not a pool identity. Both unselected configs remain
+    // visible even though the canonical Claude and Gemini configs are selected.
     let resp = make_response(vec![
-        ("Claude 3.5 Sonnet", 0.8),
         ("Claude 4 Sonnet", 0.8),
         ("Gemini 2.5 Pro Low", 0.5),
+        ("Mistral Large", 0.8),
+        ("Qwen Max", 0.8),
     ]);
     let provider = AntigravityProvider::new();
     let snap = provider.parse_user_status(resp).unwrap();
     assert_eq!(
         snap.extra_rate_windows.len(),
         2,
-        "models sharing a quota bucket collapse to one lane"
+        "distinct unselected configs with equal readings remain visible"
     );
 }
 
@@ -377,5 +503,165 @@ fn models_in_distinct_quota_buckets_keep_separate_lanes() {
     ]);
     let provider = AntigravityProvider::new();
     let snap = provider.parse_user_status(resp).unwrap();
-    assert_eq!(snap.extra_rate_windows.len(), 3);
+    assert_eq!(snap.extra_rate_windows.len(), 1);
+}
+
+#[test]
+fn not_installed_maps_to_local_runtime_offline() {
+    // Antigravity's `NotInstalled` reports the local language-server probe
+    // finding nothing to talk to: a runtime that is not running, not a
+    // credential problem.
+    assert_eq!(
+        AntigravityProvider::new()
+            .error_state_kind(&ProviderError::NotInstalled(AGY_NOT_FOUND_MESSAGE.into())),
+        crate::core::ProviderStateKind::LocalRuntimeOffline
+    );
+}
+
+#[test]
+fn probe_failure_maps_to_unknown() {
+    // A failed probe (PowerShell unavailable etc.) says nothing about the
+    // runtime itself - inconclusive, not offline.
+    assert_eq!(
+        AntigravityProvider::new().error_state_kind(&ProviderError::NotInstalled(
+            "Failed to detect Antigravity process".into()
+        )),
+        crate::core::ProviderStateKind::Unknown
+    );
+}
+
+// ── Offline-history fallback on probe failure ──────────────────────
+
+fn offline_result() -> ProviderFetchResult {
+    ProviderFetchResult::new(
+        UsageSnapshot::new(RateWindow::informational("Offline · 2 conversations"))
+            .with_login_method("offline"),
+        "offline",
+    )
+}
+
+#[test]
+fn auth_required_surfaces_instead_of_offline_history() {
+    let resolved = AntigravityProvider::resolve_probe_failure(
+        ProviderError::AuthRequired,
+        Some(offline_result()),
+    );
+    assert!(matches!(resolved, Err(ProviderError::AuthRequired)));
+}
+
+#[test]
+fn non_auth_failure_prefers_offline_history() {
+    // A transient managed-start or local-probe failure must not discard the
+    // existing offline conversation-history snapshot.
+    let resolved = AntigravityProvider::resolve_probe_failure(
+        ProviderError::Other("agy readiness timeout".to_string()),
+        Some(offline_result()),
+    );
+    let resolved = resolved.expect("offline history is preserved");
+    assert_eq!(resolved.source_label, "offline");
+    assert_eq!(resolved.usage.login_method.as_deref(), Some("offline"));
+    assert!(resolved.usage.primary.is_informational);
+    assert_eq!(
+        resolved.usage.primary.reset_description.as_deref(),
+        Some("Offline · 2 conversations")
+    );
+}
+
+#[test]
+fn non_auth_failure_without_history_surfaces_error() {
+    let resolved = AntigravityProvider::resolve_probe_failure(
+        ProviderError::Other("agy readiness timeout".to_string()),
+        None,
+    );
+    assert!(matches!(resolved, Err(ProviderError::Other(_))));
+}
+
+#[test]
+fn user_tier_resolves_google_ai_ultra_plan_name() {
+    let json = serde_json::json!({
+        "userStatus": {
+            "email": "user@example.com",
+            "planStatus": {
+                "planInfo": {
+                    "planName": "Pro"
+                }
+            },
+            "userTier": {
+                "id": "g1-ultra-tier",
+                "name": "Google AI Ultra",
+                "description": "Google AI Ultra"
+            },
+            "cascadeModelConfigData": {
+                "clientModelConfigs": [
+                    {
+                        "label": "Gemini 2.5 Pro",
+                        "quotaInfo": {"remainingFraction": 0.8}
+                    }
+                ]
+            }
+        }
+    });
+    let resp: UserStatusResponse = serde_json::from_value(json).unwrap();
+    let snap = AntigravityProvider::new().parse_user_status(resp).unwrap();
+    assert_eq!(snap.login_method.as_deref(), Some("Google AI Ultra"));
+    assert_eq!(snap.account_email.as_deref(), Some("user@example.com"));
+}
+
+#[test]
+fn user_status_falls_back_to_plan_status_when_user_tier_is_absent() {
+    let json = serde_json::json!({
+        "userStatus": {
+            "email": "user@example.com",
+            "planStatus": {
+                "planInfo": {
+                    "planName": "Pro"
+                }
+            },
+            "cascadeModelConfigData": {
+                "clientModelConfigs": [
+                    {
+                        "label": "Gemini 2.5 Pro",
+                        "quotaInfo": {"remainingFraction": 0.8}
+                    }
+                ]
+            }
+        }
+    });
+    let resp: UserStatusResponse = serde_json::from_value(json).unwrap();
+    let snap = AntigravityProvider::new().parse_user_status(resp).unwrap();
+    assert_eq!(snap.login_method.as_deref(), Some("Pro"));
+}
+
+#[test]
+fn plan_name_fallback_skips_blank_user_tier_name() {
+    let status: UserStatus = serde_json::from_value(serde_json::json!({
+        "userTier": {
+            "name": "   ",
+            "description": " Google AI Ultra "
+        }
+    }))
+    .unwrap();
+
+    assert_eq!(
+        AntigravityProvider::resolve_plan_name(&status).as_deref(),
+        Some("Google AI Ultra")
+    );
+}
+
+#[test]
+fn plan_name_fallback_skips_blank_display_name() {
+    let status: UserStatus = serde_json::from_value(serde_json::json!({
+        "planStatus": {
+            "planInfo": {
+                "planDisplayName": " ",
+                "planName": " Pro "
+            }
+        }
+    }))
+    .unwrap();
+
+    assert_eq!(
+        AntigravityProvider::resolve_plan_name(&status).as_deref(),
+        Some("Pro")
+    );
 }

@@ -451,14 +451,26 @@ pub struct ClaudeAccountsStateBridge {
 /// `tauri::State`.
 fn build_claude_accounts_state() -> Result<ClaudeAccountsStateBridge, String> {
     let accounts = load_claude_accounts()?;
-    let identity = ClaudeAccountManager::new().load_active_identity();
-    let managed_tokens = managed_access_tokens(&accounts);
-    let active = active_account_id(&accounts, &identity, &managed_tokens);
+    let active = claude_active_account_id(&accounts);
     Ok(ClaudeAccountsStateBridge {
         accounts,
         snapshots: claude_account_snapshots()?,
         active_account_id: active,
     })
+}
+
+/// Id of the listed account matching the live ambient Claude Code identity.
+/// File-based only (no `claude` subprocess); shared by the Settings state
+/// bridge and the native tray account menu so both show one active account.
+pub(crate) fn claude_active_account_id(accounts: &[ClaudeAccount]) -> Option<Uuid> {
+    let identity = ClaudeAccountManager::new().load_active_identity();
+    let managed_tokens = managed_access_tokens(accounts);
+    active_account_id(accounts, &identity, &managed_tokens)
+}
+
+/// Whether the user allowed CodexBar to manage Claude Code accounts.
+pub(crate) fn claude_accounts_management_enabled() -> bool {
+    claude_accounts_consent()
 }
 
 #[tauri::command]

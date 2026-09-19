@@ -73,6 +73,7 @@ function snapshot(
   opts: {
     exhausted?: boolean;
     error?: string | null;
+    errorState?: ProviderUsageSnapshot["errorState"];
     resetsAt?: string | null;
     resetDescription?: string | null;
     informational?: boolean;
@@ -117,6 +118,7 @@ function snapshot(
     sourceLabel: "auto",
     updatedAt: "2026-05-15T00:00:00Z",
     error: opts.error ?? null,
+    errorState: opts.errorState ?? "ready",
     pace: null,
     accountOrganization: null,
     trayStatusLabel: null,
@@ -222,6 +224,11 @@ describe("FloatBar", () => {
         TrayResetsDueNow: "Resetting",
         PanelToday: "Today",
         PanelUsedSuffix: "used",
+        OverviewSpendEstimate: "Estimate",
+        ProviderIssueAuthRequired: "Sign-in required",
+        ProviderIssueSessionExpired: "Session expired",
+        ProviderIssueLocalRuntimeOffline: "Local runtime offline",
+        ProviderIssueUnknown: "Usage unavailable",
         FloatBarThirtyDayShort: "30d",
         FloatBarNoProviders: "No providers",
         FloatBarRemainingSuffix: "remaining",
@@ -394,6 +401,31 @@ describe("FloatBar", () => {
     expect(tauriMocks.getProviderChartData).not.toHaveBeenCalled();
   });
 
+  it("marks displayed local cost as an estimate", async () => {
+    tauriMocks.getCachedProviders.mockResolvedValue([snapshot("codex", "Codex", 75)]);
+    tauriMocks.getSettingsSnapshot.mockResolvedValue(settings({ floatBarShowCost: true }));
+    tauriMocks.getProviderLocalUsageSummary.mockResolvedValue({
+      todayCost: 1.25,
+      thirtyDayCost: 12.5,
+      thirtyDayTokens: 1000,
+      latestTokens: 200,
+      topModel: "gpt-5",
+      estimateNote: "Estimated from local logs",
+      tokenCostUpdatedAtMs: 1234,
+    });
+
+    const { container } = renderFloatBar(bootstrap({ floatBarShowCost: true }));
+
+    await waitFor(() => {
+      expect(container.querySelector(".floatbar__cost-estimate")?.textContent).toBe(
+        "Estimate",
+      );
+    });
+    expect(container.querySelector(".floatbar__cost-pill")?.getAttribute("title")).toContain(
+      "(Estimate)",
+    );
+  });
+
   it("does not scan local costs by default", async () => {
     tauriMocks.getCachedProviders.mockResolvedValue([
       snapshot("codex", "Codex", 75),
@@ -406,6 +438,44 @@ describe("FloatBar", () => {
       expect(tauriMocks.getCachedProviders).toHaveBeenCalled();
     });
     expect(tauriMocks.getProviderLocalUsageSummary).not.toHaveBeenCalled();
+    expect(document.querySelector(".floatbar__cost-pill")).toBeNull();
+  });
+
+  it("uses a safe state label instead of a raw provider error", async () => {
+    const raw = "legacy telemetry failed for https://private.example.test; cookie=super-secret";
+    tauriMocks.getCachedProviders.mockResolvedValue([
+      snapshot("gemini", "Gemini", 12, { error: raw, errorState: "unknown" }),
+    ]);
+    tauriMocks.getSettingsSnapshot.mockResolvedValue(settings({ enabledProviders: ["gemini"] }));
+
+    const { container } = renderFloatBar(bootstrap({ enabledProviders: ["gemini"] }));
+
+    await waitFor(() => {
+      const pill = container.querySelector(".floatbar__pill");
+      expect(pill?.textContent).toContain("Usage unavailable");
+      expect(pill?.getAttribute("title")).toBe("Gemini: Usage unavailable");
+      expect(pill?.textContent).not.toContain("super-secret");
+      expect(pill?.getAttribute("title")).not.toContain("private.example.test");
+    });
+  });
+
+  it("renders the sign-in label when the backend classifies needsAuthentication", async () => {
+    tauriMocks.getCachedProviders.mockResolvedValue([
+      snapshot("copilot", "GitHub Copilot", 12, {
+        error: "GitHub Copilot token not found. Sign in with GitHub.",
+        errorState: "needsAuthentication",
+      }),
+    ]);
+    tauriMocks.getSettingsSnapshot.mockResolvedValue(settings({ enabledProviders: ["copilot"] }));
+
+    const { container } = renderFloatBar(bootstrap({ enabledProviders: ["copilot"] }));
+
+    await waitFor(() => {
+      const pill = container.querySelector(".floatbar__pill");
+      expect(pill?.textContent).toContain("Sign-in required");
+      expect(pill?.textContent).not.toContain("12%");
+      expect(pill?.getAttribute("title")).toBe("GitHub Copilot: Sign-in required");
+    });
   });
 
   it("can show remaining percentages when configured", async () => {
@@ -604,6 +674,161 @@ describe("FloatBar", () => {
       expect(reset?.textContent).toMatch(/2h [45]m/);
       expect(reset?.textContent).not.toContain("Resets in");
     });
+  });
+
+  it("compacts localized reset text from the timestamp", async () => {
+    const now = Date.parse("2024-06-01T00:00:00Z");
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const fullResetText = "4 小时 59 分钟后重置";
+      tauriMocks.getLocaleStrings.mockResolvedValue(
+        buildBundle(
+          {
+            ResetsInHoursMinutes: "{} 小时 {} 分钟后重置",
+            TrayResetsDueNow: "现在重置",
+          },
+          "chinese",
+        ),
+      );
+      tauriMocks.getCachedProviders.mockResolvedValue([
+        snapshot("claude", "Claude", 20, {
+          resetsAt: "2024-06-01T04:59:00Z",
+        }),
+      ]);
+      tauriMocks.getSettingsSnapshot.mockResolvedValue(
+        settings({ floatBarShowResetInline: true }),
+      );
+
+      const { container } = renderFloatBar(
+        bootstrap({ floatBarShowResetInline: true }),
+      );
+
+      await waitFor(() => {
+        const reset = container.querySelector(".floatbar__reset");
+        expect(reset?.querySelector(".floatbar__reset-time")).toHaveTextContent(
+          "4h 59m",
+        );
+        expect(container.querySelector(".floatbar__pill")?.getAttribute("title")).toContain(
+          fullResetText,
+        );
+        expect(reset?.getAttribute("title")).toBe(fullResetText);
+        expect(reset?.getAttribute("aria-label")).toBe(fullResetText);
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("compacts localized due-now reset text to now", async () => {
+    const now = Date.parse("2024-06-01T00:00:00Z");
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const fullResetText = "重置时间已到";
+      tauriMocks.getLocaleStrings.mockResolvedValue(
+        buildBundle(
+          {
+            TrayResetsDueNow: fullResetText,
+          },
+          "chinese",
+        ),
+      );
+      tauriMocks.getCachedProviders.mockResolvedValue([
+        snapshot("claude", "Claude", 20, {
+          resetsAt: "2024-05-31T23:59:00Z",
+        }),
+      ]);
+      tauriMocks.getSettingsSnapshot.mockResolvedValue(
+        settings({ floatBarShowResetInline: true }),
+      );
+
+      const { container } = renderFloatBar(
+        bootstrap({ floatBarShowResetInline: true }),
+      );
+
+      await waitFor(() => {
+        const reset = container.querySelector(".floatbar__reset");
+        expect(reset?.querySelector(".floatbar__reset-time")).toHaveTextContent(
+          "now",
+        );
+        expect(container.querySelector(".floatbar__pill")?.getAttribute("title")).toContain(
+          fullResetText,
+        );
+        expect(reset?.getAttribute("title")).toBe(fullResetText);
+        expect(reset?.getAttribute("aria-label")).toBe(fullResetText);
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("keeps a future sub-minute reset out of the now state", async () => {
+    const now = Date.parse("2024-06-01T00:00:00Z");
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      tauriMocks.getLocaleStrings.mockResolvedValue(buildBundle({}, "chinese"));
+      tauriMocks.getCachedProviders.mockResolvedValue([
+        snapshot("claude", "Claude", 20, {
+          resetsAt: "2024-06-01T00:00:30Z",
+        }),
+      ]);
+      tauriMocks.getSettingsSnapshot.mockResolvedValue(
+        settings({ floatBarShowResetInline: true }),
+      );
+
+      const { container } = renderFloatBar(
+        bootstrap({ floatBarShowResetInline: true }),
+      );
+
+      await waitFor(() => {
+        expect(container.querySelector(".floatbar__reset-time")).toHaveTextContent(
+          "1m",
+        );
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("compacts localized day and hour reset text", async () => {
+    const now = Date.parse("2024-06-01T00:00:00Z");
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const fullResetText = "1 天 2 小时后重置";
+      tauriMocks.getLocaleStrings.mockResolvedValue(
+        buildBundle(
+          {
+            ResetsInDaysHours: "{} 天 {} 小时后重置",
+          },
+          "chinese",
+        ),
+      );
+      tauriMocks.getCachedProviders.mockResolvedValue([
+        snapshot("claude", "Claude", 20, {
+          resetsAt: "2024-06-02T02:07:00Z",
+        }),
+      ]);
+      tauriMocks.getSettingsSnapshot.mockResolvedValue(
+        settings({ floatBarShowResetInline: true }),
+      );
+
+      const { container } = renderFloatBar(
+        bootstrap({ floatBarShowResetInline: true }),
+      );
+
+      await waitFor(() => {
+        const reset = container.querySelector(".floatbar__reset");
+        expect(reset?.querySelector(".floatbar__reset-time")).toHaveTextContent(
+          "1d 2h",
+        );
+        expect(container.querySelector(".floatbar__pill")?.getAttribute("title")).toContain(
+          fullResetText,
+        );
+        expect(reset?.getAttribute("title")).toBe(fullResetText);
+        expect(reset?.getAttribute("aria-label")).toBe(fullResetText);
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it("polls refreshProvidersIfStale on the configured interval", async () => {

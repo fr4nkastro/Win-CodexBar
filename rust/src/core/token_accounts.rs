@@ -351,7 +351,8 @@ impl TokenAccountSupport {
             | ProviderId::LongCat
             | ProviderId::Wayfinder
             | ProviderId::QwenCloud
-            | ProviderId::Fireworks => None,
+            | ProviderId::Fireworks
+            | ProviderId::Meta => None,
         }
     }
 
@@ -461,6 +462,9 @@ pub struct TokenAccount {
     pub label: String,
     /// The token/cookie value
     pub token: String,
+    /// Stable external identity supplied by the provider, when available
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_identifier: Option<String>,
     /// When this account was added (Unix timestamp in seconds)
     pub added_at: i64,
     /// When this account was last used (Unix timestamp in seconds)
@@ -475,6 +479,7 @@ impl TokenAccount {
             id: Uuid::new_v4(),
             label: label.into(),
             token: token.into(),
+            external_identifier: None,
             added_at: Utc::now().timestamp(),
             last_used: None,
         }

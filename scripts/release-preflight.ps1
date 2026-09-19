@@ -1,22 +1,29 @@
 #Requires -Version 5.1
 <##
 .SYNOPSIS
-    Validate the exact, canonical release source selected by CircleCI.
+    Validate the exact, canonical release source selected by the release workflow.
 
 .DESCRIPTION
     This is deliberately credential-free. It accepts only canonical vX.Y.Z tags,
     verifies that the checked-out commit and tag resolve to the supplied SHA, and
     proves the tag commit is reachable from the protected main branch. It also checks
     every committed project version file before a release build is allowed to run.
+
+.PARAMETER AllowTagSourceMismatch
+    Manual SignPath test-only mode. The checked-out source may be newer than
+    the version tag, but the tag must be in that source commit's history and
+    all version files must still match the selected tag. Production release
+    workflows never use this switch.
 #>
 
 [CmdletBinding()]
 param(
-    [string]$Tag = $env:CIRCLE_TAG,
-    [string]$Sha = $env:CIRCLE_SHA1,
+    [string]$Tag = $env:RELEASE_TAG,
+    [string]$Sha = $env:RELEASE_SHA,
     [string]$RepoRoot = '',
     [string]$Repository = "nesszer/Win-CodexBar",
-    [string]$MainBranch = "main"
+    [string]$MainBranch = "main",
+    [switch]$AllowTagSourceMismatch
 )
 
 Set-StrictMode -Version Latest
@@ -70,19 +77,19 @@ if (-not (Test-Path -LiteralPath $RepoRoot -PathType Container)) {
     throw "Repository root does not exist: $RepoRoot"
 }
 if (-not (Test-CanonicalReleaseTag $Tag)) {
-    throw "CircleCI release requires a canonical vX.Y.Z tag; received '$Tag'."
+    throw "Release requires a canonical vX.Y.Z tag; received '$Tag'."
 }
 if ([string]::IsNullOrWhiteSpace($Sha) -or $Sha -notmatch '^[0-9a-fA-F]{40}$') {
-    throw "CircleCI release requires a full 40-character commit SHA; received '$Sha'."
+    throw "Release requires a full 40-character commit SHA; received '$Sha'."
 }
 if ([string]::IsNullOrWhiteSpace($MainBranch) -or $MainBranch -ne 'main') {
     throw "Release ancestry must be checked against the protected main branch."
 }
-if ($env:CIRCLE_PULL_REQUEST) {
-    throw "Pull-request builds are not release builds."
+if (-not $AllowTagSourceMismatch -and $env:GITHUB_REF_TYPE -and $env:GITHUB_REF_TYPE -ne 'tag') {
+    throw "Branch builds are not release builds; GITHUB_REF_TYPE was '$env:GITHUB_REF_TYPE'."
 }
-if ($env:CIRCLE_BRANCH) {
-    throw "Branch builds are not release builds; CIRCLE_BRANCH was '$env:CIRCLE_BRANCH'."
+if (-not $AllowTagSourceMismatch -and $env:GITHUB_HEAD_REF) {
+    throw 'Pull-request builds are not release builds.'
 }
 
 Push-Location $RepoRoot
@@ -100,10 +107,19 @@ try {
     Write-Host "[ok] HEAD is immutable SHA $Sha"
 
     $tagSha = Invoke-GitCapture @('rev-parse', '--verify', "$Tag^{commit}")
-    if ($tagSha -ne $Sha.ToLowerInvariant()) {
+    if (-not $AllowTagSourceMismatch -and $tagSha -ne $Sha.ToLowerInvariant()) {
         throw "Tag '$Tag' resolves to '$tagSha', not immutable release SHA '$Sha'."
     }
-    Write-Host "[ok] $Tag resolves to $Sha"
+    if ($AllowTagSourceMismatch) {
+        $git = Get-Command git -ErrorAction Stop
+        & $git.Source merge-base --is-ancestor $tagSha $Sha 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Test source commit $Sha must contain the selected tag '$Tag' in its history."
+        }
+        Write-Host "[ok] test source $Sha contains tag $Tag ($tagSha)"
+    } else {
+        Write-Host "[ok] $Tag resolves to $Sha"
+    }
 
     $remoteMainRef = "refs/remotes/origin/$MainBranch"
     $git = Get-Command git -ErrorAction Stop

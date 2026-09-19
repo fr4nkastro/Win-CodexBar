@@ -13,7 +13,7 @@ use crate::spend_contract::build_local_spend_contract_from_summary;
 /// Arguments for the cost command
 #[derive(Args, Debug, Default)]
 pub struct CostArgs {
-    /// Provider to query (codex, claude, cursor, gemini, copilot, all, both)
+    /// Provider to query (codex, claude, antigravity, cursor, gemini, copilot, all, both)
     #[arg(short, long)]
     pub provider: Option<String>,
 
@@ -102,6 +102,7 @@ pub async fn run(args: CostArgs) -> anyhow::Result<()> {
                     display_name: provider.display_name().to_string(),
                     summary,
                     supported: true,
+                    token_history: None,
                 });
             }
             ProviderId::Claude => {
@@ -111,6 +112,18 @@ pub async fn run(args: CostArgs) -> anyhow::Result<()> {
                     display_name: provider.display_name().to_string(),
                     summary,
                     supported: true,
+                    token_history: None,
+                });
+            }
+            ProviderId::Antigravity => {
+                results.push(CostResult {
+                    provider: provider.cli_name().to_string(),
+                    display_name: provider.display_name().to_string(),
+                    summary: CostSummary::default(),
+                    supported: true,
+                    token_history: Some(crate::providers::antigravity::local_sessions::summarize(
+                        args.days,
+                    )),
                 });
             }
             _ => {
@@ -120,6 +133,7 @@ pub async fn run(args: CostArgs) -> anyhow::Result<()> {
                     display_name: provider.display_name().to_string(),
                     summary: CostSummary::default(),
                     supported: false,
+                    token_history: None,
                 });
             }
         }
@@ -143,21 +157,26 @@ struct CostResult {
     display_name: String,
     summary: CostSummary,
     supported: bool,
+    token_history: Option<crate::spend_contract::LocalTokenHistorySummary>,
 }
 
 /// Print text output
 fn print_text_output(results: &[CostResult], use_color: bool, days: u32, group_by: CostGroupBy) {
     for (i, result) in results.iter().enumerate() {
-        if use_color {
-            println!(
-                "\x1b[1m{} Cost (last {} days)\x1b[0m",
-                result.display_name, days
-            );
+        let title = if result.token_history.is_some() {
+            format!("{} Token History (last {} days)", result.display_name, days)
         } else {
-            println!("{} Cost (last {} days)", result.display_name, days);
+            format!("{} Cost (last {} days)", result.display_name, days)
+        };
+        if use_color {
+            println!("\x1b[1m{title}\x1b[0m");
+        } else {
+            println!("{title}");
         }
 
-        if group_by == CostGroupBy::Session && result.provider == "codex" {
+        if let Some(history) = result.token_history {
+            print_local_token_history(history, days);
+        } else if group_by == CostGroupBy::Session && result.provider == "codex" {
             print_codex_session_output(result, days);
         } else if group_by == CostGroupBy::Session {
             println!("  Session grouping is only available for Codex local conversations");
@@ -241,6 +260,23 @@ fn print_text_output(results: &[CostResult], use_color: bool, days: u32, group_b
     }
 }
 
+fn print_local_token_history(history: crate::spend_contract::LocalTokenHistorySummary, days: u32) {
+    use crate::spend_contract::LocalHistoryCoverage;
+    match history.coverage {
+        LocalHistoryCoverage::Complete if history.total_tokens == 0 => {
+            println!("  No token usage in the last {days} days (scan complete)");
+        }
+        LocalHistoryCoverage::Complete => {
+            println!("  Tokens:   {} total", format_number(history.total_tokens));
+            println!("  Sessions: {}", history.session_count);
+        }
+        LocalHistoryCoverage::Partial | LocalHistoryCoverage::Unavailable => {
+            println!("  Local token history is unavailable or incomplete");
+        }
+    }
+    println!("  Local token history; dollar costs unavailable");
+}
+
 fn print_codex_session_output(result: &CostResult, days: u32) {
     let index = crate::codex_workspaces::CodexWorkspacesIndex::new(days);
     let snapshot = match index.load_snapshot(false, |_| {}) {
@@ -311,6 +347,9 @@ fn build_json_payloads(results: &[CostResult], days: u32) -> Vec<serde_json::Val
     results
         .iter()
         .map(|r| {
+            if let Some(history) = r.token_history {
+                return crate::spend_contract::local_token_history_json(&r.provider, history, days);
+            }
             if !r.supported {
                 serde_json::json!({
                     "provider": r.provider,
@@ -324,6 +363,7 @@ fn build_json_payloads(results: &[CostResult], days: u32) -> Vec<serde_json::Val
                         days.clamp(1, 365),
                         settings.open_codex_usage_logs_enabled && r.provider == "codex",
                         settings.hide_native_codex_cost_when_open_codex_present && r.provider == "codex",
+                        settings.hide_personal_info,
                         r.summary.clone(),
                     ));
                 serde_json::json!({
@@ -405,6 +445,7 @@ mod tests {
             display_name: "Codex".to_string(),
             summary,
             supported: true,
+            token_history: None,
         };
 
         // Capture stdout
@@ -450,6 +491,7 @@ mod tests {
             display_name: "Claude".to_string(),
             summary,
             supported: true,
+            token_history: None,
         };
 
         // For non-codex, historyCoverageIsEstablished should be null.
@@ -461,6 +503,36 @@ mod tests {
         assert!(s.contains("null"), "non-codex A16 is null");
     }
 
+    #[test]
+    fn antigravity_json_keeps_unknown_cost_distinct_from_zero() {
+        use crate::spend_contract::{LocalHistoryCoverage, LocalTokenHistorySummary};
+        let payload = crate::spend_contract::local_token_history_json(
+            "antigravity",
+            LocalTokenHistorySummary {
+                total_tokens: 12_345,
+                session_count: 2,
+                coverage: LocalHistoryCoverage::Complete,
+            },
+            30,
+        );
+        assert!(payload["cost"]["total_usd"].is_null());
+        assert_eq!(payload["tokens"]["total"], 12_345);
+        assert_eq!(payload["historyCoverage"], "complete");
+        assert_eq!(payload["knownZero"], false);
+
+        let partial = crate::spend_contract::local_token_history_json(
+            "antigravity",
+            LocalTokenHistorySummary {
+                total_tokens: 999,
+                session_count: 1,
+                coverage: LocalHistoryCoverage::Partial,
+            },
+            30,
+        );
+        assert!(partial["cost"]["total_usd"].is_null());
+        assert!(partial["tokens"]["total"].is_null());
+        assert_eq!(partial["historyCoverage"], "partial");
+    }
     #[test]
     fn provider_native_only_flag_default_false() {
         // Default CostArgs has provider_native_only = false (backward compat).

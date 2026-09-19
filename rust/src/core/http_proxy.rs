@@ -43,8 +43,8 @@ impl HttpProxySettings {
 
 /// Resolve a reqwest [`Proxy`] from settings.
 ///
-/// - Disabled or empty URL → `Ok(None)` (direct / default).
-/// - Invalid URL when enabled → `Err(...)`.
+/// - Disabled → `Ok(None)`, leaving reqwest's Windows/macOS system-proxy path intact.
+/// - Empty or invalid URL when enabled → `Err(...)`.
 /// - Supports `http` and `https` proxy schemes only (MVP).
 pub fn resolve_proxy(settings: &HttpProxySettings) -> Result<Option<Proxy>, String> {
     if !settings.enabled {
@@ -90,10 +90,12 @@ pub fn apply_proxy_to_builder(
 ) -> ClientBuilder {
     match resolve_proxy(settings) {
         Ok(Some(proxy)) => builder.proxy(proxy),
+        // Do not call `no_proxy()`: with the reqwest `system-proxy` feature,
+        // an unchanged builder follows Windows/macOS system proxy settings.
         Ok(None) => builder,
         Err(err) => {
             tracing::warn!(error = %err, "http proxy config ignored; using direct connection");
-            builder
+            builder.no_proxy()
         }
     }
 }

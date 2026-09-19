@@ -28,7 +28,10 @@ struct KimiCodeCredentialFile {
     #[serde(default, alias = "accessToken")]
     access_token: String,
     #[serde(default)]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "field exists in the CLI credential file; deserialized to preserve the schema but never read locally"
+    )]
     refresh_token: Option<String>,
     #[serde(default, alias = "expiresAt")]
     expires_at: Option<serde_json::Value>,
@@ -78,18 +81,30 @@ pub(crate) async fn fetch_via_code_api(
     let json: KimiCodeApiUsageResponse = resp.json().await.map_err(|e| {
         ProviderError::Parse(format!("Failed to parse Kimi Code API response: {e}"))
     })?;
+    let plan_name = json.plan_name();
+    let has_plan_name = plan_name.is_some();
     let mut snapshot = snapshot_from_code_api_response(json)?;
-    snapshot.login_method = Some(login_method.to_string());
+    snapshot.login_method = Some(plan_name.unwrap_or_else(|| login_method.to_string()));
 
     // Upstream #2622: enrich Code API + CLI usage with the monthly membership
     // pool from a signed-in Kimi Desktop (or browser/manual) session.
-    if let Some(web_token) = web::web_auth_token(ctx.manual_cookie_header.as_deref()) {
-        match web::fetch_subscription_for_enrichment(&client, &web_token).await {
-            Some(subscription) => {
-                snapshot = super::apply_subscription_windows(snapshot, &subscription);
+    for web_token in web::web_auth_tokens(ctx.manual_cookie_header.as_deref()) {
+        match web::fetch_subscription_for_enrichment_result(&client, &web_token).await {
+            Ok(subscription) => {
+                if let Some(subscription) = subscription {
+                    snapshot = super::apply_subscription_windows(snapshot, &subscription);
+                }
+                if !has_plan_name
+                    && let Some(plan) = web::fetch_subscription_plan(&client, &web_token).await
+                {
+                    snapshot.login_method = Some(plan);
+                }
+                break;
             }
-            None => {
-                tracing::debug!("Kimi Code monthly enrichment unavailable");
+            Err(ProviderError::AuthRequired) => continue,
+            Err(error) => {
+                tracing::debug!(error = %error, "Kimi Code monthly enrichment unavailable");
+                break;
             }
         }
     }
@@ -101,7 +116,11 @@ pub(super) fn snapshot_from_code_api_response(
     response: KimiCodeApiUsageResponse,
 ) -> Result<UsageSnapshot, ProviderError> {
     let primary = KimiProvider::rate_window_from_usage_detail(&response.usage, None)?;
-    let mut usage = UsageSnapshot::new(primary).with_login_method("Code API");
+    let mut usage = UsageSnapshot::new(primary).with_login_method(
+        response
+            .plan_name()
+            .unwrap_or_else(|| "Code API".to_string()),
+    );
 
     if let Some(limit) = response.limits.unwrap_or_default().into_iter().next() {
         let window_minutes = limit.window.as_ref().and_then(kimi_window_minutes);
@@ -305,6 +324,8 @@ mod tests {
                 .any(|(k, v)| *k == "X-Msh-Platform" && v == KIMI_CODE_CLI_PLATFORM)
         );
 
+        // SAFETY: this test owns KIMI_CODE_HOME_ENV (set at its start under
+        // env_lock); removing it here restores the shared environment.
         unsafe {
             std::env::remove_var(KIMI_CODE_HOME_ENV);
         }
@@ -330,6 +351,8 @@ mod tests {
         let now = 1_800_000_000.0_f64;
         let home = write_temp_kimi_code_home("oauth-token", Some(json!(now + 3600.0)));
 
+        // SAFETY: env_lock() guard held for the whole test, so these
+        // set_var calls cannot race another thread's environment access.
         unsafe {
             std::env::set_var(KIMI_CODE_HOME_ENV, home.path());
             std::env::set_var(KIMI_CODE_BASE_URL_ENV, "https://proxy.example.com/kimi");
@@ -337,12 +360,15 @@ mod tests {
         assert!(has_code_endpoint_override());
         assert!(kimi_code_cli_access_token(now).is_none());
 
+        // SAFETY: still under the same env_lock() guard; swapping which
+        // override keys are present between assertions.
         unsafe {
             std::env::remove_var(KIMI_CODE_BASE_URL_ENV);
             std::env::set_var(KIMI_CODE_OAUTH_HOST_ENV, "https://oauth.example.com");
         }
         assert!(kimi_code_cli_access_token(now).is_none());
 
+        // SAFETY: final cleanup while the env_lock() guard is still alive.
         unsafe {
             std::env::remove_var(KIMI_CODE_OAUTH_HOST_ENV);
             std::env::remove_var(KIMI_CODE_HOME_ENV);

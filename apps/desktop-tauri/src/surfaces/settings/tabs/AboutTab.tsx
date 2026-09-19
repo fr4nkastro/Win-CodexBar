@@ -8,10 +8,13 @@ import type { LocaleKey } from "../../../i18n/keys";
 import type { TabProps } from "../settingsTabs";
 import codexbarIcon from "../../../assets/codexbar-icon.png";
 
+const REPO_URL = "https://github.com/fr4nkastro/Win-CodexBar";
+const SUBMIT_ISSUE_URL = `${REPO_URL}/issues/new?labels=bug&template=bug_report.yml`;
+
 const ABOUT_LINKS: ReadonlyArray<{ labelKey: LocaleKey; url: string }> = [
   {
     labelKey: "AboutLinkGitHub",
-    url: "https://github.com/Finesssee/Win-CodexBar",
+    url: REPO_URL,
   },
   {
     labelKey: "AboutLinkWebsite",
@@ -90,6 +93,13 @@ export default function AboutTab({ settings, set, saving }: TabProps) {
           </button>
         ))}
       </div>
+      <button
+        type="button"
+        className="about-link"
+        onClick={() => openAboutLink(SUBMIT_ISSUE_URL)}
+      >
+        {t("SubmitIssue")}
+      </button>
       {linkError && (
         <p className="about-update-msg">
           {t("ErrorPrefix")} {linkError}

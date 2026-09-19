@@ -167,7 +167,8 @@ async fn run_watch(args: HooksWatchArgs) -> anyhow::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_signal = Arc::clone(&stop);
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        // Best-effort signal wait; no signal just means the loop stops when hooks finish.
+        let _signal = tokio::signal::ctrl_c().await;
         stop_for_signal.store(true, Ordering::SeqCst);
     });
 
@@ -379,6 +380,7 @@ fn hook_refresh_failure_status(error: &ProviderError) -> String {
         ProviderError::AuthRequired
         | ProviderError::NoCookies
         | ProviderError::OAuth(_)
+        | ProviderError::OAuthExpired(_)
         | ProviderError::OAuthRevoked(_) => "auth_required".into(),
         ProviderError::Timeout => "timeout".into(),
         ProviderError::Network(err) => {

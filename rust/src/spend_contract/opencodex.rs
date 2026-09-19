@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,8 +8,8 @@ use serde_json::Value;
 use crate::core::CostUsagePricing;
 
 use super::{
-    CostCoverageCounts, CustomPricing, ImportedSpendSource, SpendActivityCell, SpendDailyPoint,
-    SpendModelRow, SpendTokenMix,
+    CostCoverageCounts, CostProvenance, CustomPricing, ImportedSpendSource, SpendActivityCell,
+    SpendDailyPoint, SpendModelRow, SpendTokenMix,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,13 +28,7 @@ struct OpenCodexEntry {
     total_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CacheFile {
-    source_path: String,
-    source_len: u64,
-    source_modified_ms: u64,
-    entries: Vec<OpenCodexEntry>,
-}
+mod cache;
 
 #[derive(Default)]
 struct ModelAccumulator {
@@ -103,7 +95,7 @@ pub(super) fn load_for_subscription(
     custom: &CustomPricing,
 ) -> Option<ImportedSpendSource> {
     let source_path = usage_path()?;
-    let entries = load_entries(&source_path)?;
+    let entries = cache::load_entries(&source_path)?;
     let entries = entries
         .into_iter()
         .filter(|entry| matches!(route_entry(entry), RouteTarget::Subscription(id) if id == provider_id))
@@ -149,6 +141,9 @@ fn aggregate(
     let mut daily: BTreeMap<String, DailyAccumulator> = BTreeMap::new();
     let mut known_cost = 0.0;
     let mut saw_known_cost = false;
+    let mut saw_vendor_provenance = false;
+    let mut saw_list_provenance = false;
+    let mut saw_metered_cost = false;
     // Upstream 0.55.0 #3136: resolve the dynamic pricing catalog once per
     // aggregate instead of re-checking its cache metadata for every usage row.
     let pricing_snapshot = crate::core::pricing_snapshot();
@@ -168,6 +163,11 @@ fn aggregate(
 
         let cost = entry_cost(entry, custom, &pricing_snapshot);
         match entry.usage_status.as_str() {
+            "reported" => saw_vendor_provenance = true,
+            "estimated" => saw_list_provenance = true,
+            _ => {}
+        }
+        match entry.usage_status.as_str() {
             "reported" if cost.is_some() => coverage.priced = coverage.priced.saturating_add(1),
             "estimated" if cost.is_some() => {
                 coverage.estimated = coverage.estimated.saturating_add(1)
@@ -178,9 +178,17 @@ fn aggregate(
         if let Some(cost) = cost {
             known_cost += cost;
             saw_known_cost = true;
+            if entry.usage_status == "reported" {
+                saw_metered_cost = true;
+            }
         }
 
         let local = entry.timestamp.with_timezone(&Local);
+        // Weekday (0-6) and hour (0-23) both fit u8.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "weekday (0-6) and hour (0-23) fit u8"
+        )]
         let key = (
             local.weekday().num_days_from_monday() as u8,
             local.hour() as u8,
@@ -248,12 +256,30 @@ fn aggregate(
         (None, None) => left.model.cmp(&right.model),
     });
 
+    // Counts are clamped to u32::MAX before casting.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "clamped to u32::MAX before casting"
+    )]
+    let request_count = entries.len().min(u32::MAX as usize) as u32;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "clamped to u32::MAX before casting"
+    )]
+    let conversation_count = conversations.len().min(u32::MAX as usize) as u32;
+
+    let snapshot_provenance =
+        CostProvenance::from_source_kinds(saw_vendor_provenance, saw_list_provenance);
+    let provenance =
+        CostProvenance::for_window(snapshot_provenance, saw_known_cost, saw_metered_cost);
+
     Some(ImportedSpendSource {
         source_id: "opencodex".to_string(),
         display_name: "OpenCodex".to_string(),
-        request_count: entries.len().min(u32::MAX as usize) as u32,
-        conversation_count: conversations.len().min(u32::MAX as usize) as u32,
+        request_count,
+        conversation_count,
         known_cost_usd: saw_known_cost.then_some(known_cost),
+        provenance,
         token_mix,
         coverage,
         models: model_rows,
@@ -331,65 +357,6 @@ fn pricing_model(entry: &OpenCodexEntry) -> Option<String> {
         RouteTarget::Subscription("deepseek") => Some(format!("deepseek/{model_tail}")),
         RouteTarget::Subscription(_) | RouteTarget::TokenOnly | RouteTarget::Unknown => None,
     }
-}
-
-fn load_entries(source_path: &Path) -> Option<Vec<OpenCodexEntry>> {
-    let metadata = fs::metadata(source_path).ok()?;
-    let source_len = metadata.len();
-    let source_modified_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0);
-    let source_path_text = source_path.to_string_lossy().to_string();
-
-    if let Some(cache) = read_cache()
-        && cache.source_path == source_path_text
-        && cache.source_len == source_len
-        && cache.source_modified_ms == source_modified_ms
-    {
-        return Some(cache.entries);
-    }
-
-    let text = fs::read_to_string(source_path).ok()?;
-    let entries: Vec<_> = text.lines().filter_map(parse_line).collect();
-    write_cache(&CacheFile {
-        source_path: source_path_text,
-        source_len,
-        source_modified_ms,
-        entries: entries.clone(),
-    });
-    Some(entries)
-}
-
-fn cache_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|root| {
-        root.join("openCodexBar")
-            .join("opencodex")
-            .join("usage-cache.json")
-    })
-}
-
-fn read_cache() -> Option<CacheFile> {
-    let bytes = fs::read(cache_path()?).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn write_cache(cache: &CacheFile) {
-    let Some(path) = cache_path() else {
-        return;
-    };
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let Ok(bytes) = serde_json::to_vec(cache) else {
-        return;
-    };
-    let _ = fs::write(path, bytes);
 }
 
 fn usage_path() -> Option<PathBuf> {
@@ -493,7 +460,17 @@ fn timestamp_from_epoch(value: f64) -> Option<DateTime<Utc>> {
     } else {
         value
     };
+    // Epoch timestamps fit i64 seconds; float-to-int casts saturate otherwise.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "epoch timestamps fit i64 seconds"
+    )]
     let whole = seconds.trunc() as i64;
+    // Fractional seconds in [0, 1e9) fit u32.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "fractional seconds in [0, 1e9) fit u32"
+    )]
     let nanos = (seconds.fract().abs() * 1_000_000_000.0) as u32;
     Utc.timestamp_opt(whole, nanos).single()
 }
@@ -504,7 +481,14 @@ fn nonnegative_u64(value: Option<&Value>) -> Option<u64> {
         return Some(number);
     }
     let number = value.as_f64()?;
-    (number.is_finite() && number >= 0.0 && number <= u64::MAX as f64).then_some(number as u64)
+    // Guarded to finite non-negative values within u64 range.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "guarded to finite non-negative values within u64 range"
+    )]
+    let parsed =
+        (number.is_finite() && number >= 0.0 && number <= u64::MAX as f64).then_some(number as u64);
+    parsed
 }
 
 fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -518,7 +502,10 @@ fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::CustomRates;
+    use super::cache::{load_entries_with_cache, read_cache};
     use super::*;
+    use std::fs;
 
     #[test]
     fn aggregate_deduplicates_requests_and_applies_history_window() {
@@ -557,6 +544,61 @@ mod tests {
         assert_eq!(source.token_mix.input_tokens, Some(20));
         assert_eq!(source.coverage.priced, 1);
         assert!(source.known_cost_usd.is_some());
+        assert_eq!(source.provenance, CostProvenance::VendorMetered);
+    }
+
+    #[test]
+    fn aggregate_preserves_list_and_mixed_provenance() {
+        let now = DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut estimated = entry("openai", "gpt-5");
+        estimated.request_id = "estimated".to_string();
+        estimated.usage_status = "estimated".to_string();
+        let list_only = aggregate(vec![estimated.clone()], now, 30, &CustomPricing::default())
+            .expect("list-price source");
+        assert_eq!(list_only.provenance, CostProvenance::ListPriceEstimate);
+
+        let mut reported = entry("openai", "gpt-5");
+        reported.request_id = "reported".to_string();
+        let mixed = aggregate(
+            vec![reported, estimated],
+            now,
+            30,
+            &CustomPricing::default(),
+        )
+        .expect("mixed source");
+        assert_eq!(mixed.provenance, CostProvenance::Mixed);
+    }
+
+    #[test]
+    fn aggregate_preserves_zero_cost_authoritative_provenance() {
+        let now = DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let custom = CustomPricing {
+            entries: std::collections::HashMap::from([(
+                "openai/gpt-5".to_string(),
+                CustomRates {
+                    input: Some(0.0),
+                    output: Some(0.0),
+                    cache_read: Some(0.0),
+                    cache_write: Some(0.0),
+                },
+            )]),
+        };
+
+        let reported = aggregate(vec![entry("openai", "gpt-5")], now, 30, &custom)
+            .expect("zero-cost vendor source");
+        assert_eq!(reported.known_cost_usd, Some(0.0));
+        assert_eq!(reported.provenance, CostProvenance::VendorMetered);
+
+        let mut estimated_entry = entry("openai", "gpt-5");
+        estimated_entry.usage_status = "estimated".to_string();
+        let estimated =
+            aggregate(vec![estimated_entry], now, 30, &custom).expect("zero-cost list source");
+        assert_eq!(estimated.known_cost_usd, Some(0.0));
+        assert_eq!(estimated.provenance, CostProvenance::ListPriceEstimate);
     }
 
     fn entry(provider: &str, model: &str) -> OpenCodexEntry {
@@ -652,5 +694,234 @@ mod tests {
         assert_eq!(entry.output_tokens, Some(4));
         assert_eq!(entry.cache_read_tokens, Some(3));
         assert_eq!(entry.reasoning_tokens, Some(2));
+    }
+
+    #[test]
+    fn parser_normalizes_defaults_and_rejects_malformed_lines() {
+        let minimal = serde_json::json!({
+            "requestId": "  r1  ", "model": "gpt-test", "timestamp": "2026-08-18T10:00:00Z",
+            "usageStatus": "  REPORTED ", "usage": {"cacheCreationInputTokens": 7}
+        });
+        let entry = parse_line(&minimal.to_string()).expect("entry");
+        assert_eq!(entry.request_id, "r1", "ids are trimmed");
+        assert_eq!(
+            entry.provider, "openai",
+            "missing provider defaults to openai"
+        );
+        assert_eq!(
+            entry.usage_status, "reported",
+            "status is lowercased and trimmed"
+        );
+        assert_eq!(entry.conversation_id, None);
+        assert_eq!(entry.cache_creation_tokens, Some(7));
+
+        for malformed in [
+            "{}",
+            r#"{"requestId": "", "model": "m", "timestamp": "2026-08-18T10:00:00Z"}"#,
+            r#"{"requestId": "r1", "model": "   ", "timestamp": "2026-08-18T10:00:00Z"}"#,
+            r#"{"requestId": "r1", "model": "m"}"#,
+            "not json at all",
+        ] {
+            assert!(parse_line(malformed).is_none(), "rejected: {malformed}");
+        }
+    }
+
+    #[test]
+    fn incremental_cache_appends_only_newline_terminated_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("usage.jsonl");
+        let cache = dir.path().join("cache.sqlite");
+        let row = |id: &str, input: u64| {
+            format!(
+                r#"{{"requestId":"{id}","model":"gpt-5","timestamp":"2026-08-18T10:00:00Z","usageStatus":"reported","usage":{{"inputTokens":{input}}}}}"#
+            )
+        };
+
+        fs::write(&log, format!("{}\n{}\n", row("a", 1), row("b", 2))).unwrap();
+        let first = load_entries_with_cache(&log, &cache).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|entry| entry.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        let first_cursor = read_cache(&cache).unwrap().cursor;
+
+        let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        use std::io::Write as _;
+        writeln!(file, "{}", row("c", 3)).unwrap();
+        drop(file);
+
+        let second = load_entries_with_cache(&log, &cache).unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|entry| entry.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        let second_cursor = read_cache(&cache).unwrap().cursor;
+        assert!(second_cursor.parsed_offset > first_cursor.parsed_offset);
+    }
+
+    #[test]
+    fn incomplete_trailing_opencodex_record_waits_for_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("usage.jsonl");
+        let cache = dir.path().join("cache.sqlite");
+        let complete = r#"{"requestId":"a","model":"gpt-5","timestamp":"2026-08-18T10:00:00Z"}"#;
+        let pending = r#"{"requestId":"b","model":"gpt-5","timestamp":"2026-08-18T10:00:00Z"}"#;
+        let split = pending.len() / 2;
+        fs::write(&log, format!("{complete}\n{}", &pending[..split])).unwrap();
+
+        let first = load_entries_with_cache(&log, &cache).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|entry| entry.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        let cursor = read_cache(&cache).unwrap().cursor;
+        assert_eq!(
+            cursor.parsed_offset,
+            u64::try_from(complete.len() + 1).unwrap()
+        );
+
+        let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        use std::io::Write as _;
+        writeln!(file, "{}", &pending[split..]).unwrap();
+        drop(file);
+        let second = load_entries_with_cache(&log, &cache).unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|entry| entry.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn complete_trailing_opencodex_record_waits_for_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("usage.jsonl");
+        let cache = dir.path().join("cache.sqlite");
+        let first = r#"{"requestId":"a","model":"gpt-5","timestamp":"2026-08-18T10:00:00Z"}"#;
+        let trailing = r#"{"requestId":"b","model":"gpt-5","timestamp":"2026-08-18T10:00:00Z"}"#;
+        fs::write(&log, format!("{first}\n{trailing}")).unwrap();
+
+        let before_newline = load_entries_with_cache(&log, &cache).unwrap();
+        assert_eq!(
+            before_newline
+                .iter()
+                .map(|entry| entry.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+
+        let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        use std::io::Write as _;
+        writeln!(file).unwrap();
+        drop(file);
+
+        let after_newline = load_entries_with_cache(&log, &cache).unwrap();
+        assert_eq!(
+            after_newline
+                .iter()
+                .map(|entry| entry.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn later_request_id_replaces_cached_entry_without_full_cache_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("usage.jsonl");
+        let cache = dir.path().join("cache.sqlite");
+        let row = |id: &str, input: u64| {
+            format!(
+                r#"{{"requestId":"{id}","model":"gpt-5","timestamp":"2026-08-18T10:00:00Z","usageStatus":"reported","usage":{{"inputTokens":{input}}}}}"#
+            )
+        };
+        fs::write(&log, format!("{}\n{}\n", row("dup", 1), row("keep", 2))).unwrap();
+        let _ = load_entries_with_cache(&log, &cache).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        use std::io::Write as _;
+        writeln!(file, "{}", row("dup", 9)).unwrap();
+        drop(file);
+
+        let entries = load_entries_with_cache(&log, &cache).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.request_id == "dup")
+                .unwrap()
+                .input_tokens,
+            Some(9)
+        );
+        assert!(entries.iter().any(|entry| entry.request_id == "keep"));
+    }
+
+    #[test]
+    fn truncation_invalidates_opencodex_cursor_and_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("usage.jsonl");
+        let cache = dir.path().join("cache.sqlite");
+        let old = r#"{"requestId":"old","model":"gpt-5","timestamp":"2026-08-18T10:00:00Z"}"#;
+        let replacement =
+            r#"{"requestId":"new","model":"gpt-5","timestamp":"2026-08-18T10:00:00Z"}"#;
+        fs::write(&log, format!("{old}\n{old}\n")).unwrap();
+        let _ = load_entries_with_cache(&log, &cache).unwrap();
+        fs::write(&log, format!("{replacement}\n")).unwrap();
+
+        let rebuilt = load_entries_with_cache(&log, &cache).unwrap();
+        assert_eq!(
+            rebuilt
+                .iter()
+                .map(|entry| entry.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new"]
+        );
+    }
+
+    #[test]
+    fn timestamps_parse_rfc3339_epoch_seconds_and_millis() {
+        let expected = Utc.with_ymd_and_hms(2026, 8, 18, 10, 0, 0).unwrap();
+        let rfc3339 = serde_json::json!("2026-08-18T10:00:00Z");
+        assert_eq!(parse_timestamp(&rfc3339), Some(expected));
+        let epoch_seconds = serde_json::json!(1_787_047_200i64);
+        assert_eq!(parse_timestamp(&epoch_seconds), Some(expected));
+        let epoch_millis = serde_json::json!(1_787_047_200_000f64);
+        assert_eq!(parse_timestamp(&epoch_millis), Some(expected));
+        let numeric_string = serde_json::json!("1787047200.0");
+        assert_eq!(parse_timestamp(&numeric_string), Some(expected));
+        for invalid in [
+            serde_json::json!("not a date"),
+            serde_json::json!(0),
+            serde_json::json!(-5.0),
+            serde_json::Value::Null,
+            serde_json::json!(true),
+        ] {
+            assert!(parse_timestamp(&invalid).is_none(), "rejected: {invalid}");
+        }
+    }
+
+    #[test]
+    fn nonnegative_u64_accepts_json_numbers_and_bounded_floats() {
+        assert_eq!(nonnegative_u64(Some(&serde_json::json!(42))), Some(42));
+        assert_eq!(nonnegative_u64(Some(&serde_json::json!(12.0))), Some(12));
+        // Fractional floats are accepted via `as u64` truncation.
+        assert_eq!(nonnegative_u64(Some(&serde_json::json!(1.5))), Some(1));
+        // `u64::MAX as f64` rounds up to 2^64; f64 spacing there is 4096, so
+        // +2048.0 rounds back into range. First out-of-range step is +4096.0.
+        assert_eq!(
+            nonnegative_u64(Some(&serde_json::json!(u64::MAX as f64 + 4096.0))),
+            None
+        );
+        assert_eq!(nonnegative_u64(None), None);
     }
 }

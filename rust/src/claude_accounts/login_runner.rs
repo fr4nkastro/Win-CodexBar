@@ -86,7 +86,7 @@ impl ManagedLoginProcess {
         self.cancelled.store(true, Ordering::SeqCst);
         let mut guard = self.inner.lock().expect("login process lock");
         if let Some(child) = guard.as_mut() {
-            let _ = child.kill();
+            let _killed = child.kill();
         }
     }
 }
@@ -218,7 +218,7 @@ fn take_child(handle: &ManagedLoginProcess) -> Option<Child> {
 
 fn kill_and_drain(handle: &ManagedLoginProcess) -> std::process::Output {
     let mut child = take_child(handle).expect("login process present");
-    let _ = child.kill();
+    let _killed = child.kill();
     child
         .wait_with_output()
         .unwrap_or_else(|_| std::process::Output {
